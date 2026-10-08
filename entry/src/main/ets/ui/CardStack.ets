@@ -27,6 +27,9 @@ export struct CardStack {
   private lastT: number = 0;
   private velocity: number = 0;
   private flyTimer: number = -1;       // flyOut 的 setTimeout 句柄，卸载时必须清掉（Ruling 28）
+  // springBack 的上报防抖窗口句柄：非 -1 表示「同一次回弹」尚未结束（Ruling 29）。
+  // 它只影响是否重复上报，不是手势闸门——回弹期间仍可重新拖拽。
+  private springTimer: number = -1;
 
   aboutToAppear(): void {
     this.dx = 0;
@@ -37,6 +40,7 @@ export struct CardStack {
   // 组件卸载（用户 230ms 内返回上一页）后不能再回调 onDecide。
   aboutToDisappear(): void {
     if (this.flyTimer !== -1) { clearTimeout(this.flyTimer); this.flyTimer = -1; }
+    if (this.springTimer !== -1) { clearTimeout(this.springTimer); this.springTimer = -1; }
   }
 
   build() {
@@ -93,6 +97,9 @@ export struct CardStack {
 
   private flyOut(dir: number): void {
     this.animating = true;
+    // 决策已生效、这张卡的回弹窗口就此结束：残留窗口属于「上一张卡」，
+    // 不能让下一张卡（实例复用）的首次回弹被误判为「已上报」。
+    if (this.springTimer !== -1) { clearTimeout(this.springTimer); this.springTimer = -1; }
     animateTo({ duration: 220, curve: Curve.EaseOut }, () => {
       this.dx = dir * 600;
       this.dy = this.dy + 40;
@@ -109,8 +116,16 @@ export struct CardStack {
   }
 
   private springBack(): void {
-    // 回弹 = 用户犹豫过，计入回弹率
-    this.onDecide(this.item.photoId, 'none', true);
+    // Ruling 29：rolledBack 是「回弹率 <3%」验收指标的唯一数据源，
+    // 快速连划不得重复上报同一次回弹；但手势仍可继续（不设 animating）。
+    const alreadyReported = this.springTimer !== -1;
+    if (!alreadyReported) {
+      // 回弹 = 用户犹豫过，计入回弹率（每张卡每个回弹窗口只计一次）
+      this.onDecide(this.item.photoId, 'none', true);
+    }
+    if (this.springTimer !== -1) { clearTimeout(this.springTimer); }
+    this.springTimer = setTimeout(() => { this.springTimer = -1; }, SPRING_BACK_MS);
+
     animateTo({ duration: SPRING_BACK_MS, curve: Curve.Friction }, () => {
       this.dx = 0;
       this.dy = 0;
