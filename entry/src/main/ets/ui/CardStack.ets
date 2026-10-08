@@ -59,7 +59,10 @@ export struct CardStack {
     .gesture(
       PanGesture({ fingers: 1, distance: 5 })
         .onActionStart((e: GestureEvent) => {
-          if (this.animating) { return; }        // Ruling 27：飞出动画期间不接受新手势
+          // 基线必须先刷新：若把闸门放在首行，一次跨越 230ms 边界的拖拽会保留
+          // 上一次手势的 lastX/lastT，解禁后的首个 update 用陈旧基线算出巨大的
+          // 伪速度（|Δ| > 800），使新卡片在几十 vp 拖动下被误判 fav/archive。
+          // 闸门职责由 onActionUpdate 与 settle() 承担，这里不早退。
           this.lastX = e.offsetX;
           this.lastT = Date.now();
           this.velocity = 0;
@@ -107,11 +110,13 @@ export struct CardStack {
     if (this.flyTimer !== -1) { clearTimeout(this.flyTimer); }
     this.flyTimer = setTimeout(() => {
       this.flyTimer = -1;
-      this.onDecide(this.item.photoId, dir > 0 ? 'fav' : 'archive', false);
       // 组件实例会被复用给下一张卡片（aboutToAppear 不会再跑），必须在这里归位。
+      // 归位要在 onDecide 之前：若回调抛错，闸门 animating 留在 true 会让整页手势死锁
+      //（实例被复用，失效范围不止这一张卡）。先归位 = 抛错也不影响后续交互。
       this.dx = 0;
       this.dy = 0;
       this.animating = false;
+      this.onDecide(this.item.photoId, dir > 0 ? 'fav' : 'archive', false);
     }, 230);
   }
 
