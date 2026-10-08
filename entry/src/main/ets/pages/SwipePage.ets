@@ -2,7 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { router } from '@kit.ArkUI';
 import { ClaimStore } from '../data/claimStore';
 import { DecisionStore } from '../data/decisionStore';
-import { CardStack, QueueItem, SwipeAction } from '../ui/CardStack';
+import { CardStack, QueueItem, SwipeOutcome } from '../ui/CardStack';
 import { Decision, emptyDecision, applyDecision } from '../core/queue';
 import { MetricsState, emptyMetrics, recordSwipe, medianDecisionMs, rollbackRate } from '../core/metrics';
 
@@ -116,8 +116,8 @@ struct SwipePage {
           CardStack({
             item: this.items[this.idx],
             cardWidth: this.cardW,
-            onDecide: (photoId: string, action: SwipeAction, rolledBack: boolean) => {
-              this.handle(photoId, action, rolledBack);
+            onDecide: (photoId: string, outcome: SwipeOutcome) => {
+              this.handle(photoId, outcome);
             }
           })
         } else {
@@ -145,13 +145,22 @@ struct SwipePage {
     .width('100%').height('100%').backgroundColor('#FAFAFA')
   }
 
-  private handle(photoId: string, action: SwipeAction, rolledBack: boolean): void {
+  private handle(photoId: string, outcome: SwipeOutcome): void {
+    // 回弹只进指标、不消耗队列；真实决策才落盘并推进 idx。
+    // 判别联合已保证不存在「回弹却带真实决策动作」这种组合（那会让卡片飞走、决策静默丢失）。
+    const rolledBack: boolean = outcome.kind === 'rollback';
+    const action: string = rolledBack ? 'none'
+      : (outcome.kind === 'decision' ? outcome.action : '');
+
     // 先挡住非法 action：它既不该被当成归档写盘，也不该进入验收指标
     //（进入 metrics 会污染 medianDecisionMs 的样本与 rollbackRate 的分母）。
-    // 位置必须在 rolledBack 早返回之后：「回弹」用 action='none' + rolledBack=true 走那条路径。
-    // 类型层面已由 SwipeAction 联合类型保证（只有 'fav' / 'archive' / 'none'，且 'none' 必带
-    // rolledBack=true），此处保留仅为运行期防御：将来若有人用 `as` 断言绕过类型检查，
-    // 这道守卫仍能拦住未知动作，不让它静默归档或污染指标。
+    // 守卫必须在 recordSwipe 之前（放到之后会让未知动作污染指标），
+    // 并用 rolledBack 放行回弹路径——回弹事件是「回弹率」的唯一数据源，
+    // 若把它一并拦掉，回弹率的分子会结构性恒为 0、指标恒显示"达标"。
+    // 类型层面已由 SwipeOutcome 判别联合保证（'rollback' 不携带 action、'decision'
+    // 只携带 'fav' / 'archive'），此处保留仅为运行期防御：将来若有人用 `as` 断言
+    // 绕过类型检查（或退回旧的 onDecide(id, 'none') 形态），这道守卫仍能拦住未知动作，
+    // 不让它静默归档或污染指标。
     if (!rolledBack && action !== 'fav' && action !== 'archive') { return; }
 
     const now = Date.now();

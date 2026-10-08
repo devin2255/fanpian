@@ -16,20 +16,29 @@ export const SPRING_BACK_MS = 150;
 export interface QueueItem { photoId: string; thumbUri: string }
 
 /**
- * CardStack 会向父组件上报的三种手势结果。
- * 收紧为联合类型（而非 string）：未来新增手势出口时，传错 action 会在编译期报错，
- * 而不是被 SwipePage.handle() 的守卫静默拦下（那样卡片会飞走、决策静默丢失）。
- * 注意：不含 'skip' —— 跳过是长按菜单里的动作（后续任务），不走滑动手势。
+ * 一次滑动的结果。用判别联合而非 (action, rolledBack) 两个独立参数：
+ * 'none' 只可能是回弹、'fav'/'archive' 只可能是真实决策 —— 这对配对关系由类型强制，
+ * 写错组合（例如 onDecide(id, 'none', false)）会在编译期报错，
+ * 而不是被 SwipePage.handle() 的守卫静默丢弃（那会让卡片飞走、决策静默丢失）。
+ * 注意：'skip' 与删除不在此列 —— 它们不是滑动手势（跳过在长按菜单、删除另设路径）。
+ *
+ * ArkTS 硬约束决定了这里只能写成两个「具名 interface」的联合，而非内联对象类型：
+ *   - arkts-no-obj-literals-as-types：内联对象字面量不能作为类型声明；
+ *   - arkts-no-untyped-obj-literals：对象字面量必须对应显式声明的 class/interface，
+ *     所以调用点用显式标注的局部变量构造，不把字面量直接塞进联合类型的参数位。
+ * 这两条只影响「怎么写」，不影响判别能力：非法配对（回弹带 action、决策缺 action）仍不可表达。
  */
-export type SwipeAction = 'fav' | 'archive' | 'none';
+export interface SwipeDecision { kind: 'decision'; action: 'fav' | 'archive' }
+export interface SwipeRollback { kind: 'rollback' }
+export type SwipeOutcome = SwipeDecision | SwipeRollback;
 
 @Component
 export struct CardStack {
   @Prop item: QueueItem;
   @Prop cardWidth: number = 360;   // 由父组件经 onAreaChange 传入真实宽度，见 settle()
-  // 上报动作收紧为 SwipeAction：值域与运行期完全一致（原来就是这三个字面量），
-  // 只是把「传错 action」从运行期静默失败提前到编译期报错。
-  onDecide: (photoId: string, action: SwipeAction, rolledBack: boolean) => void = () => {};
+  // 上报的是一次滑动的「结果」（SwipeOutcome 判别联合）：合法配对由类型编码，
+  // 传错组合（例如回弹却带 action）会在编译期报错，而不是运行期被 handle() 的守卫静默丢弃。
+  onDecide: (photoId: string, outcome: SwipeOutcome) => void = () => {};
   @State dx: number = 0;
   @State dy: number = 0;
   @State animating: boolean = false;   // 飞出动画期间为真，作为手势闸门（Ruling 27）；回弹不计入
@@ -126,7 +135,9 @@ export struct CardStack {
       this.dx = 0;
       this.dy = 0;
       this.animating = false;
-      this.onDecide(this.item.photoId, dir > 0 ? 'fav' : 'archive', false);
+      const act: 'fav' | 'archive' = dir > 0 ? 'fav' : 'archive';
+      const out: SwipeDecision = { kind: 'decision', action: act };
+      this.onDecide(this.item.photoId, out);
     }, 230);
   }
 
@@ -136,7 +147,8 @@ export struct CardStack {
     const alreadyReported = this.springTimer !== -1;
     if (!alreadyReported) {
       // 回弹 = 用户犹豫过，计入回弹率（每张卡每个回弹窗口只计一次）
-      this.onDecide(this.item.photoId, 'none', true);
+      const out: SwipeRollback = { kind: 'rollback' };
+      this.onDecide(this.item.photoId, out);
     }
     if (this.springTimer !== -1) { clearTimeout(this.springTimer); }
     this.springTimer = setTimeout(() => { this.springTimer = -1; }, SPRING_BACK_MS);
