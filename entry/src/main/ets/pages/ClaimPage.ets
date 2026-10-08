@@ -1,4 +1,5 @@
 import { common } from '@kit.AbilityKit';
+import { router } from '@kit.ArkUI';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { ClaimStore, pickPhotos } from '../data/claimStore';
 // 以下 import 是为了把 core 层留在 ArkTS 编译图内（Ruling 17）。
@@ -52,6 +53,10 @@ struct ClaimPage {
       Button('认领照片')
         .fontSize(16).height(46).width(200)
         .onClick(() => { this.doPick(); })
+
+      Button('开始刷照片')
+        .fontSize(16).height(46).width(200)
+        .onClick(() => { router.pushUrl({ url: 'pages/SwipePage' }); })
 
       Text(this.msg).fontSize(12).fontColor('#D33')
     }
