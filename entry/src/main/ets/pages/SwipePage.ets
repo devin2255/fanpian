@@ -146,6 +146,11 @@ struct SwipePage {
   }
 
   private handle(photoId: string, action: string, rolledBack: boolean): void {
+    // 先挡住非法 action：它既不该被当成归档写盘，也不该进入验收指标
+    //（进入 metrics 会污染 medianDecisionMs 的样本与 rollbackRate 的分母）。
+    // 位置必须在 rolledBack 早返回之后：「回弹」用 action='none' + rolledBack=true 走那条路径。
+    if (!rolledBack && action !== 'fav' && action !== 'archive') { return; }
+
     const now = Date.now();
     this.metrics = recordSwipe(this.metrics, {
       photoId: photoId, shownAt: this.shownAt, decidedAt: now,
@@ -155,9 +160,6 @@ struct SwipePage {
     this.rollbackPct = Math.round(rollbackRate(this.metrics) * 100);
 
     if (rolledBack) { return; }   // 回弹不消耗队列
-
-    // 只接受两个合法决策动作：未知 action（未来调用点笔误）不得被静默当成归档写盘
-    if (action !== 'fav' && action !== 'archive') { return; }
 
     const prev = this.decisions.get(photoId);
     const d = prev === undefined ? emptyDecision(photoId) : prev;
