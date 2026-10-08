@@ -46,3 +46,23 @@ test('sortByTakenDesc：有拍摄时间的按时间倒序，无时间的排最�
   const sorted = sortByTakenDesc(photos);
   assert.deepEqual(sorted.map(p => p.photoId), ['c', 'a', 'b']);
 });
+
+test('sortByTakenDesc：takenAt 为 NaN 的照片不会丢失', () => {
+  const photos = [
+    { photoId: 'a', batchId: 1, claimedAt: 1, takenAt: 100 },
+    { photoId: 'b', batchId: 1, claimedAt: 1, takenAt: NaN },
+    { photoId: 'c', batchId: 1, claimedAt: 1, takenAt: 0 }
+  ];
+  const sorted = sortByTakenDesc(photos);
+  assert.equal(sorted.length, 3, '照片不得丢失');
+  assert.deepEqual(sorted.map(p => p.photoId).sort(), ['a', 'b', 'c']);
+  assert.equal(sorted[0].photoId, 'a');   // 有时间的排最前
+});
+
+test('mergeBatch：返回值与输入状态不共享照片对象', () => {
+  const before = mergeBatch(emptyClaimState(), ['u1'], 100);
+  const after = mergeBatch(before, ['u2'], 200);
+  // 就地修改 after 里的第一张，不得影响 before
+  after.photos[0].takenAt = 999;
+  assert.equal(before.photos[0].takenAt, 0, '前一个状态被污染了');
+});
