@@ -156,6 +156,9 @@ struct SwipePage {
 
     if (rolledBack) { return; }   // 回弹不消耗队列
 
+    // 只接受两个合法决策动作：未知 action（未来调用点笔误）不得被静默当成归档写盘
+    if (action !== 'fav' && action !== 'archive') { return; }
+
     const prev = this.decisions.get(photoId);
     const d = prev === undefined ? emptyDecision(photoId) : prev;
     const nextAction = action === 'fav' ? 'fav' : 'archive';

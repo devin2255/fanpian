@@ -26,14 +26,20 @@ export class ClaimStore {
       const st = fileIo.statSync(path);
       const buf = new ArrayBuffer(st.size);
       const file = fileIo.openSync(path, fileIo.OpenMode.READ_ONLY);
+      let n: number = 0;
       try {
-        fileIo.readSync(file.fd, buf);
+        n = fileIo.readSync(file.fd, buf);
       } finally {
         fileIo.closeSync(file);
       }
+      // readSync 声明返回「实际读取字节数」；越界值只可能来自 SDK 违约，属于真异常。
+      if (n < 0 || n > st.size) { throw new Error('readSync 返回值异常'); }
+      // 只解码实际读到的字节：若文件在 stat 与 read 之间变小（短读），
+      // buf 尾部是 NUL 填充，整段解码会让 JSON.parse 失败并静默退化为空状态。
+      const bytes: Uint8Array = new Uint8Array(buf, 0, n);
       // save() 用 JSON.stringify 写出的是 UTF-8 字节，必须按 UTF-8 解码；
       // 按字节拼串等价于 Latin-1，会把非 ASCII 的 photoId 解成 mojibake。
-      const text: string = buffer.from(buf).toString('utf-8');
+      const text: string = buffer.from(bytes).toString('utf-8');
       const parsed = JSON.parse(text) as ClaimState;
       // Ruling 18：数据边界层校验，非法数据不得静默通过
       if (parsed === null || parsed === undefined || !Array.isArray(parsed.photos)) {
