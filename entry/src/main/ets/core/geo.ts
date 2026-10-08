@@ -26,7 +26,7 @@ export function haversineMeters(a: GeoPoint, b: GeoPoint): number {
 export function dmsToDecimal(dms: string): number {
   if (dms === undefined || dms === null || dms === '') { return NaN; }
   const norm = dms.replace(/，/g, ',');
-  const parts = norm.split(',');
+  const parts: string[] = norm.split(',');
   if (parts.length < 3) { return NaN; }
   const d = parseFloat(parts[0].trim());
   const m = parseFloat(parts[1].trim());
@@ -89,7 +89,7 @@ export function dedupePins(pins: Pin[], thresholdM: number): Pin[] {
   // 用户钉（manual/named）优先保留；把 gps 钉并进最近的用户钉
   const userPins = pins.filter((p: Pin) => p.kind !== 'gps');
   const gpsPins = pins.filter((p: Pin) => p.kind === 'gps');
-  const kept: Pin[] = userPins.slice();
+  const keptGps: Pin[] = [];
 
   for (let i = 0; i < gpsPins.length; i++) {
     const g = gpsPins[i];
@@ -98,15 +98,12 @@ export function dedupePins(pins: Pin[], thresholdM: number): Pin[] {
       if (haversineMeters(g, userPins[j]) <= thresholdM) { merged = true; break; }
     }
     if (merged) { continue; }
-    // 与已保留的 gps 钉去重
+    // 只在已保留的 gps 钉之间去重（user pin 已在上一循环排除）
     let dup = false;
-    for (let j = 0; j < kept.length; j++) {
-      if (haversineMeters(g, kept[j]) <= thresholdM) {
-        dup = true;
-        break;
-      }
+    for (let j = 0; j < keptGps.length; j++) {
+      if (haversineMeters(g, keptGps[j]) <= thresholdM) { dup = true; break; }
     }
-    if (!dup) { kept.push(g); }
+    if (!dup) { keptGps.push(g); }
   }
-  return kept;
+  return userPins.concat(keptGps);
 }
