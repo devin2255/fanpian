@@ -105,11 +105,10 @@ export class DecisionStore {
     }
   }
 
-  set(d: Decision): void {
-    const m = this.loadAll();
-    m.set(d.photoId, d);
-    this.saveAll(m);
-  }
+  // 这里刻意不再提供 set(d: Decision)（Task 8 曾有）：它内部 = loadAll() + saveAll()，
+  // 一旦被放在滑动热路径上就是「每滑一张一次全量读 + 一次全量写」，且跑在 UI 线程上。
+  // SwipePage 已改为「内存 Map 为权威副本 + 防抖合并全量写」，单条写入口再无调用者。
+  // 将来若确实需要单条写，先确认调用点不在热路径上，并且手上已有一份全量 Map。
 
   /** 收藏池：含已上墙的（上墙是从收藏里精选，两者不是互斥状态） */
   favedIds(): string[] {

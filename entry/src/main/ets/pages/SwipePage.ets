@@ -32,6 +32,12 @@ struct SwipePage {
   // 必须声明在 ctx 之后：字段初始化按声明顺序执行，提前会拿到 undefined 的 ctx
   private dStore: DecisionStore = new DecisionStore(this.ctx);
   private wallTimer: number = -1;   // 窗口期的 setTimeout 句柄，卸载时必须清掉（与 CardStack 同规矩）
+  // 落盘防抖：内存 Map 是权威副本，落盘合并成 1 秒窗口内最多一次。
+  // 每滑一张就 loadAll() + saveAll() 是「全量读 + 全量写」的同步 I/O，且跑在 UI 线程上；
+  // Task 7 的「手感挺好」是在无落盘时测的，加落盘后必须把 I/O 从每决策 2 次压到每秒至多 1 次。
+  private saveTimer: number = -1;
+  private pendingSave: boolean = false;
+  private readonly SAVE_DEBOUNCE_MS: number = 1000;
 
   aboutToAppear(): void {
     const claimStore = new ClaimStore(this.ctx);
@@ -64,6 +70,36 @@ struct SwipePage {
   // 与 CardStack 的做法一致：页面卸载后定时器不得再改状态
   aboutToDisappear(): void {
     if (this.wallTimer !== -1) { clearTimeout(this.wallTimer); this.wallTimer = -1; }
+    // 页面退出时把还没落盘的决策强制写下去，否则这次滑动就白刷了
+    this.flushSave();
+  }
+
+  // aboutToDisappear 只在页面被「销毁」时触发；router.pushUrl 到收藏页时本页只是被盖住、
+  // 并不销毁。若不在这里补一手，滑完 1 秒内点「收藏」，FavPage 读盘会读不到刚收藏的那张。
+  onPageHide(): void {
+    this.flushSave();
+  }
+
+  /** 决策只更新内存 Map；落盘合并到 1 秒窗口，避免每滑一张就全量读+写（UI 线程同步 I/O） */
+  private scheduleSave(): void {
+    this.pendingSave = true;
+    // 关键：只在「还没有排程」时才开表 —— 这是合并窗口（throttle），不是纯尾部防抖。
+    // 若每次都 clearTimeout 再重开（纯尾部防抖），连续快滑（间隔 < 1s）会把落盘无限推迟：
+    // 一路连滑 30 张期间一次都不写，此刻被杀丢的就不是「1 秒内的决策」而是整段连滑，
+    // 违背本任务「最多丢 1 秒」的前提。不重置则保证连滑期间每秒正好落一次盘。
+    if (this.saveTimer === -1) {
+      this.saveTimer = setTimeout(() => { this.flushSave(); }, this.SAVE_DEBOUNCE_MS);
+    }
+  }
+
+  /** 把内存 Map 全量写盘。失败只告警（DecisionStore.saveAll 内部已 hilog.warn）。 */
+  private flushSave(): void {
+    if (this.saveTimer !== -1) { clearTimeout(this.saveTimer); this.saveTimer = -1; }
+    if (!this.pendingSave) { return; }
+    this.pendingSave = false;
+    // 前提：this.decisions 自 aboutToAppear() 起就持有盘上原有的全部决策（那里是整表赋值），
+    // 否则这次「全量写」会把之前刷过的决策抹掉。
+    this.dStore.saveAll(this.decisions);
   }
 
   build() {
@@ -125,8 +161,8 @@ struct SwipePage {
     const nextAction = action === 'fav' ? 'fav' : 'archive';
     const next = applyDecision(d, nextAction, now);
     this.decisions.set(photoId, next);
-    // 决策立即落盘：不落盘的话杀掉 App 重开，这次滑动就白刷了
-    this.dStore.set(next);
+    // 落盘改防抖合并：内存 Map 已是权威副本，崩溃/被杀最多丢 1 秒内的决策
+    this.scheduleSave();
 
     // 只对「右滑收藏」弹窗口期，归档不弹
     if (nextAction === 'fav') {
@@ -147,7 +183,7 @@ struct SwipePage {
     const d = prev === undefined ? emptyDecision(id) : prev;
     const next = applyDecision(d, 'wall', Date.now());
     this.decisions.set(id, next);
-    this.dStore.set(next);
+    this.scheduleSave();
     this.wallPromptFor = '';
     if (this.wallTimer !== -1) { clearTimeout(this.wallTimer); this.wallTimer = -1; }
   }
