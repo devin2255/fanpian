@@ -161,6 +161,10 @@ struct SwipePage {
     // 只携带 'fav' / 'archive'），此处保留仅为运行期防御：将来若有人用 `as` 断言
     // 绕过类型检查（或退回旧的 onDecide(id, 'none') 形态），这道守卫仍能拦住未知动作，
     // 不让它静默归档或污染指标。
+    // 它的地位：对任何合法的 SwipeOutcome 取值，这个分支不可达（挡的不是正常路径），
+    // 挡的是经 `as` 断言洗过的值——例如 `{kind:'none'} as Object as SwipeOutcome`
+    // 这类双重断言仍能编译，类型系统拦不住它。所以它不是「可证不可达」的死代码，
+    // 不要因为「类型已保证」就把它删掉。
     if (!rolledBack && action !== 'fav' && action !== 'archive') { return; }
 
     const now = Date.now();

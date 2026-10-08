@@ -16,17 +16,26 @@ export const SPRING_BACK_MS = 150;
 export interface QueueItem { photoId: string; thumbUri: string }
 
 /**
- * 一次滑动的结果。用判别联合而非 (action, rolledBack) 两个独立参数：
- * 'none' 只可能是回弹、'fav'/'archive' 只可能是真实决策 —— 这对配对关系由类型强制，
- * 写错组合（例如 onDecide(id, 'none', false)）会在编译期报错，
+ * 一次滑动的结果（判别联合）。用它而非 (action, rolledBack) 两个独立参数，是为了让
+ * **字面量/直赋值形态**的非法配对在编译期报错：'rollback' 分支不携带 action、
+ * 'decision' 分支必须携带 action，所以 onDecide(id, 'none', false) 这类写法过不了编译，
  * 而不是被 SwipePage.handle() 的守卫静默丢弃（那会让卡片飞走、决策静默丢失）。
+ *
+ * 边界（已知且当前无害）：TypeScript 的多余属性检查只作用于「新鲜」字面量，
+ * 因此把一个带多余 action 字段的**变量**传给 'rollback' 分支仍能编译通过 ——
+ * 这是结构化类型的固有行为，与联合形态的选择无关。
+ * 真正的防线是消费侧按 kind 单向解码（见 pages/SwipePage.ets 的 handle）：
+ * 回弹分支的 action 恒为常量 'none'，多余字段不可能回流影响决策与指标。
+ * 另注：本联合只编码 action↔rolledBack 的配对，不编码「出口↔kind」对应 ——
+ * 新增手势出口时需自行确认它上报的 kind 与实际行为一致。
+ *
  * 注意：'skip' 与删除不在此列 —— 它们不是滑动手势（跳过在长按菜单、删除另设路径）。
  *
  * ArkTS 硬约束决定了这里只能写成两个「具名 interface」的联合，而非内联对象类型：
  *   - arkts-no-obj-literals-as-types：内联对象字面量不能作为类型声明；
  *   - arkts-no-untyped-obj-literals：对象字面量必须对应显式声明的 class/interface，
  *     所以调用点用显式标注的局部变量构造，不把字面量直接塞进联合类型的参数位。
- * 这两条只影响「怎么写」，不影响判别能力：非法配对（回弹带 action、决策缺 action）仍不可表达。
+ * 这两条只影响「怎么写」，不改变上面「边界」所述的判别范围。
  */
 export interface SwipeDecision { kind: 'decision'; action: 'fav' | 'archive' }
 export interface SwipeRollback { kind: 'rollback' }
@@ -37,7 +46,9 @@ export struct CardStack {
   @Prop item: QueueItem;
   @Prop cardWidth: number = 360;   // 由父组件经 onAreaChange 传入真实宽度，见 settle()
   // 上报的是一次滑动的「结果」（SwipeOutcome 判别联合）：合法配对由类型编码，
-  // 传错组合（例如回弹却带 action）会在编译期报错，而不是运行期被 handle() 的守卫静默丢弃。
+  // 字面量形态下传错组合（例如回弹却带 action）会在编译期报错，而不是运行期被
+  // handle() 的守卫静默丢弃；变量形态可绕过（见 SwipeOutcome 上方「边界」），
+  // 且「出口↔kind」对应不在编码范围内 —— 新增出口时请自行核对。
   onDecide: (photoId: string, outcome: SwipeOutcome) => void = () => {};
   @State dx: number = 0;
   @State dy: number = 0;
