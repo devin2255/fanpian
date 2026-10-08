@@ -1,11 +1,8 @@
 import { common } from '@kit.AbilityKit';
+import { buffer } from '@kit.ArkTS';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
-import { ClaimState, ClaimedPhoto, emptyClaimState, mergeBatch } from '../core/claim';
+import { ClaimState, ClaimedPhoto, emptyClaimState, mergeBatch, claimStorePath } from '../core/claim';
 import { fileIo } from '@kit.CoreFileKit';
-
-export function claimStorePath(filesDir: string): string {
-  return `${filesDir}/claimed_photos.json`;
-}
 
 export async function pickPhotos(): Promise<string[]> {
   const picker = new photoAccessHelper.PhotoViewPicker();
@@ -34,9 +31,9 @@ export class ClaimStore {
       } finally {
         fileIo.closeSync(file);
       }
-      const bytes = new Uint8Array(buf);
-      let text = '';
-      for (let i = 0; i < bytes.length; i++) { text += String.fromCharCode(bytes[i]); }
+      // save() 用 JSON.stringify 写出的是 UTF-8 字节，必须按 UTF-8 解码；
+      // 按字节拼串等价于 Latin-1，会把非 ASCII 的 photoId 解成 mojibake。
+      const text: string = buffer.from(buf).toString('utf-8');
       const parsed = JSON.parse(text) as ClaimState;
       // Ruling 18：数据边界层校验，非法数据不得静默通过
       if (parsed === null || parsed === undefined || !Array.isArray(parsed.photos)) {
@@ -54,8 +51,15 @@ export class ClaimStore {
           takenAt: typeof p.takenAt === 'number' && Number.isFinite(p.takenAt) ? p.takenAt : 0
         });
       }
-      const lastBatchId = typeof parsed.lastBatchId === 'number' && Number.isFinite(parsed.lastBatchId)
+      // 交叉校验：持久化的计数器可能损坏（0/负数），若不抬到已保留照片的最大 batchId，
+      // 下一次 mergeBatch 会算出 lastBatchId + 1 而复用仍在使用的 batchId。
+      let maxSeen: number = 0;
+      for (let i = 0; i < valid.length; i++) {
+        if (valid[i].batchId > maxSeen) { maxSeen = valid[i].batchId; }
+      }
+      const rawLast: number = typeof parsed.lastBatchId === 'number' && Number.isFinite(parsed.lastBatchId)
         ? parsed.lastBatchId : 0;
+      const lastBatchId: number = Math.max(Math.max(0, rawLast), maxSeen);
       return { photos: valid, lastBatchId: lastBatchId };
     } catch (e) {
       return emptyClaimState();
