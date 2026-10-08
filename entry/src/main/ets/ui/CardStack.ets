@@ -15,11 +15,21 @@ export const SPRING_BACK_MS = 150;
 // SwipePage 也从这里 import（不要各自定义一份）。
 export interface QueueItem { photoId: string; thumbUri: string }
 
+/**
+ * CardStack 会向父组件上报的三种手势结果。
+ * 收紧为联合类型（而非 string）：未来新增手势出口时，传错 action 会在编译期报错，
+ * 而不是被 SwipePage.handle() 的守卫静默拦下（那样卡片会飞走、决策静默丢失）。
+ * 注意：不含 'skip' —— 跳过是长按菜单里的动作（后续任务），不走滑动手势。
+ */
+export type SwipeAction = 'fav' | 'archive' | 'none';
+
 @Component
 export struct CardStack {
   @Prop item: QueueItem;
   @Prop cardWidth: number = 360;   // 由父组件经 onAreaChange 传入真实宽度，见 settle()
-  onDecide: (photoId: string, action: string, rolledBack: boolean) => void = () => {};
+  // 上报动作收紧为 SwipeAction：值域与运行期完全一致（原来就是这三个字面量），
+  // 只是把「传错 action」从运行期静默失败提前到编译期报错。
+  onDecide: (photoId: string, action: SwipeAction, rolledBack: boolean) => void = () => {};
   @State dx: number = 0;
   @State dy: number = 0;
   @State animating: boolean = false;   // 飞出动画期间为真，作为手势闸门（Ruling 27）；回弹不计入
