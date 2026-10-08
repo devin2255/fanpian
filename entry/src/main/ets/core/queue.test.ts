@@ -31,10 +31,11 @@ test('跳过 → 回到 unseen 且 deferCount +1', () => {
 });
 
 test('取消收藏 → 回到 unseen，deferCount 不变', () => {
-  const faved = applyDecision(emptyDecision('p1'), 'fav', 1);
-  const out = applyDecision(faved, 'unfav', 2);
+  const skipped = applyDecision(emptyDecision('p1'), 'skip', 1);   // deferCount = 1
+  const faved = applyDecision(skipped, 'fav', 2);                  // 仍为 1
+  const out = applyDecision(faved, 'unfav', 3);
   assert.equal(out.state, 'unseen');
-  assert.equal(out.deferCount, 0);
+  assert.equal(out.deferCount, 1, 'deferCount 不应被重置');
 });
 
 test('摘墙 → 回到 faved（不是 unseen）', () => {
@@ -92,4 +93,23 @@ test('今日回忆注入有上限（MAX_MEMORY_INJECT）', () => {
   const q = buildQueue(all, new Map<string, Decision>(), mem);
   assert.equal(q.length, 1 + MAX_MEMORY_INJECT);
   assert.deepEqual(q.map((x) => x.photoId), ['a', 'm1', 'm2']);
+});
+
+test('顺序：队首 → promoted → 回忆 → 其余 pending（四段顺序不可换）', () => {
+  // 构造：a 被跳过 3 次 → promoted；b/c 未决策 → pending；m1/m2 为今日回忆
+  const all = [
+    { photoId: 'a', takenAt: 100 },
+    { photoId: 'b', takenAt: 500 },
+    { photoId: 'c', takenAt: 400 }
+  ];
+  const decisions = new Map<string, Decision>();
+  let d = emptyDecision('a');
+  for (let i = 0; i < DEFER_PROMOTE_AT; i++) { d = applyDecision(d, 'skip', i); }
+  decisions.set('a', d);
+
+  const mem = [{ photoId: 'm1', takenAt: 10 }, { photoId: 'm2', takenAt: 20 }];
+  const q = buildQueue(all, decisions, mem);
+
+  // pending 降序 = [b(500), c(400)]；promoted = [a(100)]
+  assert.deepEqual(q.map((x) => x.photoId), ['b', 'a', 'm1', 'm2', 'c']);
 });
