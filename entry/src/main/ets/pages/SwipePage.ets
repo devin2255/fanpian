@@ -4,6 +4,11 @@ import { CardStack, QueueItem } from '../ui/CardStack';
 import { Decision, emptyDecision, applyDecision } from '../core/queue';
 import { MetricsState, emptyMetrics, recordSwipe, medianDecisionMs, rollbackRate } from '../core/metrics';
 
+// 卡片占页面宽度的比例（与 CardStack.ets 的 .width('86%') 必须一致）。
+// settle() 的位移阈值以「卡宽」为基准（spec 的 COMMIT_DISTANCE_RATIO = 0.28 是卡宽比例），
+// 而 onAreaChange 量到的是页面宽，所以这里要乘回该比例。
+const CARD_WIDTH_RATIO = 0.86;
+
 @Entry
 @Component
 struct SwipePage {
@@ -11,7 +16,7 @@ struct SwipePage {
   @State idx: number = 0;
   @State medianMs: number = 0;
   @State rollbackPct: number = 0;
-  @State cardW: number = 360;   // 兜底值，首帧布局后由 onAreaChange 覆盖为真实宽度
+  @State cardW: number = 360;   // 兜底值 = 首帧尚未量出卡宽时的假定卡宽；布局后由 onAreaChange 覆盖
   private decisions: Map<string, Decision> = new Map();
   private metrics: MetricsState = emptyMetrics();
   private shownAt: number = Date.now();
@@ -54,8 +59,9 @@ struct SwipePage {
       }
       .layoutWeight(1).width('100%')
       .onAreaChange((oldVal: Area, newVal: Area) => {
+        // 量到的是页面宽，换算成卡宽再交给 CardStack 的 settle()（阈值以卡宽为基准）。
         const w = Number(newVal.width);
-        if (w > 0) { this.cardW = w; }
+        if (w > 0) { this.cardW = w * CARD_WIDTH_RATIO; }
       })
     }
     .width('100%').height('100%').backgroundColor('#FAFAFA')

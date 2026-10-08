@@ -22,15 +22,21 @@ export struct CardStack {
   onDecide: (photoId: string, action: string, rolledBack: boolean) => void = () => {};
   @State dx: number = 0;
   @State dy: number = 0;
-  @State animating: boolean = false;
+  @State animating: boolean = false;   // 飞出动画期间为真，作为手势闸门（Ruling 27）；回弹不计入
   private lastX: number = 0;
   private lastT: number = 0;
   private velocity: number = 0;
+  private flyTimer: number = -1;       // flyOut 的 setTimeout 句柄，卸载时必须清掉（Ruling 28）
 
   aboutToAppear(): void {
     this.dx = 0;
     this.dy = 0;
     this.velocity = 0;
+  }
+
+  // 组件卸载（用户 230ms 内返回上一页）后不能再回调 onDecide。
+  aboutToDisappear(): void {
+    if (this.flyTimer !== -1) { clearTimeout(this.flyTimer); this.flyTimer = -1; }
   }
 
   build() {
@@ -40,6 +46,7 @@ export struct CardStack {
         .objectFit(ImageFit.Cover)
         .borderRadius(16)
     }
+    // 86% 与 SwipePage.ets 的 CARD_WIDTH_RATIO 是同一个事实的两处表达：改一处必须改另一处。
     .width('86%').height('62%')
     .backgroundColor('#EEE')
     .borderRadius(16)
@@ -48,11 +55,13 @@ export struct CardStack {
     .gesture(
       PanGesture({ fingers: 1, distance: 5 })
         .onActionStart((e: GestureEvent) => {
+          if (this.animating) { return; }        // Ruling 27：飞出动画期间不接受新手势
           this.lastX = e.offsetX;
           this.lastT = Date.now();
           this.velocity = 0;
         })
         .onActionUpdate((e: GestureEvent) => {
+          if (this.animating) { return; }
           const now = Date.now();
           const dt = now - this.lastT;
           if (dt > 0) { this.velocity = ((e.offsetX - this.lastX) / dt) * 1000; }
@@ -66,6 +75,7 @@ export struct CardStack {
   }
 
   private settle(): void {
+    if (this.animating) { return; }   // 已在飞出动画中，忽略（防御性；正常路径已被手势闸门挡住）
     // 用真实宽度算位移阈值：360 只是父组件尚未量出宽度时的兜底，不是判定依据。
     const w = this.cardWidth > 0 ? this.cardWidth : 360;
     const commitDist = w * COMMIT_DISTANCE_RATIO;
@@ -87,7 +97,9 @@ export struct CardStack {
       this.dx = dir * 600;
       this.dy = this.dy + 40;
     });
-    setTimeout(() => {
+    if (this.flyTimer !== -1) { clearTimeout(this.flyTimer); }
+    this.flyTimer = setTimeout(() => {
+      this.flyTimer = -1;
       this.onDecide(this.item.photoId, dir > 0 ? 'fav' : 'archive', false);
       // 组件实例会被复用给下一张卡片（aboutToAppear 不会再跑），必须在这里归位。
       this.dx = 0;
