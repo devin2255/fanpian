@@ -58,6 +58,10 @@ struct ClaimPage {
         .fontSize(16).height(46).width(200)
         .onClick(() => { router.pushUrl({ url: 'pages/SwipePage' }); })
 
+      Button('看收藏')
+        .fontSize(16).height(46).width(200)
+        .onClick(() => { router.pushUrl({ url: 'pages/FavPage' }); })
+
       Text(this.msg).fontSize(12).fontColor('#D33')
     }
     .width('100%').height('100%').justifyContent(FlexAlign.Center)
