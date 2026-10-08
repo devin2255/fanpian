@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "相册探针"
+    },
+    {
+      "name": "reason_read_imagevideo",
+      "value": "用于读取并整理相册中的照片，帮助用户浏览、收藏与清理自己的照片"
+    },
+    {
+      "name": "reason_media_location",
+      "value": "用于读取照片的拍摄地点，把照片挂到地图照片墙上"
+    }
+  ]
+}
