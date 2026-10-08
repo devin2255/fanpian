@@ -47,3 +47,16 @@ test('shownAt 晚于 decidedAt 时忽略该样本', () => {
   m = recordSwipe(m, ev(500, 1000));
   assert.equal(m.events.length, 0);
 });
+
+test('回弹率：空状态返回 0，不除零', () => {
+  assert.equal(rollbackRate(emptyMetrics()), 0);
+});
+
+test('脏数据被丢弃后，状态仍可继续使用', () => {
+  let m = emptyMetrics();
+  m = recordSwipe(m, ev(500, 1000));   // 脏：decidedAt < shownAt → 丢弃
+  assert.equal(m.events.length, 0);
+  m = recordSwipe(m, ev(1000, 0));     // 合法
+  assert.equal(m.events.length, 1, '丢弃脏数据后仍应能接受新样本');
+  assert.equal(medianDecisionMs(m), 1000);
+});
