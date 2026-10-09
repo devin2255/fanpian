@@ -8,6 +8,8 @@
 //      基准是**卡高**（不再是卡宽），卡高由父组件经 onAreaChange 传入（见 cardHeight）；
 //   4. 队列边界（idx === 0，没有上一张）不播翻出动画而是普通回弹：翻出动画之后父组件只能原样
 //      换回同一张，用户看到的是「卡片滑走又原地弹回」，比不响应更像故障（见 canPrev / canNav）。
+//      且这一次**不上报回弹**（产品裁决：无法再往前不是一次「滑了但没结果」的滑动尝试，
+//      不该计入回弹率）—— 见 springBack(report) 与 settle()。
 //
 // 另注：卡片翻出的时刻由 setTimeout(...,210) 回调；CardStack 自身不计时，
 // 「这张照片显示了多久」由 SwipePage.shownAt 承担（它才是跨卡片持有度量的那一层）。
@@ -57,11 +59,12 @@ export interface CardNav { kind: 'nav'; payload: NavPayload }
 export type CardEvent = CardDecide | CardWall | CardNav;
 
 /**
- * 回弹（手势没到阈值，或队首下滑而队列里没有上一张）。它**刻意不是** CardEvent 的一支，
+ * 回弹（**手势没过阈值**：滑了但没结果，卡片弹回原位）。它**刻意不是** CardEvent 的一支，
  * 而是与 CardEvent 并列的第二种上报类型：回弹不是「卡片做出的动作」，没有动作语义可判别，
  * 唯一用途是喂 core/metrics.ts 的 rollbackRate —— 「回弹率 < 3%」这条验收指标的**唯一数据源**。
- * 所以它必须继续由 springBack() 上报、必须继续被 SwipePage.handle() 解码
+ * 所以它必须继续由 springBack(true) 上报、必须继续被 SwipePage.handle() 解码
  *（rolledBack = true：只进指标、不消耗队列）。删掉它等于让回弹率的分子结构性恒为 0、指标恒"达标"。
+ * 但它**不是**队首下滑的上报类型：那一支走 springBack(false)（产品裁决「不算，静默弹回」）。
  */
 export interface SwipeRollback { kind: 'rollback' }
 
@@ -78,7 +81,7 @@ export struct CardStack {
   // 合法组合由类型编码，字面量形态下传错组合会在编译期报错，而不是运行期被 handle() 的守卫
   // 静默丢弃；变量形态可绕过（见 CardEvent 上方「边界」），且「出口 ↔ kind」对应不在编码范围内
   // —— 新增出口时请自行核对。当前七个出口：
-  //   手势上滑 → 'nav'(dir=-1)、手势下滑 → 'nav'(dir=1)（队列边界时改为上报回弹）、
+  //   手势上滑 → 'nav'(dir=-1)、手势下滑 → 'nav'(dir=1)（队列边界时改为静默回弹、不上报）、
   //   卡片「← 返回」按钮 → 'nav'(dir=1)、「归档」按钮 → 'decide'/archive、
   //   「收藏」按钮 → 'decide'/fav、「上墙」按钮 → 'wall'、回弹 → 'rollback'。
   onDecide: (photoId: string, ev: CardEvent | SwipeRollback) => void = () => {};
@@ -290,10 +293,13 @@ export struct CardStack {
     } else if (this.dy > 0 && (fast || far)) {
       // 下滑 → 上一张。idx === 0（队首）时没有上一张：走普通回弹而不是 navOut ——
       // navOut 会先把卡片送出视野，而父组件的 navigate(1) 只能早退，卡片原地弹回 = 像故障。
-      // 这一次手势确实没产生任何动作，所以照常计一次回弹（回弹率的语义就是「滑了但没结果」）。
-      if (this.canNav(1)) { this.navOut(1); } else { this.springBack(); }
+      // 但这一次回弹**不上报**（report=false；产品裁决：「不算，静默弹回」）：回弹率的语义是
+      //「一次滑动尝试没能产生结果」，而队首下滑根本不是滑动尝试 —— 往前已经没有可翻的下一张，
+      // 用户想「回看上一张」的意图在队列边界上不存在。上报它会让指标随用户在队首来回蹭而失真。
+      if (this.canNav(1)) { this.navOut(1); } else { this.springBack(false); }
     } else {
-      this.springBack();
+      // 没过阈值 = 一次真正的「滑了但没结果」：照常上报，这是回弹率分子的唯一来源。
+      this.springBack(true);
     }
   }
 
@@ -389,12 +395,21 @@ export struct CardStack {
     this.navOut(dir);
   }
 
-  private springBack(): void {
+  /**
+   * 手势回弹：动画归位 +（report 为真时）上报一次回弹。
+   * report 的两个取值与「这是不是一次滑动尝试」一一对应，调用点只有 settle() 的两支：
+   *   - 没过阈值 → true：滑了但没结果，是回弹率分子的唯一来源，不得变成 false；
+   *   - 队首下滑（canPrev 为假，无法再往前）→ false：不是一次滑动尝试（产品裁决），
+   *     只做视觉归位，不进任何指标。
+   * report 只决定**上不上报**：防抖窗口（springTimer）与归位动画两者的行为完全不变，
+   * 所以「静默弹回」不会在窗口管理上留下任何差异（它照样开窗、照样在 150ms 后关窗）。
+   */
+  private springBack(report: boolean): void {
     // Ruling 29：rolledBack 是「回弹率 <3%」验收指标的唯一数据源，
     // 快速连划不得重复上报同一次回弹；但手势仍可继续（不设 animating）。
     const alreadyReported = this.springTimer !== -1;
-    if (!alreadyReported) {
-      // 回弹 = 用户犹豫过（或队首下滑没有上一张），计入回弹率（每张卡每个回弹窗口只计一次）
+    if (!alreadyReported && report) {
+      // 回弹 = 用户犹豫过（滑了但没过阈值），计入回弹率（每张卡每个回弹窗口只计一次）
       const out: SwipeRollback = { kind: 'rollback' };
       this.onDecide(this.item.photoId, out);
     }

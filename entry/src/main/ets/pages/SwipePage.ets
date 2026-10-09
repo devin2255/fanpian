@@ -121,10 +121,16 @@ struct SwipePage {
             Text('今天的份刷完了').fontSize(18).fontColor('#666')
             // 队尾也必须能回头：否则用户在最后一张上滑之后就再也看不到刚划走的那张，
             // 与「刚划走的还想再看一下要不要上墙」这个核心诉求直接冲突。
-            Button('← 返回上一张').fontSize(14).height(40).width(160)
-              .backgroundColor('#1F6FEB').fontColor(Color.White)
-              .margin({ top: 16 })
-              .onClick(() => { this.navigate(1); })
+            // 但只有在**确实有可回看的照片**时才给这个按钮：items 为空（用户还没认领任何照片）
+            // 时 idx === 0，navigate(1) 会在第一道守卫早退，这样渲染出来的是一个点了没反应的
+            // 死按钮 —— 比不显示更糟（用户会以为 App 卡了）。完成态里 idx 只可能是
+            // items.length（正常刷完）或 0（空队列），所以判据就是 idx > 0。
+            if (this.idx > 0) {
+              Button('← 返回上一张').fontSize(14).height(40).width(160)
+                .backgroundColor('#1F6FEB').fontColor(Color.White)
+                .margin({ top: 16 })
+                .onClick(() => { this.navigate(1); })
+            }
           }
         }
       }
