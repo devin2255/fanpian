@@ -523,6 +523,11 @@ test('广域 fixture（wall-sample.json：乌鲁木齐/敦煌/拉萨/广州/北�
     assert.ok(p.lon >= b[0] && p.lon <= b[2] && p.lat >= b[1] && p.lat <= b[3],
       `在中国范围内的照片跑到框外了：${p.photoId}`);
   }
+  // 更极端的广域（wall-sample-many：喀什 76°E ~ 哈尔滨 126.5°E、漠河 53°N ~ 三沙 16.8°N）：
+  // 加边距之后跨度比中国还大 → `fitAxis` 第 ③ 步把跨度收到中国跨度并平移 → **正好等于全国 bounds**。
+  // 这是"跨度大时不放大"的最强形式，也说明多钉那份夹具的几何与改动前**逐点相同**。
+  assert.deepEqual(fitBounds(loadFixture('wall-sample-many.json'), VIEW_PAD_RATIO), CHINA_REGION.bounds);
+  assert.equal(viewZoomOf(CHINA_REGION.bounds), 1);
 });
 
 test('近邻城市 fixture（wall-sample-nearby.json：上海+北京+天津）→ 框跨度 = 设备真值，放大 ~9.4 倍', () => {
