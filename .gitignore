@@ -10,3 +10,9 @@
 /.clang-tidy
 **/.test
 /.appanalyzer
+# 地图墙工具链的中间产物与原始数据：都不入库。
+# tools/raw 是 Natural Earth 的原始 GeoJSON（10m 那份 12.7 MB）；
+# tools/out 是可随时用 render-preview.ts 重新生成的预览图。
+# 入库的只有简化后的 entry/src/main/resources/rawfile/china_outline.json。
+/tools/raw/
+/tools/out/
