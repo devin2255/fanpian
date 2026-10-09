@@ -2,6 +2,7 @@
   "src": [
     "pages/ClaimPage",
     "pages/SwipePage",
-    "pages/FavPage"
+    "pages/FavPage",
+    "pages/WallPage"
   ]
 }

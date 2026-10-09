@@ -1,4 +1,5 @@
 import { common } from '@kit.AbilityKit';
+import { router } from '@kit.ArkUI';
 import { DecisionStore } from '../data/decisionStore';
 
 // 收藏页 = 决策落盘后的第一个「回头路」：上墙窗口期错过也不惩罚，随时能在这里补。
@@ -18,6 +19,15 @@ struct FavPage {
     Column() {
       Text(`收藏 ${this.faved.length} 张 ｜ 已上墙 ${this.walled.length} 张`)
         .fontSize(15).fontWeight(FontWeight.Medium).padding(16)
+
+      // 看地图墙：把上墙的照片挂到中国地图上。上墙数为 0 也允许进 —— 那一页有自己的空态，
+      // 而且"为什么墙上是空的"这件事只有在那一页才说得清（缺地点 / 缺 GPS）。
+      Button('看地图墙')
+        .fontSize(14)
+        .backgroundColor('#1F6FEB')
+        .width('90%')
+        .margin({ bottom: 12 })
+        .onClick(() => { router.pushUrl({ url: 'pages/WallPage' }); })
 
       if (this.faved.length === 0) {
         // 空状态：一张都没收藏时不留一片空白，顺便说明收藏从哪来
