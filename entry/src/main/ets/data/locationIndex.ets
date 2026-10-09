@@ -56,6 +56,26 @@ export interface LocationEntry {
    * 一个 photoId 只有一个地点。分两份存会让"这张到底在哪"有两个答案，而两份答案迟早打架。
    */
   manual?: boolean;
+  /**
+   * 地点的**显示名**，如「河北·石家庄·正定」「上海·浦东」。**唯一产出者**是
+   * `core/placePick.ts` 的 `formatPlace`（格式规则只在那里定义，别处不要拼）。
+   *
+   * 语义（三条，写清楚是为了不让这个字段的含义发散）：
+   *   1) **手动选择时由用户的选择直接写入**（`PlaceStore.setManual` 落盘）。为什么必须存下来
+   *      而不是用 `nearestCounty` 反查：反查是**近似**（最近的县中心 ≠ 用户选的那个县，
+   *      省界/县界附近会选错），而且每次要多扫一遍 2851 个县的全表；用户**明确选过**那个县，
+   *      把名字直接存下来是最忠实的。
+   *   2) **EXIF 来源的条目通常没有这个字段**（读盘时是 `undefined`，因此 `JSON.stringify`
+   *      不会写出去，文件不会被一堆 `"place":""` 撑大）。地图墙遇到没有名字的钉子，
+   *      可以退回用 `nearestCounty(lat, lon)` 反查一个近似名 —— 那是**退化路径**，不是默认路径。
+   *   3) **本批之前写入的条目也没有这个字段**（本批升级前落盘的 239 条手动地点全部只有坐标）。
+   *      缺这个字段是**正常**的，所以读侧的校验对它**不告警**（与 manual 的分级不同，见 load）。
+   *
+   * 与 `manual` 的关系：`place` 只在 `manual === true` 的条目上有意义（EXIF 条目的名字由地图墙
+   * 自己反查）。但读侧**不**把两者绑定校验 —— 名字与坐标的来源判断是两件事，混在一起
+   * 会让"升级前写入的旧条目"这类正常数据落进告警分支。
+   */
+  place?: string;
 }
 
 export function locationIndexPath(filesDir: string): string {
@@ -133,6 +153,11 @@ export class LocationIndex {
       // 这一种只丢标记、保留条目（坐标与时间仍然是有效信息）。分开计数是为了让告警
       // 能说清"丢了什么"——把"丢了一个标记"和"丢了一条记录"混成一句，真机上无法定位。
       let badManual = 0;
+      // place 字段**存在但不是非空字符串**的条数。分级与 badManual 相同（丢字段、留条目），
+      // 但**必须单独计数**：两者是不同字段的错误，混在一起就分不清写侧到底写坏了哪一个。
+      // 注意它与"**根本没有 place 字段**"是两回事：后者是**正常**数据（EXIF 条目、以及本批
+      // 升级前写入的旧条目），一条都不计数、一个字都不告警（见下面 for 里的分支）。
+      let badPlace = 0;
       for (let i = 0; i < parsed.length; i++) {
         const e = parsed[i];
         if (e === null || e === undefined) { skipped = skipped + 1; continue; }
@@ -152,6 +177,20 @@ export class LocationIndex {
         // 宁可在这一侧保守：丢一个标记的代价是"下次重建时可能被 EXIF 覆盖"，
         // 而乱认一个标记的代价是"这条地点永远错了且无人知道"。
         if (e.manual !== undefined && typeof e.manual !== 'boolean') { badManual = badManual + 1; }
+        // place（显示名）也是**可选**字段，但它的校验口径与 manual **刻意不同**：
+        //   · 字段整个不存在 → **正常**（EXIF 条目、升级前写入的旧条目）→ 不计数、不告警；
+        //   · 字段在但不是非空字符串（数字 / 布尔 / 对象 / 空串 / 纯空白）→ 写侧写坏了 → 计数告警，
+        //     但**照旧保留条目**（坐标与时间仍然有效，只是地图上这个钉子暂时没有名字，
+        //     读侧可退回 nearestCounty 反查）。
+        // 空串一律当"没有名字"处理、而不是原样存成 `''`：`''` 落盘后读回来仍是 `''`，
+        // 地图墙要判两次（undefined 与空串）才敢决定"要不要反查" —— 一个字段两种"空"
+        // 是 bug 的温床（"没有名字"只该有一种表示）。
+        let placeVal: string | undefined = undefined;
+        if (typeof e.place === 'string' && e.place.trim() !== '') {
+          placeVal = e.place;
+        } else if (e.place !== undefined) {
+          badPlace = badPlace + 1;
+        }
         out.push({
           photoId: e.photoId,
           lat: typeof e.lat === 'number' && Number.isFinite(e.lat) ? e.lat : 0,
@@ -159,7 +198,11 @@ export class LocationIndex {
           takenAt: typeof e.takenAt === 'number' && Number.isFinite(e.takenAt) ? e.takenAt : 0,
           // undefined 不会被 JSON.stringify 写出去，所以"来自 EXIF"的条目在盘上**没有这个键**，
           // 文件不会被一堆 `"manual":false` 撑大（3210 条索引里绝大多数是 EXIF 条目）。
-          manual: e.manual === true ? true : undefined
+          manual: e.manual === true ? true : undefined,
+          // 同上：`undefined` 不落盘 → EXIF 条目与"名字已丢弃"的条目在盘上**都没有 place 键**，
+          // 只有真正有名字的条目才多一个键（升级前写入的 239 条旧条目读进来仍是 5 个键，
+          // 只有它们下次被手选覆盖时才会多出 place）。
+          place: placeVal
         });
       }
       if (skipped > 0) {
@@ -172,6 +215,13 @@ export class LocationIndex {
         // 与上面分级不同：条目保留、只丢标记。所以单独一条告警，不混进"已跳过"里。
         hilog.warn(DOMAIN, TAG, '%{public}s',
           `地点索引中有 ${badManual} 条的 manual 字段不是布尔值，已按"来自 EXIF"处理（条目保留、标记丢弃）`);
+      }
+      if (badPlace > 0) {
+        // 同样单独一条：写坏的字段不同（place 而不是 manual），真机上要能一眼分开。
+        // 触发它的只可能是写侧出错 —— **升级前写入的旧条目不会走到这里**（那些条目压根没有
+        // place 键，走的是"不存在 → 不计数"那一支），所以这条告警一旦出现就是真问题。
+        hilog.warn(DOMAIN, TAG, '%{public}s',
+          `地点索引中有 ${badPlace} 条的 place 字段不是非空字符串，已丢弃该字段（条目保留、坐标与时间不受影响）`);
       }
       return out;
     } catch (e) {

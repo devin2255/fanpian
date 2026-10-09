@@ -8,7 +8,7 @@ import { PlaceStore } from '../data/placeStore';
 import { CardStack, QueueItem, CardEvent, SwipeRollback } from '../ui/CardStack';
 import { PlaceOutcome, pickPlace, toastReading } from '../ui/PlacePicker';
 import { Decision, emptyDecision, applyDecision } from '../core/queue';
-import { hasPlace } from '../core/placePick';
+import { hasPlace, formatPlace } from '../core/placePick';
 import { MetricsState, emptyMetrics, recordSwipe, medianDecisionMs, rollbackRate } from '../core/metrics';
 // 会话模型（product：没有认领动作，改为"指定张数 → 抽样 → 刷完问是否继续"）。
 // 本页**消费**上一页存下的会话：cursor 是位置的唯一真相，advance 是唯一的"刷过一张"操作，
@@ -479,11 +479,20 @@ struct SwipePage {
         `地点已选（${o.hit.province}/${o.hit.city}/${o.hit.county}），但这张已有别的决策，放弃上墙`);
       return;
     }
-    const ok: boolean = this.pStore.setManual(photoId, o.hit, Date.now());
+    // 显示名在这里生成、随地点一起落盘（**不在 setManual 里现算**：那样 core 的 formatPlace
+    // 就得被 data 层 import，而"格式"这件事只该有一个定义处，见 core/placePick.formatPlace）。
+    // 它必须与 hit 来自同一个对象，所以就在这一行现算 —— 不存在"名字与坐标对不上"的可能。
+    const name: string = formatPlace(o.hit);
+    const ok: boolean = this.pStore.setManual(photoId, o.hit, name, Date.now());
     if (!ok) {
       // 地点没写进去（photoId 空 / 坐标非法 —— 正常情况下结构上不可达，见 setManual）。
       // 仍然继续上墙：用户点的是「上墙」，那是他的主要意图；地点写失败由上面那行 warn 记录。
       hilog.warn(DOMAIN, TAG, '%{public}s', `手选地点未能写入，本次上墙将没有地点: ${photoId}`);
+    } else if (name === '') {
+      // 名字为空是**合法但异常**的组合（hit 来自 findCounty，省/市/县都是真名字，不该全空）：
+      // 地点已经写进去了（上墙照常），只是地图上这个钉子暂时没有标签。留一行日志便于真机定位。
+      hilog.warn(DOMAIN, TAG, '%{public}s',
+        `手选地点已写入但没有显示名（formatPlace 返回空串）: ${photoId} ${o.hit.province}/${o.hit.city}/${o.hit.county}`);
     }
     this.applyWall(photoId);
   }
