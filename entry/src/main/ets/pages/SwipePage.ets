@@ -1,9 +1,7 @@
 import { common } from '@kit.AbilityKit';
-import { hilog } from '@kit.PerformanceAnalysisKit';
 import { router } from '@kit.ArkUI';
 import { DecisionStore } from '../data/decisionStore';
 import { SessionStore, takeSession } from '../data/sessionStore';
-import { LocationIndex, LocationEntry } from '../data/locationIndex';
 import { CardStack, QueueItem, CardEvent, SwipeRollback } from '../ui/CardStack';
 import { Decision, emptyDecision, applyDecision } from '../core/queue';
 import { MetricsState, emptyMetrics, recordSwipe, medianDecisionMs, rollbackRate } from '../core/metrics';
@@ -79,27 +77,6 @@ struct SwipePage {
     //   3) navigate(1)（返回上一张）会 decisions.delete + dStore.remove，内存与盘必须同源。
     this.decisions = this.dStore.loadAll();
     this.shownAt = Date.now();
-
-    // 地点索引：增量读取 EXIF（时间 + GPS），供地图墙使用。
-    // 不 await：它是后台性质的工作，不该阻塞刷卡页首帧。
-    //
-    // 输入 = 本会话的队列。任务书这里写的是 `claimed.photos`（ClaimStore.load() 的结果），
-    // 那是「认领流程」还在时的写法：Task 8 之后本页已经不再读 ClaimStore（池子与抽样都在首页完成，
-    // 本页只消费 takeSession() 取回的那一局），所以「已有的、在内存里的照片清单」就是 session.queue
-    // —— 同样满足「复用现有变量、不要重复读盘」这条要求。它比 claimed 更贴合地图墙要看的东西：
-    // 用户这次真正在刷的就是这一批。buildFrom 只读入参、不改它，所以传引用是安全的。
-    const idx = new LocationIndex(this.ctx);
-    idx.buildFrom(session.queue)
-      .then((list: LocationEntry[]) => {
-        let withGps = 0;
-        for (let i = 0; i < list.length; i++) {
-          if (list[i].lat !== 0 || list[i].lon !== 0) { withGps = withGps + 1; }
-        }
-        hilog.info(0x0000, 'PhotoWall', '%{public}s', `索引 ${list.length} 条，其中带 GPS ${withGps} 条`);
-      })
-      .catch((e: Error) => {
-        hilog.warn(0x0000, 'PhotoWall', '%{public}s', `地点索引构建失败: ${e.message}`);
-      });
   }
 
   // 与 CardStack 的做法一致：页面卸载后定时器不得再改状态

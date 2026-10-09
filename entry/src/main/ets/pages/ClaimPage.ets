@@ -1,8 +1,10 @@
 import { common } from '@kit.AbilityKit';
 import { router } from '@kit.ArkUI';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { ClaimStore, pickPhotos } from '../data/claimStore';
 import { DecisionStore } from '../data/decisionStore';
+import { LocationIndex, LocationEntry } from '../data/locationIndex';
 import { SessionStore, setSession } from '../data/sessionStore';
 // 以下 import 是为了把 core 层留在 ArkTS 编译图内（Ruling 17）。
 // 重要：必须出现在「值位置」——只当类型用会被 ArkTS 擦成 type-only import，
@@ -132,6 +134,28 @@ struct ClaimPage {
       this.msg = '还没有可刷的照片：在系统相册里选一批就能开始。';
       return;
     }
+    // 地点索引：覆盖**整个已授权池**（不是本会话抽中的那几十张）——
+    // 地图页（Task 10）要渲染全部照片，只索引一局会让未抽中的照片在地图上消失。
+    // buildFrom 是幂等增量的（已索引的 URI 不重读），所以每次开始会话都调一次是安全的。
+    // 不 await：它是后台性质的工作，不该阻塞跳转。
+    //
+    // 位置：紧跟 pool 构建（含补货后那次重读）与空池早退之后、抽样之前。三个理由：
+    //   1) 此刻的 pool 就是马上要抽样、也是地图页要展示的那份池子，没有任何中间状态改过它；
+    //   2) 放在空池早退**之后**：空池时 buildFrom 只会白读一次盘并打一条"0 条"的日志；
+    //   3) 不 await，所以越早启动越好 —— 它随后与抽样、setPrevQueue、pushUrl 并发跑，
+    //      用户走到地图页时索引已多读了一些。
+    const idx = new LocationIndex(this.ctx);
+    idx.buildFrom(pool)
+      .then((list: LocationEntry[]) => {
+        let withGps = 0;
+        for (let i = 0; i < list.length; i++) {
+          if (list[i].lat !== 0 || list[i].lon !== 0) { withGps++; }
+        }
+        hilog.info(0x0000, 'PhotoWall', '%{public}s', `地点索引 ${list.length} 条，其中带 GPS ${withGps} 条`);
+      })
+      .catch((e: Error) => {
+        hilog.warn(0x0000, 'PhotoWall', '%{public}s', `地点索引构建失败: ${e.message}`);
+      });
     // 「看过」与「上一批」一起构成抽样的输入：决策不再影响入池（放回抽样：已归档/已收藏/已上墙
     // 的照片仍会被抽中，见 core/session.ts 的文件头），但「看过」影响优先级。
     const sessionStore = new SessionStore(this.ctx);
