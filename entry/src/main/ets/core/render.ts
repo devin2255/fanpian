@@ -472,6 +472,128 @@ export function viewZoomOf(bounds: number[]): number {
   return base / span;
 }
 
+/**
+ * Mercator 的 y **反函数**（`mercYOf` 的逆）：把一个 mercY 值还原成纬度（度）。
+ *
+ * 推导：`y = ln(tan(π/4 + φ/2))` → `φ = 2·atan(e^y) − π/2`。
+ * 只在 `fitViewToCanvas` 撑开纬度时用得到：那里必须在 **mercY 空间**里撑开（因为
+ * `geoAspect` 的分子分母就是 `经度弧度 / mercY 跨度`），撑完再换回纬度。
+ */
+function invMercYOf(y: number): number {
+  return (2 * Math.atan(Math.exp(y)) - Math.PI / 2) / DEG;
+}
+
+/**
+ * 纬度撑开的硬边界（度）。墨卡托在 ±85° 发散（`mercY → ±∞`），±84 之内仍然温和 ——
+ * 这是"让 `fitViewToCanvas` 永远不产出 NaN/Infinity 坐标"的兜底，**不是**中国国界。
+ */
+const LAT_EXPAND_LIMIT = 84;
+/** 经度撑开的硬边界（度）：跨度不许超过一整个环球 —— 再大就没有地图的语义了。 */
+const LON_EXPAND_LIMIT = 360;
+
+/**
+ * 把"能装下数据的视野"调整为**与画布同样比例**（默认铺满）。
+ *
+ * ── 为什么需要（这就是用户的第三条反馈"默认铺满"的成因）──────────────────────
+ *   `fitBounds` 只按**数据跨度**求框，不看画布。而 `mapFrame` 为了**不变形**只能
+ *   在块里 contain（居中信箱式）：当 `geoAspect(数据框) != 画布宽高比` 时，
+ *   框的一侧会空出一条带。设备真值（控制器在真机上量到的）正是这一档：
+ *
+ *     画布（地图块）376 × 663.71pt，视野 [115.66, 29.88, 122.19, 41.24]
+ *     → 数据框的墨卡托宽高比 0.4671，画布宽高比 376/663.71 = 0.5665
+ *     → `mapFrame` 给 309.1 × 663.71 @ (33.45, 0)，**左右各空 33.45pt**
+ *
+ *   本函数把框在**较短的那个轴上按比例撑开**，使"框的比例 == 画布的比例"：
+ *   数据仍然全部可见（框 ⊇ 数据），但不再有信箱空白 —— 空出来的那两条带由
+ *   **地图自己**（国界 / 省界 / 海岸线）填上。
+ *
+ * ── 撑开哪一根轴：由"框被谁限制"决定（不是随便挑一根）────────────────────────
+ *   · `geoAspect(数据框) < 画布比` → 框会被**高度**限制（左右空）→ 撑开**经度**；
+ *   · `geoAspect(数据框) > 画布比` → 框会被**宽度**限制（上下空）→ 撑开**纬度**。
+ *   两种都是"框变大"，所以**撑开只会让框更大，不会裁掉任何数据**（本模块的第一不变量）。
+ *   纬度那一支必须在 **mercY 空间**里撑（`geoAspect` 的分母就是 mercY 跨度），
+ *   否则撑完比例对不上 —— 所以那里用 `invMercYOf` 换回纬度。
+ *
+ * ── 撑开后仍要钳制在中国范围内吗：**不钳制**（这是本函数唯一需要判断的地方）─────
+ *   结论：**允许露出境外**，只在墨卡托安全边界（±84°）与环球（360°）上兜底。理由三条：
+ *     1. **钳制在数学上做不到**。把框拉回中国边界只能"缩小框"，而缩小要么破坏
+ *        "框的比例 == 画布比例"（本函数存在的全部意义），要么裁掉数据（违反第一不变量）。
+ *        两个后果都比"露出邻国"严重。
+ *     2. **境外没有东西可画，也没有东西可错**。轮廓数据里只有中国的环，出了国界就是
+ *        `BLOCK_FILL` 底色 —— 不是"画错的地图"，是空的。用户看到的仍然是"中国地图铺满屏幕"。
+ *     3. **撑开量有界**。`fitBounds` 第 ③ 步已经把**数据框**平移进中国范围，本函数只是在
+ *        它外面补上信箱那一条带，量级就是那一条带（真机上是经度两边各 ~0.7°）。
+ *      既有约定也一致：`fitAxis` 用平移而非裁剪、`render.ts` 文件头第 3 条明确允许
+ *      "照片可能落在画布之外"。
+ *   ⚠️ 但有一个**实测出来的后果必须说清**：撑开**纬度**那一支（= 数据比画布"宽"，
+ *   典型是"整个中国的视野 + 竖屏画布"）补出来的是一片**没有轮廓数据**的天与海，
+ *   所以**像素上与原来的信箱空白一模一样**（都是底色）—— 它换来的是
+ *   `frame.y === 0 && frame.h === blockH`，即**挂载区**（`hangBottom`）第一次真的能用满
+ *   整块画布。真正"看得见"的收益在另一支：撑开**经度**时补进来的是**中国自己的**
+ *   省界与海岸线（真机那一档正是这一支）。
+ *
+ * ── 幂等 ────────────────────────────────────────────────────────────────────
+ *   比例已经匹配时**原样返回入参**（浮点容差 `1e-12` 相对量），所以重复调用不会累积漂移；
+ *   设备与预览都调它，两次得到同一份数值。
+ *
+ * ── 退化（一律返回 `normalizeBounds(dataBounds)`，不猜、不产 NaN）───────────────
+ *   · 画布宽/高非有限或 ≤ 0 → 原样返回（"画布多大都不知道"时不该改视野）；
+ *   · `dataBounds` 非法（长度/NaN/零跨度）→ `normalizeBounds` 退回全国视野后再判断。
+ *   兜底钳制若真的生效（±84° / 360°），**优先保证数据仍在框内**：会再夹一次
+ *   `[minLon,maxLon]` / `[minLat,maxLat]` 的原始范围，此时比例可能对不上 ——
+ *   那是极端画布比例下唯一诚实的取舍（单测钉住它不产 NaN）。
+ *
+ * @param dataBounds `[minLon, minLat, maxLon, maxLat]`，典型来源是 `fitBounds` 的返回值
+ *                   （没有有效坐标时调用方传 `CHINA_REGION.bounds`）。
+ * @param canvasW 画布（地图块）宽 pt。
+ * @param canvasH 画布（地图块）高 pt。
+ * @returns 撑开后的 `[minLon, minLat, maxLon, maxLat]`，**恒 ⊇ 入参**（正常路径下）。
+ */
+export function fitViewToCanvas(dataBounds: number[], canvasW: number, canvasH: number): number[] {
+  const b: number[] = normalizeBounds(dataBounds);
+  const bw: number = Number.isFinite(canvasW) && canvasW > 0 ? canvasW : 0;
+  const bh: number = Number.isFinite(canvasH) && canvasH > 0 ? canvasH : 0;
+  if (!(bw > 0) || !(bh > 0)) { return b; }
+  const want: number = bw / bh;             // 目标：框的墨卡托宽高比 == 画布宽高比
+  const cur: number = geoAspect(b);
+  if (!(want > 0) || !(cur > 0)) { return b; }
+  // 已经一样了（含浮点以内的相等）→ 原样返回。幂等靠这一条。
+  if (Math.abs(cur - want) <= 1e-12 * want) { return b; }
+
+  const minLon: number = b[0];
+  const minLat: number = b[1];
+  const maxLon: number = b[2];
+  const maxLat: number = b[3];
+  const y0: number = mercYOf(minLat);
+  const y1: number = mercYOf(maxLat);
+
+  if (cur < want) {
+    // 框被高度限制（左右留白）→ 撑开经度：`want = 经度弧度 / mercY跨度`
+    const needSpan: number = (want * (y1 - y0)) / DEG;      // 需要的经度跨度（度）
+    const mid: number = (minLon + maxLon) / 2;
+    let lo: number = mid - needSpan / 2;
+    let hi: number = mid + needSpan / 2;
+    if (hi - lo > LON_EXPAND_LIMIT) { lo = mid - LON_EXPAND_LIMIT / 2; hi = mid + LON_EXPAND_LIMIT / 2; }
+    // 兜底：无论如何**不许把数据关在框外**（第一不变量优先于比例）
+    if (lo > minLon) { lo = minLon; }
+    if (hi < maxLon) { hi = maxLon; }
+    return [lo, minLat, hi, maxLat];
+  }
+
+  // 框被宽度限制（上下留白）→ 撑开纬度：`want = 经度弧度 / mercY跨度`
+  const needY: number = ((maxLon - minLon) * DEG) / want;   // 需要的 mercY 跨度
+  const yc: number = (y0 + y1) / 2;
+  let lo2: number = yc - needY / 2;
+  let hi2: number = yc + needY / 2;
+  const yLimit: number = mercYOf(LAT_EXPAND_LIMIT);
+  if (lo2 < -yLimit) { lo2 = -yLimit; }
+  if (hi2 > yLimit) { hi2 = yLimit; }
+  // 兜底同上：数据必须仍在框内（mercY 单调，所以直接比 mercY 即可）
+  if (lo2 > y0) { lo2 = y0; }
+  if (hi2 < y1) { hi2 = y1; }
+  return [minLon, invMercYOf(lo2), maxLon, invMercYOf(hi2)];
+}
+
 // ── 排布常数（钉子的视觉尺寸只有这里一份，设备与预览共用） ──────────────────
 
 /**

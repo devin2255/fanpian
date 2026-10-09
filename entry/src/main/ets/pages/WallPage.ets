@@ -60,8 +60,8 @@ import { CHINA_REGION } from '../core/projection';
 import { parseAreaData } from '../core/areaData';
 import {
   HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, TRACK_COLOR, TRACK_WIDTH, VIEW_PAD_RATIO,
-  badgeRect, buildScene, dateLabel, fitBounds, hangBottom, hangOffsets, hangRects, mapFrame, outlinePath,
-  parseOutline, trajectoryPath, viewZoomOf
+  badgeRect, buildScene, dateLabel, fitBounds, fitViewToCanvas, geoAspect, hangBottom, hangOffsets, hangRects,
+  mapFrame, outlinePath, parseOutline, trajectoryPath, viewZoomOf
 } from '../core/render';
 import type { CardRect, HangOffset, MapFrame, OutlineData, ScenePin, WallPhoto } from '../core/render';
 // MAX_HANG 只在 core/placement.ts 里定义（设计 §6.2 的阈值那儿一份），render.ts 不转手导出。
@@ -239,9 +239,15 @@ struct WallPage {
         `${DIAG} rebuild 跳过：画布还没量到（boxW=${this.boxW} boxH=${this.boxH}）`);
       return;
     }
-    // 视野框：由照片坐标求出（没有有效坐标 → 全国视野，与改动前一致）
+    // 视野框：① 由照片坐标求出"装得下全部照片"的范围（没有有效坐标 → 全国视野）
     const vb: number[] | undefined = fitBounds(this.photos, VIEW_PAD_RATIO);
-    const bounds: number[] = vb !== undefined ? vb : CHINA_REGION.bounds;
+    const dataBounds: number[] = vb !== undefined ? vb : CHINA_REGION.bounds;
+    // ② **默认铺满**：把数据框撑成**与画布同比例**，消掉 mapFrame 的信箱空白。
+    //    为什么必须有第 ② 步（真机真值）：box 376×663.71 而数据框的墨卡托比只有 0.4661，
+    //    相除之后 mapFrame 只能 contain → 图框 309.1×663.71@(33.45,0)，**左右各空 33.45pt**。
+    //    撑开只作用在"没被限制"的那根轴上，所以框 ⊇ 数据（照片一张都不会跑出去），
+    //    而且 pt/度 不变、框是**绕数据**长出去的 → 照片在屏幕上**一动都不动**（单测钉住 Δ=0）。
+    const bounds: number[] = fitViewToCanvas(dataBounds, this.boxW, this.boxH);
     // 地图块 = 整个主体区（地图是这整块区域的底色）；框 = 块里那个不变形的视野（居中）。
     const frame: MapFrame = mapFrame(this.boxW, this.boxH, bounds);
     this.mapX = r2(frame.x);
@@ -312,23 +318,33 @@ struct WallPage {
     this.shownTotal = shownTotal;
     // ── 诊断（临时）：真机上抓不到 hilog，所以把同样的数字也画在屏幕上 ──────────
     // 要的就是这一行的真值：`boxW / boxH` 是 onAreaChange 给的**地图块**（整个主体区），
-    // `map W×H@(x,y)` 是块里那个不变形的绘制框，`pathLen` 是国界 path 的字符数
+    // `图框 W×H@(x,y)` 是块里那个不变形的绘制框，`pathLen` 是国界 path 的字符数
     //（=0 就说明国界根本没画出来，那是另一类缺陷），`track` 是轨迹折线的字符数。
     //
-    // 本批新增：**视野 bounds**（格式 `[minLon,minLat,maxLon,maxLat]`，带 `(数据)`/`(全国)`
-    // 标明来源）与**放大倍数**（相对全国视野，`viewZoomOf` 的口径是经度跨度之比）。
-    // 真机上要核对的正是这两个数：`(数据)` + 放大 9 倍左右 = 数据驱动视野生效了；
-    // `(全国)` = 一张有坐标的都没有（退化路径）；放大 1× = 还是老行为（没生效）。
+    // 本批新增三样，都是为了**真机一眼核对**：
+    //   · `视野 数据[…]→铺满[…]`：**撑开前后两个框**。左边是 `fitBounds` 的产物，
+    //     右边是 `fitViewToCanvas` 撑到与画布同比例之后的产物。两者若相同 = 比例本来就匹配
+    //     （或铺满没生效）；右边若比左边宽 = 本批第 ② 件事生效了。
+    //   · `放大 A×→B×`：撑开前 / 后的放大倍数（`viewZoomOf`，经度跨度口径）。
+    //     **B < A 是正常的、也是预期的**：撑开让视野变大 → 相对全国的倍数变小。
+    //     照片大小没变（pt/度恒定），变的是原来空着的那两条带现在归地图自己。
+    //   · `图框` 里的 `@(x,y)`：铺满生效后**必然是 (0,0)**，宽度必然等于 `boxW`
+    //     —— 这就是"默认铺满"最直接的一个数字。
+    const diagBounds: string = `数据[${r2(dataBounds[0])},${r2(dataBounds[1])},${r2(dataBounds[2])},${r2(dataBounds[3])}]`
+      + `→铺满[${r2(bounds[0])},${r2(bounds[1])},${r2(bounds[2])},${r2(bounds[3])}]`;
     this.diag = `box ${r2(this.boxW)}×${r2(this.boxH)} ｜ 图框 ${this.mapW}×${this.mapH}@(${this.mapX},${this.mapY})`
-      + ` ｜ 视野 [${r2(bounds[0])},${r2(bounds[1])},${r2(bounds[2])},${r2(bounds[3])}]${vb !== undefined ? '(数据)' : '(全国)'}`
-      + ` 放大 ${r2(viewZoomOf(bounds))}×`
+      + ` ｜ 视野 ${diagBounds}${vb !== undefined ? '(数据)' : '(全国)'}`
+      + ` ｜ 放大 ${r2(viewZoomOf(dataBounds))}×→${r2(viewZoomOf(bounds))}×`
       + ` ｜ pins ${pins.length} ｜ cards ${cards.length} ｜ pathLen ${chinaPath.length} ｜ track ${this.trackPath.length}`
       + ` ｜ 上墙 ${this.walledTotal} 命中 ${located} 实挂 ${shownTotal}`;
     hilog.info(DOMAIN, TAG, '%{public}s',
       `${DIAG} rebuild：boxW=${this.boxW} boxH=${this.boxH}`
       + ` blockH=${frame.blockH} mapW=${frame.w} mapH=${frame.h} mapX=${frame.x} mapY=${frame.y}`
+      + ` dataBounds=[${r2(dataBounds[0])},${r2(dataBounds[1])},${r2(dataBounds[2])},${r2(dataBounds[3])}]`
       + ` bounds=[${r2(bounds[0])},${r2(bounds[1])},${r2(bounds[2])},${r2(bounds[3])}]`
-      + ` boundsFromData=${vb !== undefined} viewZoom=${r2(viewZoomOf(bounds))}`
+      + ` boundsFromData=${vb !== undefined}`
+      + ` viewZoomData=${r2(viewZoomOf(dataBounds))} viewZoomFilled=${r2(viewZoomOf(bounds))}`
+      + ` geoAspect=${geoAspect(bounds).toFixed(4)} canvasAspect=${(this.boxW / this.boxH).toFixed(4)}`
       + ` bottom=${bottom} pins=${pins.length} cards=${cards.length}`
       + ` chinaPath.length=${chinaPath.length} trackPath.length=${this.trackPath.length}`
       + ` linkPath.length=${this.linkPath.length} walled=${this.walledTotal} located=${located} shown=${shownTotal}`);

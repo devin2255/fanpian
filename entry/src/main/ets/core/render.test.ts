@@ -16,9 +16,9 @@ import { CHINA_REGION, projectMercator } from './projection.ts';
 import { MAX_HANG, MIN_PIN_DIST_PT } from './placement.ts';
 import {
   HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, HANG_OVERLAP_EPS, HANG_SWEEP_RAD, MIN_VIEW_SPAN_DEG, TRACK_WIDTH,
-  VIEW_PAD_RATIO, arcSpread, arcSpreadNeed, buildScene, clampRect, dateLabel, fitBounds, frameBounds,
-  geoAspect, hangBottom, hangOffsets, hangRects, mapBoxHeight, mapFrame, normalizeBounds, outlinePath,
-  parseOutline, pinTime, rectOverlapArea, sceneToSvg, trajectoryOrder, trajectoryPath, viewZoomOf
+  VIEW_PAD_RATIO, arcSpread, arcSpreadNeed, buildScene, clampRect, dateLabel, fitBounds, fitViewToCanvas,
+  frameBounds, geoAspect, hangBottom, hangOffsets, hangRects, mapBoxHeight, mapFrame, normalizeBounds,
+  outlinePath, parseOutline, pinTime, rectOverlapArea, sceneToSvg, trajectoryOrder, trajectoryPath, viewZoomOf
 } from './render.ts';
 import type { CardRect, MapFrame, ScenePin, WallPhoto } from './render.ts';
 
@@ -498,6 +498,209 @@ test('国界与照片用**同一个** bounds：同一经纬度在国界 path 与
   const old = atFrame(SH_LON, SH_LAT, mapFrame(W, H, CHINA_REGION.bounds));
   const dist = Math.sqrt((old.x - pins[0].x) * (old.x - pins[0].x) + (old.y - pins[0].y) * (old.y - pins[0].y));
   assert.ok(dist > 100, `本条测试失去了判别力：新旧视野下这个点只差 ${dist}pt`);
+});
+
+// ── 默认铺满 fitViewToCanvas：框的比例 == 画布的比例（task-16 的第 2 件事）──────
+//
+// 用户的第三条反馈是"地图应该支持缩放吧 **默认铺满**"。成因不是"视野没拉近"
+// （fitBounds 已经做到了），而是 `fitBounds` **不看画布**：数据框与画布比例不同时
+// `mapFrame` 只能 contain（居中信箱式），框的一侧空出一条带。
+//
+// 下面每一条都对着**控制器在真机上量到的原话真值**来写：
+//   诊断 box 376×663.71 ｜ 图框 309.1×663.71@(33.45,0) ｜ 视野 [115.66,29.88,122.19,41.24]
+//   （真值里的 bounds 是四舍五入到 2 位的，所以下面的框尺寸与 309.1/33.45 有 ~0.2pt 的差 ——
+//    这正是"用打印出来的数字复算"应有的量级，下面断言里写明了容差。）
+
+/** 真机诊断行里的三个数字，逐字抄下来（不是编的）。 */
+const DEV_BOX_W = 376;
+const DEV_BOX_H = 663.71;
+const DEV_VIEW: number[] = [115.66, 29.88, 122.19, 41.24];
+
+test('fitViewToCanvas：设备真值那一档 —— 撑开后**框的比例 == 画布的比例**', () => {
+  const ex = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_BOX_H);
+  // ① 比例相等（这是本函数存在的全部意义）。用 geoAspect 与画布比对比，容差只留给浮点。
+  const want = DEV_BOX_W / DEV_BOX_H;
+  assert.ok(Math.abs(geoAspect(ex) - want) < 1e-12, `撑开后比例 ${geoAspect(ex)} != 画布 ${want}`);
+  // ② 撑开的是**经度**（这一档数据框比画布"窄" → 框被高度限制 → 左右留白）
+  assert.ok(Math.abs(ex[1] - DEV_VIEW[1]) < 1e-12, '纬度不该动');
+  assert.ok(Math.abs(ex[3] - DEV_VIEW[3]) < 1e-12, '纬度不该动');
+  assert.ok(ex[0] < DEV_VIEW[0] && ex[2] > DEV_VIEW[2], '经度应当两边各撑开一些');
+  // ③ 真值复核：经度 6.53° → 7.94°（撑开 1.2155 倍）
+  assert.ok(Math.abs((ex[2] - ex[0]) - 7.94) < 0.01, `撑开后经度跨度 ${ex[2] - ex[0]}（期望 ≈7.94）`);
+  // ④ 撑开是**绕中心**做的（不是往一侧长）—— 两边的余量相等
+  const leftGap = DEV_VIEW[0] - ex[0];
+  const rightGap = ex[2] - DEV_VIEW[2];
+  assert.ok(Math.abs(leftGap - rightGap) < 1e-12, `两侧余量不等：${leftGap} vs ${rightGap}`);
+});
+
+test('fitViewToCanvas：设备真值那一档 —— mapFrame 的信箱空白**归零**（33.45pt → 0）', () => {
+  const before: MapFrame = mapFrame(DEV_BOX_W, DEV_BOX_H, DEV_VIEW);
+  // 复算改动前：框 309.34×663.71 @ (33.33, 0) —— 与真机的 309.1×663.71@(33.45,0) 相差 0.2pt
+  // 以内（真值里的 bounds 只印了 2 位小数）。这条断言同时**证明了我的模型与真机一致**。
+  assert.ok(Math.abs(before.h - DEV_BOX_H) < 1e-9, '这一档框应当填满高度（那正是"框被高度限制"）');
+  assert.ok(Math.abs(before.w - 309.1) < 0.3, `框宽 ${before.w} vs 真机 309.1`);
+  assert.ok(Math.abs(before.x - 33.45) < 0.3, `框左 ${before.x} vs 真机 33.45`);
+  assert.ok(before.x > 0, '改动前**一定**有左右留白 —— 这就是"没铺满"的机器可读形态');
+
+  const ex = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_BOX_H);
+  const after: MapFrame = mapFrame(DEV_BOX_W, DEV_BOX_H, ex);
+  // 框 == 块：没有信箱空白（这是"默认铺满"的几何表述）
+  assert.ok(Math.abs(after.x) < 1e-9, `撑开后仍有左边距 ${after.x}`);
+  assert.ok(Math.abs(after.y) < 1e-9, `撑开后仍有上边距 ${after.y}`);
+  assert.ok(Math.abs(after.w - DEV_BOX_W) < 1e-9, `框宽 ${after.w} != 画布宽 ${DEV_BOX_W}`);
+  assert.ok(Math.abs(after.h - DEV_BOX_H) < 1e-9, `框高 ${after.h} != 画布高 ${DEV_BOX_H}`);
+  // 放大倍数：9.49× → 7.81×。**这不是"变小了"**：pt/度 一点没变（见下一条测试），
+  // 变的只是"把原来空着的那两条带交给地图自己（国界/省界/海岸线）"。
+  const zoomBefore = viewZoomOf(DEV_VIEW);
+  const zoomAfter = viewZoomOf(ex);
+  assert.ok(Math.abs(zoomBefore - 9.49) < 0.02, `改动前放大倍数 ${zoomBefore}（真机诊断行印的是 9.5×）`);
+  assert.ok(Math.abs(zoomAfter - 7.81) < 0.02, `撑开后放大倍数 ${zoomAfter}（期望 ≈7.81）`);
+  assert.ok(zoomAfter < zoomBefore, '撑开经度 → 视野变大 → 相对全国的倍数必然变小');
+});
+
+test('fitViewToCanvas：撑开**不改变 pt/度** —— 它把信箱那两条带交给地图，不是把照片放大', () => {
+  // 这条测试是为了纠正一个**很容易搞错的期待**（控制器原话："数据本可以再放大约 1.55 倍填满"）。
+  // 那个 1.55 来自"6.53/11.36 ≈ 0.575 与 376/663.71 ≈ 0.5665 差不多"这个**非墨卡托**的比较；
+  // 墨卡托下真实比例是 0.4661（纬度被 mercY 拉伸），所以撑开量是 1.2155 倍而不是 1.55 倍。
+  // 而且撑开只发生在"被限制的那根轴**之外**"的那根轴上，所以**每度的 pt 数是恒等的**：
+  // 照片在屏幕上的绝对大小一点没变，变的只是两侧不再空着。
+  const before = mapFrame(DEV_BOX_W, DEV_BOX_H, DEV_VIEW);
+  const ex = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_BOX_H);
+  const after = mapFrame(DEV_BOX_W, DEV_BOX_H, ex);
+  const ptPerDegBefore = before.w / (DEV_VIEW[2] - DEV_VIEW[0]);
+  const ptPerDegAfter = after.w / (ex[2] - ex[0]);
+  assert.ok(Math.abs(ptPerDegBefore - ptPerDegAfter) < 1e-9,
+    `pt/度 变了：${ptPerDegBefore} → ${ptPerDegAfter}（撑开不该改变比例尺）`);
+  // 撑开是**绕数据长出去**的：pt/度 不变 + 框的平移恰好抵消经度的扩张
+  // → **同一个经纬度在块坐标里一动都不动**（Δ 恒等于 0，下面这条断言是精确等式）。
+  // 这条性质正是"用户的照片不会因为铺满而挪位置"的机器可读表述。
+  const q1 = projectMercator(SH_LON, SH_LAT, before.w, before.h, frameBounds(before));
+  const q2 = projectMercator(SH_LON, SH_LAT, after.w, after.h, frameBounds(after));
+  const dx = Math.abs((q1.x + before.x) - (q2.x + after.x));
+  const dy = Math.abs((q1.y + before.y) - (q2.y + after.y));
+  assert.ok(dx < 1e-9 && dy < 1e-9,
+    `照片在铺满前后挪了位置（Δ=${dx},${dy}）—— 撑开应当是绕数据长出去，不是平移视野`);
+  // 反过来：**框确实变大了**（否则上面那条 Δ=0 就成了"什么都没发生"）
+  assert.ok(after.w > before.w + 50, `框宽没变大：${before.w} → ${after.w}`);
+  assert.ok(before.x > 30 && Math.abs(after.x) < 1e-9, `框的左边距没有归零：${before.x} → ${after.x}`);
+});
+
+test('fitViewToCanvas：数据在撑开后**仍然全部可见**（框只会变大，不会裁掉数据）', () => {
+  // 这是本函数的第一不变量，工单要求必须有单测。穷举一批真实/极端的数据框 × 画布。
+  const boxes: number[][] = [
+    DEV_VIEW,
+    [115.66, 29.88, 122.19, 41.24],
+    CHINA_REGION.bounds,
+    fitBounds([ph('sh', SH_LAT, SH_LON, 0)], VIEW_PAD_RATIO) as number[],
+    fitBounds([ph('sh', SH_LAT, SH_LON, 0), ph('bj', BJ_LAT, BJ_LON, 0), ph('tj', TJ_LAT, TJ_LON, 0)], VIEW_PAD_RATIO) as number[],
+    [73, 18, 135, 54],
+    [100, 20, 100.6, 20.6],
+    [80, 40, 134, 53],           // 东北角：撑开经度会明显露出境外
+    [73, 18, 80, 19],            // 西南角
+    [121, 30, 122, 41],          // 细长竖条
+    [100, 30, 130, 31],          // 细长横条
+  ];
+  const canvases: number[][] = [
+    [DEV_BOX_W, DEV_BOX_H], [360, 720], [720, 360], [360, 360], [100, 2000], [2000, 100], [1080, 1920]
+  ];
+  let checked = 0;
+  for (const b of boxes) {
+    for (const c of canvases) {
+      const ex = fitViewToCanvas(b, c[0], c[1]);
+      // ① **数据全部可见**：撑开后的框 ⊇ 原框（四边都不许往里收）
+      assert.ok(ex[0] <= b[0] + 1e-9, `左边界被裁：${ex[0]} > ${b[0]}（框 ${b} 画布 ${c}）`);
+      assert.ok(ex[1] <= b[1] + 1e-9, `下边界被裁：${ex[1]} > ${b[1]}（框 ${b} 画布 ${c}）`);
+      assert.ok(ex[2] >= b[2] - 1e-9, `右边界被裁：${ex[2]} < ${b[2]}（框 ${b} 画布 ${c}）`);
+      assert.ok(ex[3] >= b[3] - 1e-9, `上边界被裁：${ex[3]} < ${b[3]}（框 ${b} 画布 ${c}）`);
+      // ② 坐标永远有限、跨度永远为正（NaN 会让整条 path 静默消失）
+      for (let i = 0; i < 4; i++) {
+        assert.ok(Number.isFinite(ex[i]), `非有限坐标：${ex[i]}（框 ${b} 画布 ${c}）`);
+      }
+      assert.ok(ex[2] > ex[0] && ex[3] > ex[1], `跨度非正：${ex}（框 ${b} 画布 ${c}）`);
+      // ③ 投影得出来（不产 NaN）
+      const f: MapFrame = mapFrame(c[0], c[1], ex);
+      assert.ok(!outlinePath([[ex[0], ex[1], ex[2], ex[1], ex[2], ex[3]]], f).includes('NaN'));
+      // ④ 比例匹配（除非撞到 ±84°/360° 的兜底钳制 —— 那种极端画布在下面单独测）
+      const unlimited = geoAspect(ex) > 1e-6;
+      if (unlimited) {
+        const want = c[0] / c[1];
+        const hit = Math.abs(geoAspect(ex) - want) < 1e-9;
+        const clamped = ex[1] <= -84 + 1e-9 || ex[3] >= 84 - 1e-9 || (ex[2] - ex[0]) >= 360 - 1e-9;
+        assert.ok(hit || clamped, `比例既没匹配也没撞钳制：${geoAspect(ex)} vs ${want}（框 ${b} 画布 ${c}）`);
+      }
+      checked++;
+    }
+  }
+  assert.equal(checked, boxes.length * canvases.length);
+});
+
+test('fitViewToCanvas：幂等；画布/bounds 非法时原样返回；极端画布撞钳制也不产 NaN', () => {
+  const ex = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_BOX_H);
+  // 幂等：比例已经匹配 → 再次调用原样返回（设备与预览都调它，不能累积漂移）
+  assert.deepEqual(fitViewToCanvas(ex, DEV_BOX_W, DEV_BOX_H), ex);
+  assert.deepEqual(fitViewToCanvas(ex, DEV_BOX_W, DEV_BOX_H), fitViewToCanvas(ex, DEV_BOX_W, DEV_BOX_H));
+  // 画布非法 → 原样返回（"画布多大都不知道"时不该改视野）
+  assert.deepEqual(fitViewToCanvas(DEV_VIEW, 0, DEV_BOX_H), normalizeBounds(DEV_VIEW));
+  assert.deepEqual(fitViewToCanvas(DEV_VIEW, DEV_BOX_W, 0), normalizeBounds(DEV_VIEW));
+  assert.deepEqual(fitViewToCanvas(DEV_VIEW, Number.NaN, DEV_BOX_H), normalizeBounds(DEV_VIEW));
+  assert.deepEqual(fitViewToCanvas(DEV_VIEW, -1, -1), normalizeBounds(DEV_VIEW));
+  // bounds 非法 → 先 normalizeBounds（退回全国视野），再按画布比例撑开。**必须有值、有限、正跨度**
+  const bad = fitViewToCanvas([1, 2, 3], 376, 663.71);
+  assert.equal(bad.length, 4);
+  for (let i = 0; i < 4; i++) { assert.ok(Number.isFinite(bad[i])); }
+  assert.ok(bad[2] > bad[0] && bad[3] > bad[1]);
+  assert.ok(bad[0] <= CHINA_REGION.bounds[0] && bad[2] >= CHINA_REGION.bounds[2], '全国视野必须仍被框住');
+  // 极端画布：撑到 ±84° 的墨卡托安全边界就停 —— 此时**优先保证数据可见**，比例可以不对
+  const thin = fitViewToCanvas(CHINA_REGION.bounds, 100, 2000);
+  assert.ok(Math.abs(thin[1] - -84) < 1e-9 && Math.abs(thin[3] - 84) < 1e-9, `应当停在 ±84：${thin}`);
+  assert.ok(thin[1] <= CHINA_REGION.bounds[1] && thin[3] >= CHINA_REGION.bounds[3], '撞钳制后数据仍须在框内');
+  assert.ok(Number.isFinite(geoAspect(thin)) && geoAspect(thin) > 0);
+  // 极端扁画布：经度撑到 360° 封顶
+  const fat = fitViewToCanvas(CHINA_REGION.bounds, 2000, 100);
+  assert.ok(fat[2] - fat[0] <= 360 + 1e-9, `经度跨度不许超过 360：${fat[2] - fat[0]}`);
+  assert.ok(fat[0] <= CHINA_REGION.bounds[0] && fat[2] >= CHINA_REGION.bounds[2], '撞钳制后数据仍须在框内');
+});
+
+test('fitViewToCanvas：**不做中国范围钳制**（允许露出境外）—— 这是有意为之的取舍', () => {
+  // 判断与理由写在 render.ts 的 fitViewToCanvas 注释里，这里是它的**行为级**钉死：
+  // 黑龙江东部那种"南北长、东西窄"的数据（[130.5,45,133.5,53]，墨卡托比 0.2453 < 画布比
+  // 0.5665 → 框被**高度**限制、左右留白）撑开经度后必然越过 maxLon = 135 —— 允许
+  // （境外是底色，不是错图）。注意：不是所有东北角数据都走这一支（[126,45,134,53] 比画布
+  // 还"宽"，它走的是撑纬度的另一支，见上面那条穷举测试）。
+  const ne: number[] = [130.5, 45, 133.5, 53];
+  const ex = fitViewToCanvas(ne, 376, 663.71);
+  assert.ok(ex[2] > CHINA_REGION.bounds[2], `东北角撑开后应当越过 135°E：${ex[2]}`);
+  assert.ok(Math.abs(geoAspect(ex) - 376 / 663.71) < 1e-12, '越界也必须保持比例匹配');
+  assert.ok(ex[0] <= ne[0] && ex[2] >= ne[2] && ex[1] <= ne[1] && ex[3] >= ne[3], '数据仍须全部可见');
+  // 反证：若"钳制到中国范围"，比例就必然对不上 —— 这就是不钳制的理由 1
+  const clampedToChina: number[] = [Math.max(ex[0], CHINA_REGION.bounds[0]), Math.max(ex[1], CHINA_REGION.bounds[1]),
+    Math.min(ex[2], CHINA_REGION.bounds[2]), Math.min(ex[3], CHINA_REGION.bounds[3])];
+  assert.ok(Math.abs(geoAspect(clampedToChina) - 376 / 663.71) > 1e-6,
+    '钳制回中国之后比例**必然**不再匹配 —— 所以"钳制"与"铺满"不可兼得');
+});
+
+test('fitViewToCanvas + fitBounds 组合（真机链路）：数据可见 + 比例匹配 + 框 == 块', () => {
+  // 工单要求的组合方式：fitBounds(photos, pad) → fitViewToCanvas(vb, boxW, boxH)
+  const photos = [ph('sh', SH_LAT, SH_LON, 0), ph('bj', BJ_LAT, BJ_LON, 0), ph('tj', TJ_LAT, TJ_LON, 0)];
+  const vb = fitBounds(photos, VIEW_PAD_RATIO);
+  assert.ok(vb !== undefined);
+  const bounded = fitViewToCanvas(vb, DEV_BOX_W, DEV_BOX_H);
+  // ① 三张照片全在框内
+  for (let i = 0; i < photos.length; i++) {
+    const p: WallPhoto = photos[i];
+    assert.ok(bounded[0] <= p.lon && p.lon <= bounded[2], `${p.photoId} 经度跑到框外`);
+    assert.ok(bounded[1] <= p.lat && p.lat <= bounded[3], `${p.photoId} 纬度跑到框外`);
+  }
+  // ② 框 == 块（铺满）
+  const f: MapFrame = mapFrame(DEV_BOX_W, DEV_BOX_H, bounded);
+  assert.ok(Math.abs(f.x) < 1e-9 && Math.abs(f.y) < 1e-9);
+  assert.ok(Math.abs(f.w - DEV_BOX_W) < 1e-9 && Math.abs(f.h - DEV_BOX_H) < 1e-9);
+  // ③ 场景照常算得出来（没有一张卡片或钉子变成 NaN）
+  const pins = buildScene(photos, f, 1, { canvasH: DEV_BOX_H, footer: 26 });
+  assert.ok(pins.length >= 1);
+  for (let i = 0; i < pins.length; i++) {
+    assert.ok(Number.isFinite(pins[i].x) && Number.isFinite(pins[i].y), `钉子坐标非有限：${pins[i].pinId}`);
+  }
 });
 
 // ── 两份 fixture：广域（退回接近全国）与近邻城市（真的放大） ──────────────────
