@@ -36,9 +36,9 @@ function tmpPathOf(filesDir: string): string {
 // LocationIndex，实例级标记挡不住这两个实例并发写同一个 locations.json.tmp。
 // 同一时刻只允许一次构建，并发的调用直接拿到当前盘上的索引（见 buildFrom 的取舍说明）。
 let building: boolean = false;
-// 当前正在进行的构建。供 awaitIdle() 等待 —— 没有它，调用方无法区分
-// 「索引已完整」与「另一处正在构建、我拿到的是快照」。
-let pending: Promise<LocationEntry[]> | undefined = undefined;
+// 当前**正在进行的构建**（promise），供 awaitIdle() 等待 —— 没有它，调用方无法区分
+// 「索引已完整」与「另一处正在构建」；**勿与 doBuild 内的 `todo`（本轮待处理的 URI）混淆**。
+let pendingBuild: Promise<LocationEntry[]> | undefined = undefined;
 
 export class LocationIndex {
   private ctx: common.UIAbilityContext;
@@ -177,20 +177,20 @@ export class LocationIndex {
     // 上面的「检查」与这里的「置位」之间**没有 await**：单线程事件循环下这一段是原子的，
     // 两次并发调用不可能同时通过检查 —— 这正是这个标记成立的全部依据，不要在其中插入异步。
     building = true;
-    // 从调用 doBuild 到 `pending = run` 之间**同样没有 await**：所以"看得见 building 为真"
-    // 的观察者一定也看得见 pending 非空（awaitIdle 的循环依赖这一点，它另有防御条件）。
+    // 从调用 doBuild 到 `pendingBuild = run` 之间**同样没有 await**：所以"看得见 building 为真"
+    // 的观察者一定也看得见 pendingBuild 非空（awaitIdle 的循环依赖这一点，它另有防御条件）。
     const run: Promise<LocationEntry[]> = this.doBuild(uris, onProgress);
-    pending = run;
+    pendingBuild = run;
     try {
       return await run;
     } finally {
       // **必须**放 finally：一旦某次构建抛错而标记没复位，索引就永远无法再构建了
       //（那比"并发写坏一次、下次重建"严重得多 —— 它是永久性的）。
       // 注意此处只复位标记，不做任何等待：finally 在 return 之前同步执行。
-      // 复位 building 与 pending 是同一个同步块里的两行、中间没有 await，因此不存在
-      //「building 已假、pending 还留着旧 promise」这种会被 awaitIdle 观察到的中间态。
+      // 复位 building 与 pendingBuild 是同一个同步块里的两行、中间没有 await，因此不存在
+      //「building 已假、pendingBuild 还留着旧 promise」这种会被 awaitIdle 观察到的中间态。
       building = false;
-      pending = undefined;
+      pendingBuild = undefined;
     }
   }
 
@@ -207,9 +207,9 @@ export class LocationIndex {
   async awaitIdle(): Promise<LocationEntry[]> {
     // 用 while 而不是 if：等待期间可能**又**有新的构建开始，那就必须接着等 ——
     // 用 if 只等一轮，会在"另一个构建还在跑"的时候返回，正是本方法要消灭的"看起来等过了"。
-    while (building && pending !== undefined) {
+    while (building && pendingBuild !== undefined) {
       try {
-        await pending;
+        await pendingBuild;
       } catch (e) {
         // 别人构建失败**不该**让 awaitIdle 抛错：否则地图页会因为一次与它无关的失败而白屏。
         // 吞掉即可 —— finally 已经把 building 复位，下一轮循环条件必为假、正常退出，
@@ -232,29 +232,29 @@ export class LocationIndex {
     for (let i = 0; i < existing.length; i++) {
       byId.set(existing[i].photoId, existing[i]);
     }
-    // 待办 = 索引里还没有的 URI，顺带去重（入参可能含重复 URI）。
+    // 局部 `todo` = 本轮待办（索引里还没有的 URI），顺带去重（入参可能含重复 URI）。
     // 这里先往 byId 放一条全 0 的**占位**，有两个作用：
     //   ① 后面重复出现的同一个 URI 会被上面的 byId.has 挡掉（不必再引入一个 Set 去重）；
     //   ② 新条目在 Map 里的**位置**此刻就定下来（Map.set 覆盖已有键不改变顺序），
     //      于是最终列表恒为「原有条目在前、本批新读的在后」，与读取顺序一致。
     // 占位在下面读完 EXIF 后会被真实值覆盖；若 readExif 意外抛错，占位也不会落盘
     //（异常会直接冲出本方法，save 不会执行 —— readExif 的契约是不抛，这里只是兜底推理）。
-    const pending: string[] = [];
+    const todo: string[] = [];
     for (let i = 0; i < uris.length; i++) {
       const u = uris[i];
       if (u === undefined || u === null || u === '') { continue; }
       if (byId.has(u)) { continue; }
       byId.set(u, { photoId: u, lat: 0, lon: 0, takenAt: 0 });
-      pending.push(u);
+      todo.push(u);
     }
-    if (pending.length === 0) {
+    if (todo.length === 0) {
       // 全都在索引里了：不写盘、不回调（没有进度可言）
       return existing;
     }
 
-    const total: number = pending.length;
-    for (let i = 0; i < pending.length; i++) {
-      const uri: string = pending[i];
+    const total: number = todo.length;
+    for (let i = 0; i < todo.length; i++) {
+      const uri: string = todo[i];
       // readExif 内部吞掉所有异常（读不到 → 全 0），所以这里不会再抛：
       // 一张坏照片不该让整批索引构建失败。
       const info: ExifInfo = await readExif(uri);
