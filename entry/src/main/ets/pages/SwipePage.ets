@@ -117,7 +117,15 @@ struct SwipePage {
             }
           })
         } else {
-          Text('今天的份刷完了').fontSize(18).fontColor('#666')
+          Column() {
+            Text('今天的份刷完了').fontSize(18).fontColor('#666')
+            // 队尾也必须能回头：否则用户在最后一张上滑之后就再也看不到刚划走的那张，
+            // 与「刚划走的还想再看一下要不要上墙」这个核心诉求直接冲突。
+            Button('← 返回上一张').fontSize(14).height(40).width(160)
+              .backgroundColor('#1F6FEB').fontColor(Color.White)
+              .margin({ top: 16 })
+              .onClick(() => { this.navigate(1); })
+          }
         }
       }
       .layoutWeight(1).width('100%')
