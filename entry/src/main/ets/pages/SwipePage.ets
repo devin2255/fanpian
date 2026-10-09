@@ -114,7 +114,9 @@ struct SwipePage {
             canPrev: this.idx > 0,
             onDecide: (photoId: string, ev: CardEvent | SwipeRollback) => {
               this.handle(photoId, ev);
-            }
+            },
+            // 「主页面」= 回首页。导航不在 onDecide 的内容事件流里（见 CardStack 的 onHome）。
+            onHome: () => { this.goHome(); }
           })
         } else {
           Column() {
@@ -228,7 +230,34 @@ struct SwipePage {
   }
 
   /**
-   * 翻页（卡片上滑 = 下一张 / 下滑或「← 返回」= 上一张）。
+   * 「主页面」= 回首页（认领页 pages/ClaimPage）。用 router.back() 而不是
+   * router.pushUrl({url:'pages/ClaimPage'})：
+   *
+   * ClaimPage 是用 pushUrl 打开本页的（见 pages/ClaimPage.ets 的「开始刷照片」按钮），
+   * 所以本页上面**就是**栈里的 ClaimPage（首屏 @Entry）。back() 弹出本页即回到它
+   *（SDK：back() 不带 url 时「returns to the previous page, and the page is not rebuilt」
+   * —— ClaimPage 实例还在栈里，回去不需要重建、耗时更短）。
+   *
+   * 不用 pushUrl：那会往栈里再压一个 ClaimPage，把原来的 ClaimPage 留在下面 ——
+   * 首页变成「首页之上还有一个首页」，之后再也回不到底部那一层，返回栈只会越长越深。
+   *
+   * 落盘链（这条正是我们要的，未落盘的决策必须写下去）：
+   *   1) 本页是被 pushUrl 压上来的，back() 会把它弹出栈 → 框架先触发 onPageHide()
+   *      （SDK：onPageHide 在「router 管理的页面被隐藏」时触发，含路由跳转场景，
+   *      见 ets/component/common.d.ts 的 onPageHide 说明）；
+   *   2) 页面随即从栈上弹出、实例被回收 → aboutToDisappear() 也会触发。
+   *   两条回调都调了 flushSave()，所以同步 I/O 无论如何都会跑一次：即便将来某条路径只触发其中一条，
+   *   决策也不会留在内存里丢掉 —— 这正是 onPageHide 当初存在的理由（见它上方的注释）。
+   * 推论：本方法**不需要**自己调 flushSave()，重复调用只是多一次 pendingSave 检查。
+   * 前提：本页的按钮可点时本页必然是栈顶（FavPage 是被 pushUrl 压上来的整页，一旦打开本页就被盖住、
+   * 卡片按钮不再可点），所以这里的 back() 弹掉的必定是本页 —— 「弹回本页而非首页」不可达。
+   */
+  private goHome(): void {
+    router.back();
+  }
+
+  /**
+   * 翻页（卡片上滑 = 下一张 / 下滑 = 上一张）。
    *
    * 上一张的语义是「回到刚看过的那张并让它重新可决定」：所以必须把它的决策从内存与盘上
    * 一并撤销（dStore.remove 是当场写盘，不能只改内存——用户若在 1 秒防抖窗口内杀掉 App，

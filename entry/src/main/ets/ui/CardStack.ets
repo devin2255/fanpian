@@ -2,7 +2,8 @@
 // 四个已验证的设计事实：
 //   1. 上滑 = 下一张、下滑 = 上一张（抖音式翻页），翻页本身不产生决策；但下滑回到刚看过的那张时，
 //      会把那张的决策从内存与盘上一并撤销，让它重新可决定（见 pages/SwipePage.ets 的 navigate）；
-//   2. 三个动作（归档 / 上墙 / 收藏）与「← 返回」都是卡片外侧下方的按钮，卡片本体只承载翻页手势。
+//   2. 三个动作（归档 / 上墙 / 收藏）与「主页面」都是卡片外侧下方的按钮，卡片本体只承载翻页手势。
+//      「主页面」只做页面级导航（回首页），不产生任何内容决策 —— 详见 onHome。
 //      左右滑手势全部取消 —— 斜着滑时无法判定方向归属，与上下滑直接冲突；
 //   3. 阈值必须同时落在「速度」与「位移」两个维度：轻轻一甩能过，拖到位也能过。
 //      基准是**卡高**（不再是卡宽），卡高由父组件经 onAreaChange 传入（见 cardHeight）；
@@ -74,17 +75,38 @@ export struct CardStack {
   // 卡片实际高度（= 父组件量到的可用高度 × 0.62，见 SwipePage.ets 的 CARD_HEIGHT_RATIO）。
   // 600 只是父组件尚未量出高度时的兜底，不是判定依据：位移阈值与翻出距离都以它为准。
   @Prop cardHeight: number = 600;
-  // 队列里是否还有上一张（父组件按 idx > 0 传入）。false 时「下滑 / ← 返回」不播翻出动画：
+  // 队列里是否还有上一张（父组件按 idx > 0 传入）。false 时下滑手势不播翻出动画：
   // 父组件的 navigate(1) 只能早退，卡片飞出去之后会被原样换回同一张 = 用户看到「滑走又弹回」。
   @Prop canPrev: boolean = false;
-  // 上报的是一次交互的「结果」：CardEvent（决定 / 上墙 / 翻页）或 SwipeRollback（回弹）。
+  // 上报的是一次交互的「内容结果」：CardEvent（决定 / 上墙 / 翻页）或 SwipeRollback（回弹）。
   // 合法组合由类型编码，字面量形态下传错组合会在编译期报错，而不是运行期被 handle() 的守卫
   // 静默丢弃；变量形态可绕过（见 CardEvent 上方「边界」），且「出口 ↔ kind」对应不在编码范围内
-  // —— 新增出口时请自行核对。当前七个出口：
+  // —— 新增出口时请自行核对。当前六个出口：
   //   手势上滑 → 'nav'(dir=-1)、手势下滑 → 'nav'(dir=1)（队列边界时改为静默回弹、不上报）、
-  //   卡片「← 返回」按钮 → 'nav'(dir=1)、「归档」按钮 → 'decide'/archive、
-  //   「收藏」按钮 → 'decide'/fav、「上墙」按钮 → 'wall'、回弹 → 'rollback'。
+  //   「归档」按钮 → 'decide'/archive、「收藏」按钮 → 'decide'/fav、
+  //   「上墙」按钮 → 'wall'、回弹 → 'rollback'。
+  // 「主页面」按钮**不在**此列：它是页面级导航，走下面独立的 onHome。
   onDecide: (photoId: string, ev: CardEvent | SwipeRollback) => void = () => {};
+
+  /**
+   * 「主页面」按钮的出口：回首页（认领页 pages/ClaimPage，App 首屏）。它**刻意不是** CardEvent 的一支，
+   * 走独立回调而不是 onDecide，理由是「决策」与「导航」是两类不同的东西：
+   *   1) 语义：onDecide 的契约是「卡片上报一个**关于这张照片的内容**事件」—— 决定 / 上墙 / 翻页。
+   *      回首页不产生任何内容状态：不写决策、不进指标、不消耗队列，photoId 对它毫无意义。
+   *      把这支塞进 CardEvent 会让「内容事件」这个契约多出一个反例，下一个维护者得先读懂
+   *      「这个联合里有一个成员其实与内容无关」才能正确改动消费侧。
+   *   2) 消费路径：'home' 若成为 CardEvent 的一支，SwipePage.handle() 就必须为它加一条
+   *      早退分支 —— 于是「一个纯导航动作」被塞进那个专门解码**决策**的函数（它下面的
+   *      `action` 守卫、recordSwipe、applyDecision 全是决策逻辑），导航的正确性反过来
+   *      依赖那条早退分支的位置。独立回调把这条路径整个绕开。
+   *   3) 误用代价：commit() 是内容出口的**唯一**收尾动作，它除了调 onDecide 还会写 decidedId /
+   *      decidedDuringGesture（作废在途手势）、并 endSpringWindow()。回首页不需要其中任何一项
+   *      —— 它不动这张照片的位置、也不动回弹窗口；一旦被误走 commit()，那些状态就会被写上一个
+   *      与「定案」无关的时刻，掩盖掉它真正的含义（决策唯一性 / 回弹窗口归属）。
+   *      独立回调让「走错收尾」在结构上不可达，而不是靠调用点自觉。
+   * 默认空实现：与 onDecide 同口径 —— 未接线的父组件只会得到一个点了没反应的按钮，不会崩。
+   */
+  onHome: () => void = () => {};
   // dx：垂直模型下**没有任何写入路径**（手势只写 dy），保留它只为两件事：
   //   1) .translate({ x: this.dx }) 需要一个显式的横向分量；
   //   2) 所有「这张卡已定案 / 换卡归位」的出口都显式把它置 0 —— 组件实例是复用的
@@ -93,7 +115,7 @@ export struct CardStack {
   @State dx: number = 0;
   @State dy: number = 0;
   @State animating: boolean = false;   // 翻出动画期间为真，作为手势/按钮闸门（Ruling 27）；回弹不计入
-  // 已经上报过决策（或翻页）的那张照片 —— 三个动作按钮与「← 返回」在 onDecide **之前**写它。
+  // 已经上报过决策（或翻页）的那张照片 —— 三个动作按钮在 onDecide **之前**写它。
   // 翻页/决定都**不**设 animating 之外的保护：动作按钮要立即上报、不走 navOut 的 210ms 延迟，
   // 所以多指场景下「另一根手指在途的拖拽」会在 idx 已前进后继续写 dy，抬手时 settle() 会以
   // **新** photoId 上报 → 用户没打算决定的那张被静默消耗（批 15 修的缺陷）。
@@ -155,7 +177,7 @@ export struct CardStack {
    *          正是如此，且该路径**不重建组件实例**（idx 从 1 回到 0 时 `idx < items.length`
    *          分支没有切换，@Prop item 只是换回了同一张照片）—— decidedId 会陈旧成「当前这张」，
    *          而 onActionStart 每次把手势起点刷成同一张，于是恒真且不自愈：
-   *          这张卡不可滑、不可决策、连「← 返回」也失效，只能杀 App。
+   *          这张卡不可滑、不可决策、连动作按钮也失效，只能杀 App。
    *        - `item.photoId === decidedId`（「还没换卡」）**不改变任何判定**：判据 2 为假时必有
    *          gestureId === item.photoId，故在「判据 2 为假」这个唯一需要判据 1 说话的状态下，
    *          它是恒真的推论；判据 2 为真时本就已作废。保留它只是把「还没换卡」写进代码，
@@ -305,12 +327,12 @@ export struct CardStack {
 
       // 四个按钮：卡片外侧、卡片下方一行等分（layoutWeight(1)）。位置取舍见 M1 报告：
       // 塞进卡片内会压住照片主体（违反「不遮挡」），放在卡片外还顺带避开了与卡片
-      // PanGesture 的竞争。顺序按使用频率与危险度排：返回 / 归档 / 上墙 / 收藏。
+      // PanGesture 的竞争。顺序按使用频率与危险度排：主页面（回首页）/ 归档 / 上墙 / 收藏。
       Row({ space: 8 }) {
-        Button('← 返回')
+        Button('主页面')
           .fontSize(12).height(40).layoutWeight(1)
           .backgroundColor('#E6E6E6').fontColor('#333333')
-          .onClick(() => { this.tapNav(1); })
+          .onClick(() => { this.tapHome(); })
         Button('归档')
           .fontSize(12).height(40).layoutWeight(1)
           .backgroundColor('#E6E6E6').fontColor('#333333')
@@ -444,7 +466,23 @@ export struct CardStack {
     this.commit(ev);
   }
 
-  /** 「← 返回」= 下滑同一个出口。没有上一张时点了不响应（不播动画、不计指标）。 */
+  /** 「主页面」= 回首页（认领页）。导航出口，不产生决策，所以不走 commit()、也不写 decidedId。 */
+  private tapHome(): void {
+    // 闸门口径与其余三个按钮（commit）和「上一张」（tapNav）**完全一致**，两条都要：
+    //   - animating：翻出动画期间卡片视觉上已经飞走、而 idx 还要等 navOut 的 210ms 回调才推进，
+    //     这段窗口里点「主页面」会让用户在「下一张正在就位」的中途离开这一页 —— 该点按落在
+    //     哪一张的语义不确定（他们可能是想对下一张做决定）。与按钮闸门同一取舍：动画期间一律不受理。
+    //   - isGestureVoided()：正在拖这张卡的那根手指（另一根手指点按钮）会让「这次点按属于哪张」
+    //     同样不确定；与 commit/tapNav 同口径。
+    if (this.animating) { return; }
+    if (this.isGestureVoided()) { return; }
+    // 不调用 endSpringWindow()、不归零 dx/dy：那两件事是「这张卡到此为止」的收尾，而回首页
+    // 不改这张卡的状态 —— 页面紧接着就退出，未落盘的决策由 SwipePage.onPageHide/aboutToDisappear
+    // 的 flushSave() 收尾（见 pages/SwipePage.ets），不依赖这里做任何状态清理。
+    this.onHome();
+  }
+
+  /** 「上一张」= 下滑手势的同一个出口（队列边界时点了不响应：不播动画、不计指标）。 */
   private tapNav(dir: number): void {
     if (this.animating) { return; }
     if (this.isGestureVoided()) { return; }
