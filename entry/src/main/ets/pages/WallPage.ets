@@ -98,6 +98,16 @@ struct WallPage {
   @State shownTotal: number = 0;     // 实际挂出来的张数
   @State note: string = '';          // 退化说明（国界/区划读不到时）
   @State selIndex: number = -1;      // 点开的钉子（-1 = 没点开）
+  // ── 详情面板的数据（**必须是 @State，不能读 `this.pins`**）──────────────────
+  // 理由（这是"点钉子闪一下"的第二个成因，修的是它的下半截）：
+  //   · `pins` 是普通字段（`private pins: ScenePin[]`），**不是被观察的**；
+  //   · `@Builder detail(pin)` 的参数是**按值**传的普通对象，ArkUI 也不观察它。
+  // 于是"详情画什么"这件事只能靠"每次 `pins` 变时 `selIndex` 恰好也变"这个巧合来驱动 ——
+  // 只要有一次 `pins` 变了而 `selIndex` 没变，面板就会显示**上一次**那个钉子的照片（静默的错）。
+  // 把面板要用的东西拆成被观察的标量/数组，重绘判据就只依赖真正变了的东西。
+  @State selName: string = '';       // 面板标题里的地名
+  @State selShown: number = 0;       // 该钉子在墙上真正挂出来的张数
+  @State selPhotos: WallPhoto[] = []; // 该钉子的**全部**照片（挂出来的 + 没挂出来的）
 
   private store: DecisionStore = new DecisionStore(getContext(this) as common.UIAbilityContext);
   private idx: LocationIndex = new LocationIndex(getContext(this) as common.UIAbilityContext);
@@ -111,6 +121,8 @@ struct WallPage {
 
   /** 取数据 → 算场景。**不要**把 buildFrom 与 awaitIdle 合成一步（见文件头）。 */
   private async load(): Promise<void> {
+    // 数据要重读了 → 之前点开的那个钉子已经不一定是同一个了，**这里**才是清选中项的地方。
+    this.close();
     const walled: string[] = this.store.walledIds();
     this.walledTotal = walled.length;
 
@@ -237,12 +249,36 @@ struct WallPage {
     for (let i = 0; i < pins.length; i++) { located += pins[i].photos.length; }
     this.locatedTotal = located;
     this.shownTotal = shownTotal;
-    this.selIndex = -1;
+    // ── 这里**不许**再写 `this.selIndex = -1` ────────────────────────────────
+    // 这行曾经在：`rebuild()` 只在"数据到了"或"画布尺寸变了"时跑，而 `onAreaChange` 每次
+    // 画布尺寸变化都会调它（页面刚进来时布局还没稳定 → 会连着跑好几次）。
+    // 于是「点钉子 → selIndex=i → 紧接着一次 rebuild() 清成 -1」= 详情面板出现又消失
+    // = 用户看到的"闪一下"。清选中项是**数据换了**才该做的事，已经挪到 `load()` 开头。
   }
 
-  /** 点开一个钉子：看它挂着的（**全部**）照片。 */
+  /**
+   * 点开一个钉子：看它挂着的（**全部**）照片。
+   *
+   * 把面板要用的三样东西**拷进 @State**（而不是让 `build()` 去读 `this.pins[i]`）：
+   * `pins` 不是被观察的，详情面板的重绘必须由被观察的状态驱动 —— 见 `selName` 处的注释。
+   * `slice()` 也顺带切断了对 `pins` 的别名依赖：之后哪怕场景重算出一批**新**的数组对象，
+   * 面板显示的内容也不会跟着变。
+   */
   private open(idx: number): void {
-    this.selIndex = idx < this.pins.length ? idx : -1;
+    if (idx < 0 || idx >= this.pins.length) { this.close(); return; }
+    const pin: ScenePin = this.pins[idx];
+    this.selName = pin.name;
+    this.selShown = pin.shown;
+    this.selPhotos = pin.photos.slice(0, pin.photos.length);
+    this.selIndex = idx;
+  }
+
+  /** 关掉详情面板（也用于"数据要重读了"时把上一次的选择清干净）。 */
+  private close(): void {
+    this.selIndex = -1;
+    this.selName = '';
+    this.selShown = 0;
+    this.selPhotos = [];
   }
 
   build() {
@@ -350,8 +386,9 @@ struct WallPage {
         .width('100%').padding({ left: 12, right: 12, bottom: 8 })
 
       // ── 点开钉子的详情：全部照片（含没挂出来的那几张）──────────────────
-      if (this.selIndex >= 0 && this.selIndex < this.pins.length) {
-        this.detail(this.pins[this.selIndex])
+      // 判据只看 @State（`selIndex` / `selPhotos`），**不看 `this.pins`** —— 后者不是被观察的。
+      if (this.selIndex >= 0 && this.selPhotos.length > 0) {
+        this.detail()
       }
     }
     .width('100%').height('100%').backgroundColor('#FAFAFA')
@@ -360,28 +397,31 @@ struct WallPage {
   /**
    * 一个钉子的详情：地名、张数、**全部**照片（挂出来的 + 没挂出来的）。
    *
-   * 这是"重叠兜底"的收口：墙上最多挂 7 张（见 core/render 的几何说明），
+   * 这是"重叠兜底"的收口：墙上每个钉子最多挂 `MAX_HANG` 张（见 core/render 的几何说明），
    * 剩下的必须在某处看得到 —— 就是这里。日期也在这里给（卡片上叠不下可读的字号）。
+   *
+   * **不收参数**：数据全部从 `selName` / `selShown` / `selPhotos` 这三个 `@State` 读。
+   * 收 `ScenePin` 参数会把它变成"按值传的普通对象"，ArkUI 不观察它（见 `selName` 处的注释）。
    *
    * @Builder 而不是子组件：它直接用 this，且只有这一处使用。
    */
   @Builder
-  detail(pin: ScenePin) {
+  detail() {
     Column() {
       Row() {
-        Text(`${pin.name} ·${pin.photos.length} 张`).fontSize(13).fontWeight(FontWeight.Medium).layoutWeight(1)
+        Text(`${this.selName} ·${this.selPhotos.length} 张`).fontSize(13).fontWeight(FontWeight.Medium).layoutWeight(1)
         Text('关闭').fontSize(13).fontColor('#1F6FEB')
-          .onClick(() => { this.selIndex = -1; })
+          .onClick(() => { this.close(); })
       }
       .width('100%').padding({ bottom: 6 })
 
-      if (pin.shown > 0 && pin.shown < pin.photos.length) {
-        Text(`墙上挂了 ${pin.shown} 张（一屏最多 ${MAX_HANG} 张、此处受画布空间限制），下面是可以看的全部`)
+      if (this.selShown > 0 && this.selShown < this.selPhotos.length) {
+        Text(`墙上挂了 ${this.selShown} 张（一屏最多 ${MAX_HANG} 张、此处受画布空间限制），下面是可以看的全部`)
           .fontSize(10).fontColor('#999').width('100%').padding({ bottom: 4 })
       }
 
       List({ space: 8 }) {
-        ForEach(pin.photos, (p: WallPhoto) => {
+        ForEach(this.selPhotos, (p: WallPhoto) => {
           ListItem() {
             Column() {
               Image(p.photoId)
