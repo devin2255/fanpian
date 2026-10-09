@@ -836,6 +836,16 @@ export function parseOutline(text: string): OutlineData | undefined {
  * 也让 ArkUI 侧只需要一个 Path 组件）。相邻点重复时跳过（相邻重复点在 SVG 里是无用点，
  * 简化后会出现）；坐标保留 2 位小数控制体积。
  * 数据为空时返回空串（调用方据此跳过绘制，而不是画一条空 path）。
+ *
+ * ── 视口裁剪：整个落在 `[0,w]×[0,h]` 之外的环**不产出子路径** ──────────────────
+ * 为什么需要：`china_outline.json` 的 `bounds` 与 `CHINA_REGION.bounds` 一致（必须一致，
+ * 否则国界与照片会各画各的），而它的 `minLat = 18` —— 南海诸岛在 8~11.4°N，
+ * 投影后落在地图块**下方**（y > h）。不裁的话它们会飘到挂照片的区域里，看着像脏点。
+ * 数据里一条都没删（96 条环全在文件里，`build-outline.ts` 会数出来 77 条在块内 / 19 条在块外），
+ * 这里只是**视口剔除**：屏幕外的东西不画。
+ * 实测 96 条环里 **0 条跨界**（要么整条在块内、要么整条在块外），所以这个剔除是精确的、
+ * 不是近似。真出现跨界的环时会整条画出来（多出的部分由调用方的 frame 裁掉，
+ * 设备侧是容器的 `.clip(true)`）—— 那种情况下误差上界是一条描边宽度。
  */
 export function outlinePath(rings: number[][], w: number, h: number, bounds: number[]): string {
   if (rings === undefined || rings === null || rings.length === 0) { return ''; }
@@ -847,16 +857,26 @@ export function outlinePath(rings: number[][], w: number, h: number, bounds: num
     let d: string = '';
     let px: number = Number.NaN;
     let py: number = Number.NaN;
+    let minX: number = Number.POSITIVE_INFINITY;
+    let maxX: number = Number.NEGATIVE_INFINITY;
+    let minY: number = Number.POSITIVE_INFINITY;
+    let maxY: number = Number.NEGATIVE_INFINITY;
     for (let j = 0; j + 1 < ring.length; j += 2) {
       const p = projectMercator(ring[j], ring[j + 1], w, h, b);
       const x: number = r2(p.x);
       const y: number = r2(p.y);
+      if (x < minX) { minX = x; }
+      if (x > maxX) { maxX = x; }
+      if (y < minY) { minY = y; }
+      if (y > maxY) { maxY = y; }
       if (x === px && y === py) { continue; }
       px = x;
       py = y;
       d += (d.length === 0 ? 'M' : 'L') + x + ' ' + y;
     }
     if (d.length === 0) { continue; }
+    // 整条在视口外 → 丢掉这条子路径（视口剔除，不是删数据）
+    if (maxX < 0 || minX > w || maxY < 0 || minY > h) { continue; }
     parts.push(d + 'Z');
   }
   return parts.join('');

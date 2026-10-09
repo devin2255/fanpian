@@ -362,6 +362,54 @@ test('outlinePath：越界的 bounds 参数退回 CHINA_REGION.bounds（不产�
   assert.ok(!d.includes('NaN'));
 });
 
+test('outlinePath：整个落在地图块外的环被剔除（视口剔除，不是删数据）', () => {
+  // 视口 360×100。第二条环在 4~5°N —— 远在 bounds 的 minLat=18 之南，投影后整条在视口下方。
+  const inside = [73, 54, 74, 54, 74, 53];
+  const below = [100, 5, 101, 5, 101, 4];
+  const d = outlinePath([inside, below], W, 100, CHINA_REGION.bounds);
+  assert.equal(d.split('M').length - 1, 1, '视口外的环没有被剔除');
+  assert.equal(outlinePath([below], W, 100, CHINA_REGION.bounds), '', '整屏都在视口外时应当返回空串');
+  // 横向出界同理（经度 10°E 远在 bounds 的 minLon=73 之西）
+  const left = [10, 40, 11, 40, 11, 39];
+  assert.equal(outlinePath([left], W, 100, CHINA_REGION.bounds), '');
+});
+
+// ── 真实轮廓文件（china_outline.json） ──────────────────────────────────────
+
+const OUTLINE_URL = new URL('../../resources/rawfile/china_outline.json', import.meta.url);
+
+test('china_outline.json：真实文件能解析、bounds 与 CHINA_REGION 完全一致、环数不变', () => {
+  const text = fs.readFileSync(OUTLINE_URL, 'utf8');
+  assert.ok(Buffer.byteLength(text, 'utf8') <= 200 * 1024, `轮廓文件超过 200KB：${Buffer.byteLength(text, 'utf8')}`);
+  const od = parseOutline(text);
+  assert.ok(od !== undefined, 'china_outline.json 过不了 parseOutline —— 设备上地图会整块消失（静默失败）');
+  // 这一条是「地图与钉子对齐」的全部保障：钉子用 CHINA_REGION.bounds 投影、
+  // 国界用文件里的 bounds 投影，两者一旦不同就会各画各的，而且谁都不报错。
+  assert.deepEqual(od.bounds, CHINA_REGION.bounds);
+  assert.ok(od.license.length > 0, '缺少许可字段');
+  assert.ok(od.src.indexOf('Natural Earth') >= 0, `来源字段没写清出处：${od.src}`);
+  // 96 条环（中国 70 + 香港 4 + 澳门 2 + 台湾 8 + 南海诸岛 12），一条都不许少
+  assert.equal(od.rings.length, 96, `环数变了：${od.rings.length}`);
+});
+
+test('china_outline.json：投到地图块上的路径非空、无 NaN、且没有一个点落在地图块外', () => {
+  const od = parseOutline(fs.readFileSync(OUTLINE_URL, 'utf8'));
+  assert.ok(od !== undefined);
+  const mapH = mapBoxHeight(W, CHINA_REGION.bounds);
+  const d = outlinePath(od.rings, W, mapH, od.bounds);
+  assert.ok(d.length > 0, '轮廓 path 是空的');
+  assert.ok(!d.includes('NaN') && !d.includes('Infinity'));
+  // 视口剔除之后，子路径的坐标必须全部落在 [0,W]×[0,mapH] 内（实测 0 条跨界环）
+  const nums = d.replace(/[MLZ]/g, ' ').trim().split(/\s+/).map((s: string) => Number(s));
+  assert.ok(nums.length > 100, `坐标太少：${nums.length}`);
+  for (let i = 0; i + 1 < nums.length; i += 2) {
+    assert.ok(nums[i] >= -0.01 && nums[i] <= W + 0.01, `轮廓 x 越界：${nums[i]}`);
+    assert.ok(nums[i + 1] >= -0.01 && nums[i + 1] <= mapH + 0.01, `轮廓 y 越界：${nums[i + 1]}`);
+  }
+  // 地图块外的 19 条环（8~11.4°N 的南海诸岛）被剔除 → 子路径数少于环数，但数据里一条不少
+  assert.ok(d.split('M').length - 1 < od.rings.length, '视口外的环没被剔除');
+});
+
 // ── 画布比例（防止地图被拉成竖条） ──────────────────────────────────────────
 
 test('geoAspect / mapBoxHeight：地图块是**等比例**的（用 projectMercator 反推交叉验证）', () => {
