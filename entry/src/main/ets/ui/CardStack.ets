@@ -259,6 +259,24 @@ export struct CardStack {
             // 而上面刚把 gestureId 清空 —— 手势结束后它已无读取者，清它是无读者的冗余写入。
             // 它的生命周期由 onActionStart（清）与 commit（置真）划定，不再加第三个写入点。
           })
+          .onActionCancel(() => {
+            // 手势被取消（系统中断 / 被其他手势抢占）时不会走 onActionEnd。
+            // 不在这里收尾的后果与批 19 修的缺陷同形态：gestureId 留着手势起点，
+            // 判据 2 恒真 → 四个动作按钮全部失效，直到用户再拖一次。
+            //
+            // 语义：取消**不是**一次滑动尝试，所以**不上报回弹**（与「队首下滑静默弹回」同一口径）；
+            // 但卡片必须归位（否则它停在拖到一半的位置），故用 springBack(false)。
+            //
+            // 顺序不可颠倒：springBack(false) 在前（它内部会 endSpringWindow() 并起归位动画），
+            // gestureId = '' 在后 —— 与 onActionEnd 的顺序同理（清空要先让收尾动作读完状态）。
+            // 用 springBack(false) 而**不是** settle()：settle() 会按位移/速度替用户判定翻页或回弹，
+            // 而「手势被取消」不是一次翻页意图（SDK：取消 = PanGesture 识别成功之后收到触摸
+            // 取消事件），按位移/速度决定会凭空翻掉一张、或记一次伪回弹。
+            this.springBack(false);
+            this.gestureId = '';
+            // **不**在此清 decidedDuringGesture：与 onActionEnd 的既定处置一致 —— 上面清空
+            // gestureId 之后判据 1 不再成立，它已无读取者（见 onActionEnd 的说明）。
+          })
       )
 
       // 四个按钮：卡片外侧、卡片下方一行等分（layoutWeight(1)）。位置取舍见 M1 报告：
