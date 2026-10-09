@@ -28,6 +28,10 @@ struct FavPage {
         Grid() {
           ForEach(this.faved, (uri: string) => {
             GridItem() {
+              // 这一层 Stack 只负责把「墙上」角标叠在图片右上角（GridItem 的 alignContent
+              // 是「格内对齐」不是「叠加」，两个子组件没法靠它叠起来）。
+              // 格子尺寸由下方的 GridItem.aspectRatio(1) 给定：之前缺的正是这层尺寸约束，
+              // Image.height('100%') 去撑一个高度未定义的格子，才被拉成长竖条。
               Stack({ alignContent: Alignment.TopEnd }) {
                 Image(uri).width('100%').height('100%').objectFit(ImageFit.Cover).borderRadius(8)
                 if (this.walled.indexOf(uri) >= 0) {
@@ -37,6 +41,10 @@ struct FavPage {
                 }
               }
             }
+            // aspectRatio 在 GridItem 上可用：SDK 里 GridItemAttribute extends CommonMethod<GridItemAttribute>，
+            // 而 aspectRatio(value: number) 就声明在 CommonMethod 上。列宽由 columnsTemplate 定，
+            // 高度按 1:1 从列宽推出 → 方格。
+            .aspectRatio(1)
           }, (uri: string) => uri)
         }
         .columnsTemplate('1fr 1fr 1fr').columnsGap(8).rowsGap(8)

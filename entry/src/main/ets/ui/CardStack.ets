@@ -133,22 +133,29 @@ export struct CardStack {
     // 决策已生效、这张卡的回弹窗口就此结束：残留窗口属于「上一张卡」，
     // 不能让下一张卡（实例复用）的首次回弹被误判为「已上报」。
     if (this.springTimer !== -1) { clearTimeout(this.springTimer); this.springTimer = -1; }
+    // 飞出距离按卡宽推导，确保卡片完全离开视野（硬编码 600 在宽屏上可能只挪到边上）
+    const w = this.cardWidth > 0 ? this.cardWidth : 360;
+    const outX = dir * (w * 1.4);
     animateTo({ duration: 220, curve: Curve.EaseOut }, () => {
-      this.dx = dir * 600;
+      this.dx = outX;
       this.dy = this.dy + 40;
     });
     if (this.flyTimer !== -1) { clearTimeout(this.flyTimer); }
     this.flyTimer = setTimeout(() => {
       this.flyTimer = -1;
-      // 组件实例会被复用给下一张卡片（aboutToAppear 不会再跑），必须在这里归位。
-      // 归位要在 onDecide 之前：若回调抛错，闸门 animating 留在 true 会让整页手势死锁
-      //（实例被复用，失效范围不止这一张卡）。先归位 = 抛错也不影响后续交互。
-      this.dx = 0;
-      this.dy = 0;
-      this.animating = false;
       const act: 'fav' | 'archive' = dir > 0 ? 'fav' : 'archive';
       const out: SwipeDecision = { kind: 'decision', action: act };
-      this.onDecide(this.item.photoId, out);
+      // 顺序：先上报（换下一张卡）再归位位置。
+      // 若先归位，会出现一帧「旧卡弹回中央」——连拍照片下新旧卡视觉几乎一样，
+      // 用户会把「弹回来的旧卡」当成「照片没消失」。
+      // try/finally：onDecide 抛错时也必须把闸门放下，否则实例复用会让整页手势死锁。
+      try {
+        this.onDecide(this.item.photoId, out);
+      } finally {
+        this.dx = 0;
+        this.dy = 0;
+        this.animating = false;
+      }
     }, 230);
   }
 

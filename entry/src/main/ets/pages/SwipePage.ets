@@ -11,10 +11,6 @@ import { MetricsState, emptyMetrics, recordSwipe, medianDecisionMs, rollbackRate
 // 而 onAreaChange 量到的是页面宽，所以这里要乘回该比例。
 const CARD_WIDTH_RATIO = 0.86;
 
-// 「上墙窗口期」（spec §5.2）：刚收藏完、照片还「热」着的时候问「要不要上墙」命中率最高；
-// 错过也不惩罚——收藏页随时能补。
-export const WALL_PROMPT_MS = 4000;
-
 @Entry
 @Component
 struct SwipePage {
@@ -23,15 +19,15 @@ struct SwipePage {
   @State medianMs: number = 0;
   @State rollbackPct: number = 0;
   @State cardW: number = 360;   // 兜底值 = 首帧尚未量出卡宽时的假定卡宽；布局后由 onAreaChange 覆盖
-  // 非空 = 窗口期内的照片 id；按钮只在这段时间挂在卡片下方
-  @State wallPromptFor: string = '';
+  // 最后一张被右滑收藏的照片 id。非空时在顶部常驻一个「挂上墙」小按钮，
+  // 不遮挡卡片、不过期——用户不必为了点它而打断滑动节奏（真机反馈后由 4 秒窗口期改为此形态）。
+  @State lastFaved: string = '';
   private decisions: Map<string, Decision> = new Map();
   private metrics: MetricsState = emptyMetrics();
   private shownAt: number = Date.now();
   private ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
   // 必须声明在 ctx 之后：字段初始化按声明顺序执行，提前会拿到 undefined 的 ctx
   private dStore: DecisionStore = new DecisionStore(this.ctx);
-  private wallTimer: number = -1;   // 窗口期的 setTimeout 句柄，卸载时必须清掉（与 CardStack 同规矩）
   // 落盘防抖：内存 Map 是权威副本，落盘合并成 1 秒窗口内最多一次。
   // 每滑一张就 loadAll() + saveAll() 是「全量读 + 全量写」的同步 I/O，且跑在 UI 线程上；
   // Task 7 的「手感挺好」是在无落盘时测的，加落盘后必须把 I/O 从每决策 2 次压到每秒至多 1 次。
@@ -69,7 +65,6 @@ struct SwipePage {
 
   // 与 CardStack 的做法一致：页面卸载后定时器不得再改状态
   aboutToDisappear(): void {
-    if (this.wallTimer !== -1) { clearTimeout(this.wallTimer); this.wallTimer = -1; }
     // 页面退出时把还没落盘的决策强制写下去，否则这次滑动就白刷了
     this.flushSave();
   }
@@ -106,6 +101,12 @@ struct SwipePage {
     Column() {
       Row() {
         Text(`剩余 ${this.items.length - this.idx}`).fontSize(13).fontColor('#666').layoutWeight(1)
+        // 常驻小按钮：不叠在卡片上、不过期，滑到哪张都能点，不打断滑动节奏
+        if (this.lastFaved !== '') {
+          Button('挂上墙').fontSize(12).height(28).margin({ right: 8 })
+            .backgroundColor('#1F6FEB')
+            .onClick(() => { this.promoteToWall(); })
+        }
         Text(`中位 ${this.medianMs}ms  回弹 ${this.rollbackPct}%`).fontSize(12).fontColor('#999')
         Button('收藏').fontSize(12).height(28).margin({ left: 10 })
           .onClick(() => { router.pushUrl({ url: 'pages/FavPage' }); })
@@ -122,17 +123,6 @@ struct SwipePage {
           })
         } else {
           Text('今天的份刷完了').fontSize(18).fontColor('#666')
-        }
-
-        // 上墙窗口期：卡片下方浮出「挂上墙」，WALL_PROMPT_MS 后自动消失。
-        // Stack 子组件上的 align 等价于覆盖 Stack 的 alignContent，所以卡片仍居中、按钮贴底。
-        if (this.wallPromptFor !== '') {
-          Button('挂上墙')
-            .fontSize(15).height(42).width(160)
-            .backgroundColor('#1F6FEB')
-            .margin({ bottom: 32 })
-            .align(Alignment.Bottom)
-            .onClick(() => { this.promoteToWall(); })
         }
       }
       .layoutWeight(1).width('100%')
@@ -185,11 +175,9 @@ struct SwipePage {
     // 落盘改防抖合并：内存 Map 已是权威副本，崩溃/被杀最多丢 1 秒内的决策
     this.scheduleSave();
 
-    // 只对「右滑收藏」弹窗口期，归档不弹
+    // 右滑收藏后把「上墙」入口更新为这张；归档不动它
     if (nextAction === 'fav') {
-      this.wallPromptFor = photoId;
-      if (this.wallTimer !== -1) { clearTimeout(this.wallTimer); }
-      this.wallTimer = setTimeout(() => { this.wallPromptFor = ''; }, WALL_PROMPT_MS);
+      this.lastFaved = photoId;
     }
 
     this.idx = this.idx + 1;
@@ -198,14 +186,13 @@ struct SwipePage {
 
   // 上墙 = 从收藏里精选（不是与收藏互斥的状态）：摘墙会回到 faved 而不是 unseen。
   private promoteToWall(): void {
-    const id = this.wallPromptFor;
+    const id = this.lastFaved;
     if (id === '') { return; }
     const prev = this.decisions.get(id);
     const d = prev === undefined ? emptyDecision(id) : prev;
     const next = applyDecision(d, 'wall', Date.now());
     this.decisions.set(id, next);
     this.scheduleSave();
-    this.wallPromptFor = '';
-    if (this.wallTimer !== -1) { clearTimeout(this.wallTimer); this.wallTimer = -1; }
+    this.lastFaved = '';   // 已上墙，入口收起（下次右滑收藏会重新出现）
   }
 }
