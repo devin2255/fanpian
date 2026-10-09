@@ -21,8 +21,18 @@
  *   --w=--h=         画布尺寸（pt，默认 360×720 —— 一台常见鸿蒙手机的 vp 尺寸）
  *   --zoom=          地图缩放（默认 1）。小于 placement.MIN_ZOOM_FOR_EXPAND 时全部收成点。
  *   --scale=         SVG 的像素放大倍数（默认 2；**只改 width/height，几何一点不变**）
+ *   --footer=        底部图例条的高度（pt，默认 34）。卡片不许压到图例上 —— 这是**分区**的一部分。
  *   --many           用 18 个钉子的那份数据（演示"钉子多时收成点"）
  *   --flat           把地图拉满整块画布（**会变形**，只是留个对照，别用）
+ *
+ * ── 画布分区是怎么定的（"内容决定"，不是拍脑袋的常数） ────────────────────────
+ *   · **地图块高** = `mapBoxHeight(w)`：由**中国本身的形状**决定（bounds 的墨卡托宽高比）。
+ *     360 宽 → 267.72 高。它不能改成"画布的 45%~55%"：要让中国填满 360×360 就得把
+ *     经度压到 46°（砍掉新疆或东部海岸），或者非等比拉伸（中国变成一根竖条，
+ *     单测 `geoAspect / mapBoxHeight：若把 bounds 拉满竖屏（h=720）比例会崩掉` 就是钉这个的）。
+ *   · **挂载区** = `[地图块底, h − footer]`，即地图放不下照片的那部分全给照片。
+ *     它是**剩余量**，不是常数：换一块画布（--w/--h/--footer）它自己跟着变。
+ *   · 布局只在这个分区内做取舍：放不下就少挂几张、再不行就收成点（见 core/render.ts 的 planPin）。
  *
  * 输出断言（脚本自己会检查，不符合就非零退出）：
  *   · 文件写出且非空；· 没有 NaN/Infinity 坐标；· 有 <svg> 根元素。
@@ -35,7 +45,7 @@ import { parseAreaData } from '../entry/src/main/ets/core/areaData.ts';
 import { CHINA_REGION, projectMercator } from '../entry/src/main/ets/core/projection.ts';
 import { MIN_ZOOM_FOR_EXPAND } from '../entry/src/main/ets/core/placement.ts';
 import {
-  HANG_GAP, HANG_PHOTO_H, arcSpread, buildScene, geoAspect, hangOffsets, mapBoxHeight,
+  HANG_GAP, HANG_PHOTO_H, arcSpread, arcSpreadNeed, buildScene, geoAspect, hangOffsets, mapBoxHeight,
   outlinePath, parseOutline, sceneToSvg
 } from '../entry/src/main/ets/core/render.ts';
 import type { ScenePin, WallPhoto } from '../entry/src/main/ets/core/render.ts';
@@ -55,6 +65,7 @@ interface Options {
   h: number;
   zoom: number;
   scale: number;
+  footer: number;
   flat: boolean;
 }
 
@@ -67,6 +78,7 @@ function parseArgs(argv: string[]): Options {
     h: 720,
     zoom: 1,
     scale: 2,
+    footer: 34,
     flat: false
   };
   const positional: string[] = [];
@@ -87,6 +99,7 @@ function parseArgs(argv: string[]): Options {
     if (key === '--h') { o.h = Number(val); continue; }
     if (key === '--zoom') { o.zoom = Number(val); continue; }
     if (key === '--scale') { o.scale = Number(val); continue; }
+    if (key === '--footer') { o.footer = Number(val); continue; }
     if (a.startsWith('--')) { throw new Error(`未知参数：${a}`); }
     positional.push(a);
   }
@@ -192,8 +205,12 @@ function main(): number {
     }
   }
 
-  const pins: ScenePin[] = buildScene(loaded.photos, mapW, mapH, o.zoom);
+  const pins: ScenePin[] = buildScene(loaded.photos, mapW, mapH, o.zoom, { canvasH: o.h, footer: o.footer });
   let svg = sceneToSvg(pins, o.w, o.h, chinaPath, o.scale);
+
+  // 分区：地图块 / 挂载区。挂载区底 = h − footer（图例的地盘不许被卡片压住）。
+  const hangBottom = o.h - o.footer > mapH ? o.h - o.footer : mapH;
+  const hangTop = mapH;
 
   // 地图块的底色：让"地图只占上方这一块、下方是挂照片的地方"在图上一眼可见。
   // 分区是**预览的排版**（sceneToSvg 只管画钉子和照片），所以在这里拼进去。
@@ -206,8 +223,9 @@ function main(): number {
   }
 
   // 页脚：把"这张图是什么、用了哪份数据、几何是多少"写在图上，省得看图的人猜
-  const drawn = pins.filter((p) => p.expanded).reduce((s, p) => s + Math.min(9, p.photos.length), 0);
+  const drawn = pins.reduce((s, p) => s + p.shown, 0);
   const undated = pins.reduce((s, p) => s + p.photos.filter((x) => !(x.takenAt > 0)).length, 0);
+  const onWall = pins.reduce((s, p) => s + p.photos.length, 0);
   const total = loaded.photos.length;
   // 「照片级」的地图块外计数：按**原始坐标**算，不受聚簇影响。
   // 为什么必须单独算：400km 外的两张照片会在屏幕上被并进同一个钉子（MIN_PIN_DIST_PT=40
@@ -224,9 +242,9 @@ function main(): number {
   }
   const legend: string[] = [];
   legend.push(`<g id="legend" font-size="7" fill="#7A8577">`);
-  legend.push(`<text x="8" y="${round2(o.h - 26)}">地图墙预览 ｜ ${pins.length} 个钉子 ｜ 挂出的照片 ${drawn} 张（时间未知 ${undated} 张）</text>`);
-  legend.push(`<text x="8" y="${round2(o.h - 15)}">输入 ${total} 张（不上墙 ${total - pins.reduce((s, p) => s + p.photos.length, 0)} 张 ｜ 地图块外 ${outside.length} 张） ｜ 照片是占位卡片，Node 侧没有像素</text>`);
-  legend.push(`<text x="8" y="${round2(o.h - 4)}">地图块 ${o.w}×${round2(mapH)}pt（墨卡托比例 ${geoAspect(CHINA_REGION.bounds).toFixed(3)}） ｜ ${escapeText(outlineNote)}</text>`);
+  legend.push(`<text x="8" y="${round2(o.h - 26)}">地图墙预览 ｜ ${pins.length} 个钉子 ｜ 挂出 ${drawn} 张 / 上墙 ${onWall} 张（图例 ${o.footer}pt ｜ 时间未知 ${undated} 张）</text>`);
+  legend.push(`<text x="8" y="${round2(o.h - 15)}">输入 ${total} 张（无地点不上墙 ${total - onWall} 张 ｜ 地图块外 ${outside.length} 张） ｜ 照片是占位卡片，Node 侧没有像素</text>`);
+  legend.push(`<text x="8" y="${round2(o.h - 4)}">地图块 ${o.w}×${round2(mapH)}pt（墨卡托 ${geoAspect(CHINA_REGION.bounds).toFixed(3)}） ｜ 挂载区 ${round2(hangTop)}→${round2(hangBottom)}pt ｜ ${escapeText(outlineNote)}</text>`);
   legend.push(`</g>`);
   svg = svg.replace('</svg>', legend.join('\n') + '\n</svg>');
 
@@ -242,23 +260,28 @@ function main(): number {
   // ── 控制台摘要（报告里的数字都来自这里） ──────────────────────────────────
   console.log(`数据：${loaded.source}`);
   console.log(`  读入 ${loaded.photos.length} 条${loaded.dropped > 0 ? `（丢弃 ${loaded.dropped} 条非法记录）` : ''}`);
-  console.log(`画布：${o.w}×${o.h}pt（scale=${o.scale} → ${o.w * o.scale}×${o.h * o.scale}px）  地图块：${o.w}×${round2(mapH)}pt  zoom=${o.zoom}${o.zoom < MIN_ZOOM_FOR_EXPAND ? '（< 展开阈值，全部收成点）' : ''}`);
+  console.log(`画布：${o.w}×${o.h}pt（scale=${o.scale} → ${o.w * o.scale}×${o.h * o.scale}px）`);
+  console.log(`分区：地图块 0→${round2(mapH)}pt（${round2((mapH / o.h) * 100)}%） ｜ 挂载区 ${round2(hangTop)}→${round2(hangBottom)}pt（${round2(((hangBottom - hangTop) / o.h) * 100)}%） ｜ 图例 ${o.footer}pt`);
+  console.log(`      地图块高 = mapBoxHeight(${o.w}) = ${round2(mapW)}/${geoAspect(CHINA_REGION.bounds).toFixed(4)} —— 由中国本身的墨卡托宽高比决定，不是常数  zoom=${o.zoom}${o.zoom < MIN_ZOOM_FOR_EXPAND ? '（< 展开阈值，全部收成点）' : ''}`);
   console.log(`国界：${outlineNote}`);
   console.log(`钉子 ${pins.length} 个：`);
   for (const p of pins) {
     const off = p.x < 0 || p.x > o.w || p.y < 0 || p.y > mapH ? '  ← 画布外' : '';
+    const tail = p.shown > 0 && p.shown < p.photos.length ? `（还有 ${p.photos.length - p.shown} 张画成 +N）` : '';
     console.log(`  ${p.name.padEnd(22)} (${String(p.x).padStart(6)}, ${String(p.y).padStart(6)})`
-      + ` ${p.expanded ? '展开' : '收成点'} ${p.photos.length} 张`
-      + ` 时间未知 ${p.photos.filter((x) => !(x.takenAt > 0)).length} 张${off}`);
+      + ` ${p.shown > 0 ? '展开' : '收成点'} ${String(p.shown).padStart(2)}/${String(p.photos.length).padStart(2)} 张`
+      + ` 弦宽 ${p.spread.toFixed(2).padStart(6)}`
+      + ` 时间未知 ${p.photos.filter((x) => !(x.takenAt > 0)).length} 张${tail}${off}`);
   }
-  const hidden = loaded.photos.length - pins.reduce((s, p) => s + p.photos.length, 0);
+  const hidden = loaded.photos.length - onWall;
   console.log(`没有地点的照片 ${hidden} 张（不上墙）`);
+  console.log(`挂出 ${drawn} 张 / 上墙 ${onWall} 张（少挂的 ${onWall - drawn} 张画成「+N」，点开钉子仍能看到）`);
   console.log(`地图块外（按原始坐标算，不受聚簇影响）${outside.length} 张：${outside.length === 0 ? '（无）' : outside.join('、')}`);
   console.log(`弧形核对表 n=5, spread=100：`);
   hangOffsets(5, 100).forEach((v, i) => {
     console.log(`  #${i}  dx=${v.dx.toFixed(3).padStart(8)}  dy=${v.dy.toFixed(3).padStart(8)}`);
   });
-  console.log(`  （实际用的 spread(5, ${o.w}) = ${arcSpread(5, o.w).toFixed(2)}，卡片 ${HANG_GAP}pt 之下起挂，卡片高 ${HANG_PHOTO_H}）`);
+  console.log(`  （实际用的 spread(5, ${o.w}) = ${arcSpread(5, o.w).toFixed(2)}；${arcSpreadNeed(5).toFixed(2)} 是"相邻卡片不压住"的下限）`);
   const st = fs.statSync(o.out);
   console.log(`✓ ${path.relative(REPO, o.out)}  ${st.size} 字节`);
   return 0;
