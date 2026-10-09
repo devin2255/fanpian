@@ -37,7 +37,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHINA_REGION, projectMercator } from '../entry/src/main/ets/core/projection.ts';
-import { mapBoxHeight, parseOutline, outlinePath } from '../entry/src/main/ets/core/render.ts';
+import { mapBoxHeight, mapFrame, parseOutline, outlinePath } from '../entry/src/main/ets/core/render.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
@@ -391,7 +391,15 @@ function main(): number {
       + ' —— 国界会与照片错位，拒绝收工');
     return 1;
   }
-  const d = outlinePath(od.rings, REF_W, REF_H, od.bounds);
+  // `outlinePath` 现在收一个 `MapFrame`（bounds 长在框上，见 render.ts 的 `MapFrame`）。
+  // 这里用 `mapFrame(REF_W, REF_H, od.bounds)` 重建**整块参考画布**：
+  // `REF_H` 本来就是 `mapBoxHeight(REF_W, CHINA_REGION.bounds)`，而 `od.bounds` 已被上面
+  // 钉死等于 `CHINA_REGION.bounds` —— 所以这个框的不变形比例与画布**恰好**一致，
+  // 算出来就是 `x = 2.8e-14, y = 0, w = REF_W(−5.7e-14), h = REF_H`（浮点尾差，`r2` 之后为 0），
+  // 即"框 == 整块画布"，与旧调用 `outlinePath(rings, REF_W, REF_H, od.bounds)` **逐字节等价**。
+  // 唯一差别是新实现多了"整条环落在块外 → 不产出子路径"的视口剔除（96 条 → 77 条），
+  // 这是 render.ts 侧有意为之，下面 main() 里的视口统计数的就是这件事。
+  const d = outlinePath(od.rings, mapFrame(REF_W, REF_H, od.bounds));
   if (d.length === 0 || d.includes('NaN') || d.includes('Infinity')) {
     console.error('✗ outlinePath 产出的 d 为空或含 NaN —— 拒绝收工');
     return 1;
