@@ -165,6 +165,19 @@ function clipBand(cards: CardRect[], y0: number, y1: number, w: number): CardRec
   return out;
 }
 
+/**
+ * 某一条横带 `y ∈ [y0,y1]` 内的卡片并集覆盖面积（pt²）。
+ *
+ * 为什么不直接把 `y0,y1` 传给 `unionArea`：那个函数的 `h` 是**绝对**画布高（它按 `[0,h]` 钳制），
+ * 而地图框在 task-14 之后**不再从 y=0 开始**（它居中在块里，y=226.14）。
+ * 直接把 `h=mapH` 传进去会让 y 区间倒挂、整条带被算成 0（一个不会报错的静默错误，
+ * 第一版就撞上了：地图框内覆盖 0% / 挂载区内覆盖 0%）。所以先把这一段**搬到原点**再量。
+ */
+function bandUnion(cards: CardRect[], y0: number, y1: number, w: number): number {
+  if (!(y1 > y0)) { return 0; }
+  return unionArea(clipBand(cards, y0, y1, w).map((c) => ({ x: c.x, y: c.y - y0, w: c.w, h: c.h, id: c.id })), w, y1 - y0);
+}
+
 // ── 报告 ────────────────────────────────────────────────────────────────────
 
 function main(): number {
@@ -181,12 +194,19 @@ function main(): number {
   const canvas = readCanvas(svg);
   const cards = readCards(svg);
 
-  // 分区：预览在地图块上铺了一层底色矩形（fill="#F2F7EF"），从它读地图块高。
-  // 读不出来（例如 --flat 或图里没有分区）时按"地图块 = 整块画布"处理。
-  const bandMatch = /<rect x="0" y="0" width="[\d.]+" height="([\d.]+)" fill="#F2F7EF"\/>/.exec(svg);
-  const mapH = bandMatch === null ? canvas.h : parseFloat(bandMatch[1]);
-  const legendMatch = /地图块 [\d.]+×([\d.]+)pt/.exec(svg);
-  const mapHShown = legendMatch === null ? mapH : parseFloat(legendMatch[1]);
+  // 分区：从**图例**里读（预览写的是「地图块 0→720pt」与「地图框 360×267.72pt@(0,226.14)」）。
+  // 为什么不再靠底色矩形区分：task-14 之后地图块（整块主体区）与地图框是**同一个底色**
+  //（设备侧也一样），靠两种颜色去区分会让"预览与真机同色"这条性质失效。
+  // 图例是预览自己写的、带单位的一行文本，比颜色更稳。
+  const frameMatch = /地图框 ([\d.]+)×([\d.]+)pt@\((-?[\d.]+),(-?[\d.]+)\)/.exec(svg);
+  const frame = frameMatch === null
+    ? { x: 0, y: 0, w: canvas.w, h: canvas.h }
+    : { x: parseFloat(frameMatch[3]), y: parseFloat(frameMatch[4]), w: parseFloat(frameMatch[1]), h: parseFloat(frameMatch[2]) };
+  const mapH = frame.h;
+  const mapY = frame.y;
+  const blockMatch = /地图块 0→([\d.]+)pt/.exec(svg);
+  const blockH = blockMatch === null ? canvas.h : parseFloat(blockMatch[1]);
+  const mapHShown = mapH;
   // 挂载区底：从图例里读（预览写的是 "挂载区 a→b pt"）
   const hangMatch = /挂载区 [\d.]+→([\d.]+)pt/.exec(svg);
   const hangBottom = hangMatch === null ? canvas.h : parseFloat(hangMatch[1]);
@@ -210,19 +230,24 @@ function main(): number {
   // 空间利用（并集面积是精确值，见 unionArea 的注释）
   const cardArea = cards.reduce((s, c) => s + c.w * c.h, 0);
   const boardArea = canvas.w * canvas.h;
-  const hangH = hangBottom - mapH;
+  const frameTop = mapY;
+  const frameBottom = mapY + mapH;
+  const hangH = hangBottom - frameBottom;
   const mapArea = canvas.w * mapH;
   const hangArea = canvas.w * (hangH > 0 ? hangH : 0);
   const covered = unionArea(cards, canvas.w, canvas.h);
-  const coveredMap = unionArea(clipBand(cards, 0, mapH, canvas.w), canvas.w, mapH);
-  const coveredHang = unionArea(clipBand(cards, mapH, hangBottom, canvas.w), canvas.w, hangH > 0 ? hangH : 0);
+  const coveredMap = bandUnion(cards, frameTop, frameBottom, canvas.w);
+  const coveredHang = bandUnion(cards, frameBottom, hangBottom, canvas.w);
   let cardInHang = 0;
-  for (const c of cards) { cardInHang += bandOverlap(c, mapH, hangBottom, canvas.w); }
+  for (const c of cards) { cardInHang += bandOverlap(c, frameBottom, hangBottom, canvas.w); }
 
   // 钉点与 +N 角标（用于报告"收成点"的数量）
   const dots = svg.split('<circle ').length - 1;
   const plusN = (svg.match(/>\+\d+</g) || []).length;
   const lines = svg.split('<line ').length - 1;
+  // 轨迹折线：预览把它画在 <g id="trajectory"> 里的一条 path
+  const trackMatch = /<g id="trajectory">\s*<path d="([^"]*)"/.exec(svg);
+  const trackPts = trackMatch === null ? 0 : (trackMatch[1].match(/[ML]/g) || []).length;
 
   let minY = Number.POSITIVE_INFINITY;
   let maxY = Number.NEGATIVE_INFINITY;
@@ -241,14 +266,19 @@ function main(): number {
     file: path.relative(process.cwd(), p.file),
     canvas: { w: canvas.w, h: canvas.h, px: `${canvas.w * canvas.scale}x${canvas.h * canvas.scale}` },
     partition: {
+      blockH: r2(blockH),
+      mapX: r2(frame.x),
+      mapY: r2(mapY),
+      mapW: r2(frame.w),
       mapH: r2(mapHShown),
       mapPct: pct(mapHShown, canvas.h),
-      hangTop: r2(mapHShown),
+      hangTop: r2(frameBottom),
       hangBottom: r2(hangBottom),
-      hangH: r2(hangBottom - mapHShown),
-      hangPct: pct(hangBottom - mapHShown, canvas.h)
+      hangH: r2(hangBottom - frameBottom),
+      hangPct: pct(hangBottom - frameBottom, canvas.h)
     },
     cards: cards.length,
+    trackPoints: trackPts,
     cardOut: outside.length,
     cardOutDetail: outside.map((c) => `${c.id} x=${r2(c.x)} y=${r2(c.y)} 右=${r2(c.x + c.w)} 下=${r2(c.y + c.h)}`),
     overlapPairs: pairs.length,
@@ -277,9 +307,10 @@ function main(): number {
   }
 
   console.log(`文件：${out.file}（画布 ${out.canvas.w}×${out.canvas.h}pt → ${out.canvas.px}px）`);
-  console.log(`分区：地图块 0→${out.partition.mapH}pt（${out.partition.mapPct}%）`
+  console.log(`分区：地图块 0→${out.partition.blockH}pt（地图是整块主体区的底色）`
+    + ` ｜ 地图框 ${out.partition.mapW}×${out.partition.mapH}pt@(${out.partition.mapX},${out.partition.mapY})（${out.partition.mapPct}%）`
     + ` ｜ 挂载区 ${out.partition.hangTop}→${out.partition.hangBottom}pt（${out.partition.hangH}pt，${out.partition.hangPct}%）`);
-  console.log(`照片卡片 ${out.cards} 张 ｜ 线 ${out.lines} 条 ｜ 钉点 ${out.dots} 个 ｜ +N 角标 ${out.plusN} 个`);
+  console.log(`照片卡片 ${out.cards} 张 ｜ 挂线 ${out.lines} 条 ｜ 轨迹 ${out.trackPoints} 点 ｜ 钉点 ${out.dots} 个 ｜ +N 角标 ${out.plusN} 个`);
   if (out.cardSpanY !== null && out.cardSpanX !== null) {
     console.log(`  卡片横向跨度 x ∈ [${out.cardSpanX[0]}, ${out.cardSpanX[1]}] ｜ 纵向跨度 y ∈ [${out.cardSpanY[0]}, ${out.cardSpanY[1]}]`);
   }

@@ -15,17 +15,39 @@ import { parseAreaData } from './areaData.ts';
 import { CHINA_REGION, projectMercator } from './projection.ts';
 import { MAX_HANG, MIN_PIN_DIST_PT } from './placement.ts';
 import {
-  HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, HANG_OVERLAP_EPS, HANG_SWEEP_RAD,
-  arcSpread, arcSpreadNeed, buildScene, clampRect, dateLabel, geoAspect, hangOffsets, hangRects,
-  mapBoxHeight, outlinePath, parseOutline, rectOverlapArea, sceneToSvg
+  HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, HANG_OVERLAP_EPS, HANG_SWEEP_RAD, TRACK_WIDTH,
+  arcSpread, arcSpreadNeed, buildScene, clampRect, dateLabel, geoAspect, hangBottom, hangOffsets, hangRects,
+  mapBoxHeight, mapFrame, outlinePath, parseOutline, pinTime, rectOverlapArea, sceneToSvg,
+  trajectoryOrder, trajectoryPath
 } from './render.ts';
-import type { CardRect, ScenePin, WallPhoto } from './render.ts';
+import type { CardRect, MapFrame, ScenePin, WallPhoto } from './render.ts';
 
 const DATA_URL = new URL('../../resources/rawfile/china_areas.json', import.meta.url);
 parseAreaData(fs.readFileSync(DATA_URL, 'utf8'));
 
 const W = 360;
 const H = 720;
+
+/**
+ * 各种测试用的地图框。
+ *
+ * `MapFrame` 把"地图块"和"不变形绘制框"分成两件事（见 core/render.ts 的长注释）：
+ * 块是整块主体区（地图是它的底色），框是块里那个**不变形**、**居中**的矩形。
+ * 于是 `ScenePin.x/y` 与 `hangRects` 的矩形都落在**块坐标**里 ——
+ * 断言坐标时要带上框的平移（`atFrame` 就是干这个的）。
+ */
+/** 真机形状：主体区 360×720 → 框 360×267.72，居中在 y=226.14（x=0，因为宽度正好用满）。 */
+const FRAME: MapFrame = mapFrame(W, H, CHINA_REGION.bounds);
+/** "画布给得很宽"的那一档（720×800）：框宽 720、高 535.53，居中在 y=132.24。 */
+const FRAME_WIDE: MapFrame = mapFrame(720, 800, CHINA_REGION.bounds);
+/** 块与框重合的那种退化框（块本身的比例就正好）：用来测与"框"无关的性质。 */
+const FULL_FRAME: MapFrame = { blockW: W, blockH: H, x: 0, y: 0, w: W, h: H };
+
+/** 按某个框投影一个经纬度（结果已含框的平移），与 `buildScene` 内部的算法同源。 */
+function atFrame(lon: number, lat: number, frame: MapFrame): { x: number; y: number } {
+  const p = projectMercator(lon, lat, frame.w, frame.h, CHINA_REGION.bounds);
+  return { x: p.x + frame.x, y: p.y + frame.y };
+}
 
 /** 造一张照片。参数按"最常改到的东西"排：id、坐标、时间。 */
 function ph(photoId: string, lat: number, lon: number, takenAt: number, place?: string): WallPhoto {
@@ -94,7 +116,7 @@ test('arcSpread：单调不减 + 受可用宽度钳制 + 单张不为 0', () => 
   for (let n = 1; n <= 12; n++) {
     const s = arcSpread(n, W);
     assert.ok(s >= prev, `n=${n} 的弦宽比 n-1 还小`);
-    assert.ok(s <= W * 0.72 + 1e-9, `n=${n} 的弦宽超出了画布的安全区`);
+    assert.ok(s <= W * 0.80 + 1e-9, `n=${n} 的弦宽超出了画布的安全区`);
     prev = s;
   }
   // 可用宽度很小时也不会退化成 0（否则整条弧会变成一个点）
@@ -108,7 +130,7 @@ test('buildScene：没有坐标的照片不上墙（(0,0) 不是几内亚湾）'
     ph('a', 0, 0, 1700000000000),
     ph('b', 39.9042, 116.4074, 1700000000000)   // 北京天安门
   ];
-  const pins = buildScene(photos, W, H, 1);
+  const pins = buildScene(photos, FRAME, 1);
   assert.equal(pins.length, 1);
   assert.equal(pins[0].photos.length, 1);
   assert.equal(pins[0].photos[0].photoId, 'b');
@@ -116,7 +138,7 @@ test('buildScene：没有坐标的照片不上墙（(0,0) 不是几内亚湾）'
 
 test('buildScene：manual 的地点即使坐标是 (0,0) 也算有地点（hasPlace 优先手动）', () => {
   const p: WallPhoto = { photoId: 'm', lat: 0, lon: 0, takenAt: 1700000000000, manual: true, place: '河北·石家庄·正定' };
-  const pins = buildScene([p], W, H, 1);
+  const pins = buildScene([p], FRAME, 1);
   assert.equal(pins.length, 1);
   assert.equal(pins[0].name, '河北·石家庄·正定');
 });
@@ -124,14 +146,14 @@ test('buildScene：manual 的地点即使坐标是 (0,0) 也算有地点（hasPl
 test('buildScene：有 place 就直接用，不走反查（EXIF 坐标也不会盖掉手选名）', () => {
   // 坐标是上海人民广场，但用户说这张挂在正定 —— 以用户为准
   const p = ph('x', 31.2304, 121.4737, 1700000000000, '河北·石家庄·正定');
-  const pins = buildScene([p], W, H, 1);
+  const pins = buildScene([p], FRAME, 1);
   assert.equal(pins.length, 1);
   assert.equal(pins[0].name, '河北·石家庄·正定');
 });
 
 test('buildScene：没有 place 的 EXIF 条目用 nearestCounty 反查真实地名', () => {
   // 上海人民广场 31.2304,121.4737 → 应当是「上海·黄浦」一带（真实数据断言，见文件头）
-  const pins = buildScene([ph('s', 31.2304, 121.4737, 1700000000000)], W, H, 1);
+  const pins = buildScene([ph('s', 31.2304, 121.4737, 1700000000000)], FRAME, 1);
   assert.equal(pins.length, 1);
   assert.ok(pins[0].name.indexOf('上海') === 0, `反查到的地名不是上海：${pins[0].name}`);
 });
@@ -142,14 +164,14 @@ test('buildScene：同一地名的多张照片归到一个钉子下', () => {
     ph('b', 31.2310, 121.4740, 1700000100000),
     ph('c', 31.2290, 121.4730, 1700000200000)
   ];
-  const pins = buildScene(photos, W, H, 1);
+  const pins = buildScene(photos, FRAME, 1);
   assert.equal(pins.length, 1);
   assert.equal(pins[0].photos.length, 3);
 });
 
 test('buildScene：重复传入同一张照片不会长出两个钉子', () => {
   const one = ph('dup', 31.2304, 121.4737, 1700000000000);
-  const pins = buildScene([one, one], W, H, 1);
+  const pins = buildScene([one, one], FRAME, 1);
   assert.equal(pins.length, 1);
   assert.equal(pins[0].photos.length, 1);
 });
@@ -161,13 +183,15 @@ test('buildScene：钉子位置 = 组内坐标中位数（真实地点，逐点�
     ph('b', 38.1464, 114.5709, 1700000000000),
     ph('c', 38.0428, 114.5149, 1700000000000)
   ];
-  const pins = buildScene(photos, W, H, 1);
+  const pins = buildScene(photos, FRAME, 1);
   assert.equal(pins.length, 1);
   const lat = 38.0428;   // 三个值的中位数
   const lon = 114.5149;
-  const exp = projectMercator(lon, lat, W, H, CHINA_REGION.bounds);
+  const exp = atFrame(lon, lat, FRAME);
   assert.ok(Math.abs(pins[0].x - exp.x) < 0.01, `x 不是中位数投影：${pins[0].x} vs ${exp.x}`);
   assert.ok(Math.abs(pins[0].y - exp.y) < 0.01, `y 不是中位数投影：${pins[0].y} vs ${exp.y}`);
+  // 钉子坐标在**块坐标**里：至少要比投影框的原点低 `frame.y`（框是居中的，不是从 0 开始）
+  assert.ok(pins[0].y > FRAME.y, `钉子跑到地图框上面去了：y=${pins[0].y} < ${FRAME.y}`);
 });
 
 // ── buildScene：takenAt == 0 的照片（必须仍然在墙上） ────────────────────────
@@ -178,7 +202,7 @@ test('buildScene：takenAt=0 的照片仍然上墙，且排在组内最后', () 
     ph('late', 31.2304, 121.4737, 1700000200000),
     ph('early', 31.2304, 121.4737, 1700000000000)
   ];
-  const pins = buildScene(photos, W, H, 1);
+  const pins = buildScene(photos, FRAME, 1);
   assert.equal(pins.length, 1);
   assert.equal(pins[0].photos.length, 3, '没有时间的照片被丢掉了');
   const ids = pins[0].photos.map((p: WallPhoto) => p.photoId);
@@ -188,8 +212,8 @@ test('buildScene：takenAt=0 的照片仍然上墙，且排在组内最后', () 
 test('buildScene：全是 takenAt=0 时按 photoId 排序（可复现，与输入顺序无关）', () => {
   const a = ph('b', 31.2304, 121.4737, 0);
   const b = ph('a', 31.2304, 121.4737, 0);
-  const forward = buildScene([a, b], W, H, 1)[0].photos.map((p: WallPhoto) => p.photoId);
-  const backward = buildScene([b, a], W, H, 1)[0].photos.map((p: WallPhoto) => p.photoId);
+  const forward = buildScene([a, b], FRAME, 1)[0].photos.map((p: WallPhoto) => p.photoId);
+  const backward = buildScene([b, a], FRAME, 1)[0].photos.map((p: WallPhoto) => p.photoId);
   assert.deepEqual(forward, ['a', 'b']);
   assert.deepEqual(backward, ['a', 'b']);
 });
@@ -199,7 +223,7 @@ test('buildScene：全是 takenAt=0 时按 photoId 排序（可复现，与输�
 test('buildScene：钉子 ≤3 时全部展开（每钉最多 9 张）', () => {
   const photos: WallPhoto[] = [];
   for (let i = 0; i < 12; i++) { photos.push(ph(`p${i}`, 31.2304 + i * 0.001, 121.4737, 1700000000000 + i)); }
-  const pins = buildScene(photos, W, H, 1);
+  const pins = buildScene(photos, FRAME, 1);
   assert.equal(pins.length, 1);
   assert.equal(pins[0].expanded, true);
   assert.equal(pins[0].photos.length, 12, 'ScenePin.photos 是全部照片，不受 MAX_HANG 截断');
@@ -208,14 +232,14 @@ test('buildScene：钉子 ≤3 时全部展开（每钉最多 9 张）', () => {
 
 test('buildScene：zoom 小于阈值时全部按钉渲染（不展开）', () => {
   const photos = [ph('a', 31.2304, 121.4737, 1700000000000), ph('b', 31.2305, 121.4738, 1700000000001)];
-  assert.equal(buildScene(photos, W, H, 0.2)[0].expanded, false);
-  assert.equal(buildScene(photos, W, H, 1)[0].expanded, true);
+  assert.equal(buildScene(photos, FRAME, 0.2)[0].expanded, false);
+  assert.equal(buildScene(photos, FRAME, 1)[0].expanded, true);
 });
 
 test('buildScene：zoom 为 NaN / 0 / 负数时按 1 处理（不静默走进"错误展开"）', () => {
   const photos = [ph('a', 31.2304, 121.4737, 1700000000000), ph('b', 31.2305, 121.4738, 1700000000001)];
   for (const z of [Number.NaN, 0, -1]) {
-    assert.equal(buildScene(photos, W, H, z)[0].expanded, true, `zoom=${z} 的处理与 zoom=1 不一致`);
+    assert.equal(buildScene(photos, FRAME, z)[0].expanded, true, `zoom=${z} 的处理与 zoom=1 不一致`);
   }
 });
 
@@ -230,7 +254,7 @@ test('buildScene：16 个钉子全部收成点（>COLLAPSE_THRESHOLD）', () => 
     photos.push(ph(`far${i}b`, 22 + (i % 4) * 6.0, 80 + i * 3.0, 1700000001000));
     photos.push(ph(`far${i}c`, 22 + (i % 4) * 6.0, 80 + i * 3.0, 1700000002000));
   }
-  const pins = buildScene(photos, W, H, 1);
+  const pins = buildScene(photos, FRAME, 1);
   assert.ok(pins.length > 15, `只得到 ${pins.length} 个钉子，压不住 COLLAPSE_THRESHOLD`);
   for (const p of pins) { assert.equal(p.expanded, false, `${p.name} 在钉子过多的场景下仍然展开了`); }
 });
@@ -243,7 +267,7 @@ test('buildScene：屏幕上挤在一起的相邻地点被并成一个簇，地�
     ph('hk', 22.3193, 114.1694, 1700000000000),
     ph('sz', 22.5431, 114.0579, 1700000001000)
   ];
-  const pins = buildScene(photos, W, H, 1);
+  const pins = buildScene(photos, FRAME, 1);
   assert.equal(pins.length, 1, '两个挤在一起的钉子没有并簇');
   assert.equal(pins[0].photos.length, 2);
   assert.ok(pins[0].name.indexOf('等2地') > 0, `并簇后的名字没体现第二个地名：${pins[0].name}`);
@@ -257,9 +281,9 @@ test('buildScene：并簇后的钉子落在得胜那一组的真实位置上，�
     ph('hk3', 22.3180, 114.1680, 1700000002000),
     ph('sz1', 22.5431, 114.0579, 1700000003000)
   ];
-  const pins = buildScene(photos, W, H, 1);
+  const pins = buildScene(photos, FRAME, 1);
   assert.equal(pins.length, 1);
-  const hk = projectMercator(114.1694, 22.3193, W, H, CHINA_REGION.bounds);
+  const hk = atFrame(114.1694, 22.3193, FRAME);
   assert.ok(Math.abs(pins[0].x - hk.x) < 1, `钉子不在香港：x=${pins[0].x} vs ${hk.x}`);
   assert.ok(Math.abs(pins[0].y - hk.y) < 1, `钉子不在香港：y=${pins[0].y} vs ${hk.y}`);
   assert.equal(pins[0].photos.length, 4);
@@ -272,7 +296,7 @@ test('buildScene：相距很远的钉子不会被并簇（每个省一个钉）'
     ph('urc', 43.8256, 87.6168, 1700000000000),   // 乌鲁木齐
     ph('lsa', 29.6520, 91.1721, 1700000000000)    // 拉萨
   ];
-  const pins = buildScene(photos, W, H, 1);
+  const pins = buildScene(photos, FRAME, 1);
   assert.equal(pins.length, 4);
   assert.ok(MIN_PIN_DIST_PT === 40);
 });
@@ -286,19 +310,19 @@ test('buildScene：输出与输入顺序无关（钉子与照片都有确定的�
     ph('m', 23.1291, 113.2644, 0),
     ph('a2', 31.2304, 121.4737, 1700000001000)
   ];
-  const one = JSON.stringify(buildScene(photos, W, H, 1));
-  const two = JSON.stringify(buildScene([photos[3], photos[1], photos[2], photos[0]], W, H, 1));
+  const one = JSON.stringify(buildScene(photos, FRAME, 1));
+  const two = JSON.stringify(buildScene([photos[3], photos[1], photos[2], photos[0]], FRAME, 1));
   assert.equal(one, two);
 });
 
 test('buildScene：空输入 / 全无坐标 → 空场景（调用方据此显示空态）', () => {
-  assert.deepEqual(buildScene([], W, H, 1), []);
-  assert.deepEqual(buildScene([ph('a', 0, 0, 0)], W, H, 1), []);
+  assert.deepEqual(buildScene([], FRAME, 1), []);
+  assert.deepEqual(buildScene([ph('a', 0, 0, 0)], FRAME, 1), []);
 });
 
 test('buildScene：境外坐标不丢，得到一个坐标标签的钉子（M2 的世界地图才处理它）', () => {
   // 东京 35.6762,139.6503 → nearestCounty 判为境外（>800km）
-  const pins = buildScene([ph('tokyo', 35.6762, 139.6503, 1700000000000)], W, H, 1);
+  const pins = buildScene([ph('tokyo', 35.6762, 139.6503, 1700000000000)], FRAME, 1);
   assert.equal(pins.length, 1);
   assert.ok(pins[0].name.indexOf('°N') > 0, `境外的钉子应带坐标标签：${pins[0].name}`);
 });
@@ -336,7 +360,7 @@ test('parseOutline：坏输入返回 undefined，不抛错', () => {
 test('outlinePath：一条 ring 一条子路径，坐标落在画布内且保留 2 位小数', () => {
   const o = parseOutline(GOOD_OUTLINE);
   assert.ok(o !== undefined);
-  const d = outlinePath(o.rings, W, H, o.bounds);
+  const d = outlinePath(o.rings, FRAME, o.bounds);
   assert.ok(d.startsWith('M'), 'path 未以 M 开头');
   assert.ok(d.endsWith('Z'));
   assert.equal(d.split('M').length - 1, 1, 'ring 数与子路径数不一致');
@@ -351,27 +375,45 @@ test('outlinePath：一条 ring 一条子路径，坐标落在画布内且保留
 
 test('outlinePath：多个 ring → 多个子路径；空输入返回空串', () => {
   const rings = [[73, 54, 74, 54, 74, 53], [80, 40, 81, 40, 81, 39]];
-  const d = outlinePath(rings, W, H, CHINA_REGION.bounds);
+  const d = outlinePath(rings, FRAME, CHINA_REGION.bounds);
   assert.equal(d.split('M').length - 1, 2);
-  assert.equal(outlinePath([], W, H, CHINA_REGION.bounds), '');
+  assert.equal(outlinePath([], FRAME, CHINA_REGION.bounds), '');
 });
 
 test('outlinePath：越界的 bounds 参数退回 CHINA_REGION.bounds（不产出 NaN）', () => {
-  const d = outlinePath([[100, 30, 101, 30, 101, 29]], W, H, [1, 2, 3]);
+  const d = outlinePath([[100, 30, 101, 30, 101, 29]], FRAME, [1, 2, 3]);
   assert.ok(d.length > 0);
   assert.ok(!d.includes('NaN'));
 });
 
 test('outlinePath：整个落在地图块外的环被剔除（视口剔除，不是删数据）', () => {
   // 视口 360×100。第二条环在 4~5°N —— 远在 bounds 的 minLat=18 之南，投影后整条在视口下方。
+  const small: MapFrame = mapFrame(W, 100, CHINA_REGION.bounds);
   const inside = [73, 54, 74, 54, 74, 53];
   const below = [100, 5, 101, 5, 101, 4];
-  const d = outlinePath([inside, below], W, 100, CHINA_REGION.bounds);
+  const d = outlinePath([inside, below], small, CHINA_REGION.bounds);
   assert.equal(d.split('M').length - 1, 1, '视口外的环没有被剔除');
-  assert.equal(outlinePath([below], W, 100, CHINA_REGION.bounds), '', '整屏都在视口外时应当返回空串');
+  assert.equal(outlinePath([below], small, CHINA_REGION.bounds), '', '整屏都在视口外时应当返回空串');
   // 横向出界同理（经度 10°E 远在 bounds 的 minLon=73 之西）
   const left = [10, 40, 11, 40, 11, 39];
-  assert.equal(outlinePath([left], W, 100, CHINA_REGION.bounds), '');
+  assert.equal(outlinePath([left], small, CHINA_REGION.bounds), '');
+});
+
+test('outlinePath：坐标在**块坐标**里 —— 框居中时轮廓跟着偏移 frame.x / frame.y', () => {
+  // 一个刻意做得很高、很窄的块：框按"填满宽度"算，居中在纵向 → frame.y > 0。
+  const tall: MapFrame = mapFrame(200, 900, CHINA_REGION.bounds);
+  assert.ok(tall.y > 0, `这个块应当让框纵向居中：y=${tall.y}`);
+  const ring = [73, 54, 135, 54, 135, 18, 73, 18];
+  const d = outlinePath([ring], tall, CHINA_REGION.bounds);
+  const nums = d.replace(/[MLZ]/g, ' ').trim().split(/\s+/).map((s: string) => Number(s));
+  let minY = Number.POSITIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (let i = 1; i < nums.length; i += 2) {
+    if (nums[i] < minY) { minY = nums[i]; }
+    if (nums[i] > maxY) { maxY = nums[i]; }
+  }
+  assert.ok(Math.abs(minY - tall.y) < 0.05, `轮廓上边缘没有贴在框顶：${minY} vs ${tall.y}`);
+  assert.ok(Math.abs(maxY - (tall.y + tall.h)) < 0.05, `轮廓下边缘没有贴在框底：${maxY} vs ${tall.y + tall.h}`);
 });
 
 // ── 真实轮廓文件（china_outline.json） ──────────────────────────────────────
@@ -392,11 +434,15 @@ test('china_outline.json：真实文件能解析、bounds 与 CHINA_REGION 完�
   assert.equal(od.rings.length, 96, `环数变了：${od.rings.length}`);
 });
 
-test('china_outline.json：投到地图块上的路径非空、无 NaN、且没有一个点落在地图块外', () => {
+test('china_outline.json：投到地图框上的路径非空、无 NaN、且没有一个点落在地图块外', () => {
   const od = parseOutline(fs.readFileSync(OUTLINE_URL, 'utf8'));
   assert.ok(od !== undefined);
+  // 框与块取成一样（块 360×267.72 的比例正好等于墨卡托比例）→ 平移量为 0，
+  // 于是"轮廓是否越出块"这件事可以直接按 [0,W]×[0,mapH] 判。
   const mapH = mapBoxHeight(W, CHINA_REGION.bounds);
-  const d = outlinePath(od.rings, W, mapH, od.bounds);
+  const frame: MapFrame = mapFrame(W, mapH, CHINA_REGION.bounds);
+  assert.ok(Math.abs(frame.x) < 1e-9 && Math.abs(frame.y) < 1e-9, '块的比例正好时平移量应当是 0');
+  const d = outlinePath(od.rings, frame, od.bounds);
   assert.ok(d.length > 0, '轮廓 path 是空的');
   assert.ok(!d.includes('NaN') && !d.includes('Infinity'));
   // 视口剔除之后，子路径的坐标必须全部落在 [0,W]×[0,mapH] 内（实测 0 条跨界环）
@@ -408,6 +454,64 @@ test('china_outline.json：投到地图块上的路径非空、无 NaN、且没�
   }
   // 地图块外的 19 条环（8~11.4°N 的南海诸岛）被剔除 → 子路径数少于环数，但数据里一条不少
   assert.ok(d.split('M').length - 1 < od.rings.length, '视口外的环没被剔除');
+});
+
+// ── 地图框：铺满主体区 + 不变形 + 居中（task-14 的形态改造） ─────────────────
+
+test('mapFrame：块填满可用高度；框取不下于它的最大一块，且**永不变形**', () => {
+  const f = mapFrame(W, H, CHINA_REGION.bounds);
+  // 块 = 整个主体区（这就是"地图占满主体区域"的含义：地图是这整块区域的底色）
+  assert.equal(f.blockW, W);
+  assert.equal(f.blockH, H);
+  // 框的宽高比 == 墨卡托宽高比（不变形，这是硬约束）
+  assert.ok(Math.abs(f.w / f.h - geoAspect(CHINA_REGION.bounds)) < 1e-9, `框变形了：${f.w}/${f.h}`);
+  // 竖屏 360×720：按"填满高度"算出来的宽度 968.18 放不下 → 退成"填满宽度"
+  assert.ok(Math.abs(f.w - W) < 1e-9, `框宽应当是画布宽：${f.w}`);
+  assert.ok(Math.abs(f.h - mapBoxHeight(W, CHINA_REGION.bounds)) < 1e-9);
+  // 框完全落在块里，且**居中**
+  assert.ok(f.x >= -1e-9 && f.y >= -1e-9);
+  assert.ok(f.x + f.w <= f.blockW + 1e-9 && f.y + f.h <= f.blockH + 1e-9);
+  assert.ok(Math.abs(f.x - (f.blockW - f.w) / 2) < 1e-9, '横向没有居中');
+  assert.ok(Math.abs(f.y - (f.blockH - f.h) / 2) < 1e-9, '纵向没有居中');
+  // 关键反证：**没有**把框拉满 720 高（那会把中国拉成竖条）
+  assert.ok(f.h < f.blockH, '框被拉满了整块高度 —— 那是变形的');
+});
+
+test('mapFrame：块足够宽时真的**填满高度**（宽体上第 1 条生效）', () => {
+  // 1000×600 的横屏块：按填满高度算宽 = 600×1.3447 = 806.8 ≤ 1000 → 成立，两侧留白居中
+  const f = mapFrame(1000, 600, CHINA_REGION.bounds);
+  assert.ok(Math.abs(f.h - 600) < 1e-9, `框没有填满高度：h=${f.h}`);
+  assert.ok(Math.abs(f.w / f.h - geoAspect(CHINA_REGION.bounds)) < 1e-9, '框变形了');
+  assert.ok(f.x > 0 && f.y === 0, `应当是"左右居中留白、上下填满"：x=${f.x} y=${f.y}`);
+  assert.ok(Math.abs(f.x - (1000 - f.w) / 2) < 1e-9);
+});
+
+test('mapFrame：比例刚好匹配时框 == 块（留白为 0）', () => {
+  const h = mapBoxHeight(W, CHINA_REGION.bounds);
+  const f = mapFrame(W, h, CHINA_REGION.bounds);
+  assert.ok(Math.abs(f.x) < 1e-9 && Math.abs(f.y) < 1e-9);
+  assert.ok(Math.abs(f.w - W) < 1e-9 && Math.abs(f.h - h) < 1e-9);
+});
+
+test('mapFrame：非法尺寸返回全 0 的框（不产出 NaN 坐标）', () => {
+  for (const bad of [[0, 720], [360, 0], [-1, 720], [360, -1], [Number.NaN, 720], [360, Number.POSITIVE_INFINITY]]) {
+    const f = mapFrame(bad[0] as number, bad[1] as number, CHINA_REGION.bounds);
+    assert.equal(f.w, 0, `块 ${bad[0]}×${bad[1]} 应当给出空框`);
+    assert.equal(f.h, 0);
+    assert.ok(Number.isFinite(f.x) && Number.isFinite(f.y));
+  }
+});
+
+test('hangBottom：画布 = 块时给块底；页脚把它压到框底以下就不再往下让', () => {
+  const f = FRAME;
+  const frameBottom = f.y + f.h;
+  // 不给 env：画布就是块 → 挂载区底 = 块底
+  assert.equal(hangBottom(f), f.blockH);
+  // 给页脚：底 = 块底 − 页脚（但要 ≥ 框底，否则"下方没余量"时反而画不出来）
+  assert.equal(hangBottom(f, { canvasH: f.blockH, footer: 34 }), f.blockH - 34);
+  assert.equal(hangBottom(f, { canvasH: f.blockH, footer: f.blockH - frameBottom + 10 }), frameBottom);
+  // 画布比块还矮 → 按块处理（不能比地图还矮）
+  assert.equal(hangBottom(f, { canvasH: 100 }), f.blockH);
 });
 
 // ── 画布比例（防止地图被拉成竖条） ──────────────────────────────────────────
@@ -466,12 +570,12 @@ function demoPins(): ScenePin[] {
     ph('c', 39.9042, 116.4074, 0),
     ph('d', 23.1291, 113.2644, 1700000200000)
   ];
-  return buildScene(photos, W, H, 1);
+  return buildScene(photos, FRAME, 1);
 }
 
 test('sceneToSvg：产出结构完整的 SVG（含国界 path、钉子组、每个钉子的照片数）', () => {
   const pins = demoPins();
-  const d = outlinePath(parseOutline(GOOD_OUTLINE)!.rings, W, H, CHINA_REGION.bounds);
+  const d = outlinePath(parseOutline(GOOD_OUTLINE)!.rings, FRAME, CHINA_REGION.bounds);
   const svg = sceneToSvg(pins, W, H, d);
   assert.ok(svg.startsWith('<svg '));
   assert.ok(svg.endsWith('</svg>'));
@@ -509,15 +613,17 @@ test('sceneToSvg：scale 只放大 width/height，viewBox 与几何完全不变'
 
 test('sceneToSvg：地名里的 & < > 被转义（否则整份 SVG 会解析失败）', () => {
   const p = ph('x', 31.2304, 121.4737, 1700000000000, 'A&B <大厦> "x"');
-  const svg = sceneToSvg(buildScene([p], W, H, 1), W, H, '');
+  const svg = sceneToSvg(buildScene([p], FRAME, 1), W, H, '');
   assert.ok(svg.includes('A&amp;B &lt;大厦&gt; &quot;x&quot;'));
   assert.ok(!svg.includes('<大厦>'));
 });
 
-test('sceneToSvg：没有国界数据时也能画（chinaPath 传空串）', () => {
+test('sceneToSvg：没有国界数据时也能画（chinaPath 传空串）—— 轨迹层另算', () => {
   const svg = sceneToSvg(demoPins(), W, H, '');
   assert.ok(svg.startsWith('<svg '));
-  assert.ok(!svg.includes('<path d='));
+  // 国界没画（没有 fill="#E8F0E4" 那条 path）。注意**不能**断言"没有 <path" ——
+  // 轨迹折线也是一条 <path>，它由 pins 自己算出来，与 chinaPath 无关。
+  assert.ok(!svg.includes('fill="#E8F0E4"'), '没有国界数据却画了国界');
   assert.ok(svg.includes('<g id="pins">'));
 });
 
@@ -529,13 +635,12 @@ test('sceneToSvg：没有照片（空数组）也要产出合法 SVG —— 空�
 });
 
 test('sceneToSvg：挂出的张数由空间决定（MAX_HANG 只是上限），其余如实画成 +N', () => {
-  // 12 张挂在同一个钉子上。老规则"超过 MAX_HANG 就画 MAX_HANG 张"在这块画布上从来没成立过：
-  // 9 张需要的弦宽是 arcSpreadNeed(9) ≈ 353.7pt > 0.72×360 = 259.2pt —— **放不下**，
-  // 硬画 9 张必然让两侧卡片互相压住（旧实现实测每钉 4 对重叠）。
-  // 现在：挂几张由空间决定，MAX_HANG 只是上限；没挂出来的由「+N」如实报出。
+  // 12 张挂在同一个钉子上。26×34 的卡片下 9 张需要的弦宽是 arcSpreadNeed(9) ≈ 271.6pt，
+  // 而 360 宽的画布能给 0.80×360 = 288pt —— **放得下**，于是 MAX_HANG 这道硬上限真的生效。
+  // （34×44 的时代 9 张要 353.7pt > 259.2pt，"一屏最多 7 张"就是这么来的。）
   const photos: WallPhoto[] = [];
   for (let i = 0; i < 12; i++) { photos.push(ph(`p${i}`, 31.2304, 104.0, 1700000000000 + i)); }
-  const pins = buildScene(photos, W, H, 1);
+  const pins = buildScene(photos, FRAME, 1);
   const shown = pins[0].shown;
   assert.ok(shown > 0 && shown <= MAX_HANG, `挂出 ${shown} 张，超出了 [1, MAX_HANG]`);
   const svg = sceneToSvg(pins, W, H, '');
@@ -544,7 +649,7 @@ test('sceneToSvg：挂出的张数由空间决定（MAX_HANG 只是上限），�
   // 画布给到 720 宽时 9 张放得下 → MAX_HANG 这道上限确实生效
   const wide: WallPhoto[] = [];
   for (let i = 0; i < 12; i++) { wide.push(ph(`p${i}`, 31.2304, 104.0, 1700000000000 + i)); }
-  const widePins = buildScene(wide, 720, 800, 1, { canvasH: 4000 });
+  const widePins = buildScene(wide, FRAME_WIDE, 1, { canvasH: 4000 });
   assert.equal(widePins[0].shown, MAX_HANG, '画布够大时没有挂满 MAX_HANG');
   const wideSvg = sceneToSvg(widePins, 720, 4000, '');
   assert.equal(wideSvg.split('rx="2" fill="#').length - 1, MAX_HANG);
@@ -558,7 +663,7 @@ test('sceneToSvg：收起的钉子不画照片，只画点 + 张数（"钉子多
       photos.push(ph(`f${i}_${k}`, 22 + (i % 4) * 6.0, 80 + i * 3.0, 1700000000000 + k));
     }
   }
-  const pins = buildScene(photos, W, H, 1);
+  const pins = buildScene(photos, FRAME, 1);
   const svg = sceneToSvg(pins, W, H, '');
   assert.equal(svg.split('rx="2" fill="#').length - 1, 0, '收起的钉子仍然画了照片');
   assert.equal(svg.split('<line ').length - 1, 0, '收起的钉子仍然画了线');
@@ -572,11 +677,13 @@ test('sceneToSvg：所有卡片的顶端都在钉子的 HANG_GAP 之下（照片
   const svg = sceneToSvg(pins, W, H, '');
   const pinY = new Map<string, number>();
   for (const p of pins) { pinY.set(p.name, p.y); }
-  const re = /<rect x="[-\d.]+" y="([\d.]+)" width="34" height="44" rx="2"/g;
+  const re = /<rect x="[-\d.]+" y="([\d.]+)" width="(\d+)" height="(\d+)" rx="2"/g;
   let m = re.exec(svg);
   let n = 0;
   while (m !== null) {
     const y = parseFloat(m[1]);
+    assert.equal(Number(m[2]), HANG_PHOTO_W, `卡片宽度不是 ${HANG_PHOTO_W}：${m[2]}`);
+    assert.equal(Number(m[3]), HANG_PHOTO_H, `卡片高度不是 ${HANG_PHOTO_H}：${m[3]}`);
     let minPinY = Number.POSITIVE_INFINITY;
     pinY.forEach((v: number) => { if (v < minPinY) { minPinY = v; } });
     assert.ok(y >= minPinY + HANG_GAP - 0.01, `卡片 y=${y} 挂到了钉子上面（最低的钉子在 ${minPinY}）`);
@@ -605,12 +712,18 @@ test('dateLabel：0 / 负数 / NaN 显示为"未知时间"，正常时间显示 
 // `HANG_OVERLAP_EPS` / 同一个 `hangRects`：布局说"不重叠"，量出来也必须是不重叠。
 // ────────────────────────────────────────────────────────────────────────────
 
-/** 真机尺寸：360×720 的 vp 画布，底部留 34pt 给图例。 */
+/** 真机尺寸：360×720 的 vp 画布（= 地图块），底部留 34pt 给图例。 */
 const CANVAS_H = 720;
 const FOOTER = 34;
-const BOTTOM = CANVAS_H - FOOTER;
-/** 地图块高（不变形的那个值）—— 钉子的投影范围。 */
-const MAP_H = mapBoxHeight(W, CHINA_REGION.bounds);
+/**
+ * 挂载区底。**与 buildScene 内部用的是同一个 `hangBottom`** —— 这个测试文件里
+ * "布局说放得下、量出来也放得下"的全部效力都建立在这一点上：两边各算一遍就会漂移。
+ */
+const BOTTOM = hangBottom(FRAME, { canvasH: CANVAS_H, footer: FOOTER });
+/** 地图框底（= 挂载区顶）。框是居中的，所以它不再是 267.72，而是 226.14 + 267.72 = 493.86。 */
+const FRAME_BOTTOM = FRAME.y + FRAME.h;
+/** 地图框高（不变形的那个值）—— 钉子投影的纵向范围。 */
+const MAP_H = FRAME.h;
 
 /**
  * 一批**真实地点**下的照片（逐个注明来源；坐标与 tools/fixtures/wall-sample.json 同源，
@@ -655,7 +768,7 @@ function countOverlapPairs(rects: CardRect[]): number {
 }
 
 test('布局：密集场景（6 钉 24 张）没有一张照片出画布 —— 修的就是这个缺陷', () => {
-  const pins = buildScene(denseScene(), W, MAP_H, 1, { canvasH: CANVAS_H, footer: FOOTER });
+  const pins = buildScene(denseScene(), FRAME, 1, { canvasH: CANVAS_H, footer: FOOTER });
   const cards = sceneCards(pins, W, BOTTOM);
   assert.ok(cards.length > 0, '一张都没挂出来');
   for (const r of cards) {
@@ -667,14 +780,14 @@ test('布局：密集场景（6 钉 24 张）没有一张照片出画布 —— 
 });
 
 test('布局：密集场景里任意两张照片框都不重叠（判据 = HANG_OVERLAP_EPS）', () => {
-  const pins = buildScene(denseScene(), W, MAP_H, 1, { canvasH: CANVAS_H, footer: FOOTER });
+  const pins = buildScene(denseScene(), FRAME, 1, { canvasH: CANVAS_H, footer: FOOTER });
   const cards = sceneCards(pins, W, BOTTOM);
   assert.equal(countOverlapPairs(cards), 0, `有 ${countOverlapPairs(cards)} 对卡片压在了一起`);
   assert.equal(HANG_OVERLAP_EPS, 1, '重叠判据变了 —— tools/wall-audit.ts 直接 import 它，要一起改');
 });
 
 test('布局：钳制只是兜底 —— 画出来的每张卡片都**没有**被挪动过，且弧的形状仍然成立', () => {
-  const pins = buildScene(denseScene(), W, MAP_H, 1, { canvasH: CANVAS_H, footer: FOOTER });
+  const pins = buildScene(denseScene(), FRAME, 1, { canvasH: CANVAS_H, footer: FOOTER });
   let checked = 0;
   for (const p of pins) {
     if (p.shown <= 0) { continue; }
@@ -704,9 +817,10 @@ test('布局：钳制只是兜底 —— 画出来的每张卡片都**没有**�
 });
 
 test('布局：靠边到放不下一张卡片时收成点（宁可收成点，也不画被钳扁的弧）', () => {
-  // 经度 74.0 → 投影 x≈5.8pt，小于半张卡（17）+ 留白（4）= 21pt。喀什（75.99°E）在真机上正是这一类。
+  // 经度 74.0 → 投影 x≈5.8pt，小于半张卡（26/2 = 13）+ 留白（4）= 17pt。
+  // 喀什（75.99°E）在真机上正是这一类。地图框是居中的，但横向 x 不变（框宽 = 块宽）。
   const photos = [ph('k1', 39.47, 74.0, 1), ph('k2', 39.471, 74.001, 2), ph('k3', 39.469, 73.999, 3)];
-  const pins = buildScene(photos, W, MAP_H, 1, { canvasH: CANVAS_H, footer: FOOTER });
+  const pins = buildScene(photos, FRAME, 1, { canvasH: CANVAS_H, footer: FOOTER });
   assert.equal(pins.length, 1);
   assert.ok(pins[0].x < HANG_PHOTO_W / 2, `钉子没有贴边：x=${pins[0].x}`);
   // 意愿为真（1 个钉子 ≤3 → 全展开），但空间一票否决 → shown=0，画成点 + 张数
@@ -722,7 +836,7 @@ test('布局：靠边到放不下一张卡片时收成点（宁可收成点，�
 test('布局兜底：一个钉子下 20 张 —— 挂得下的挂、其余如实 +N（不缩框、不叠）', () => {
   const photos: WallPhoto[] = [];
   for (let i = 0; i < 20; i++) { photos.push(ph(`q${i}`, 31.2304, 104.0, 1700000000000 + i)); }
-  const pins = buildScene(photos, W, MAP_H, 1, { canvasH: CANVAS_H, footer: FOOTER });
+  const pins = buildScene(photos, FRAME, 1, { canvasH: CANVAS_H, footer: FOOTER });
   assert.equal(pins.length, 1);
   const p = pins[0];
   assert.ok(p.shown >= 1 && p.shown <= MAX_HANG, `挂出 ${p.shown} 张`);
@@ -748,7 +862,7 @@ test('布局：shown 不超上限，且 shown>0 必然蕴含 expanded（空间�
   }
   scenes.push(many);
   for (const photos of scenes) {
-    const pins = buildScene(photos, W, MAP_H, 1, { canvasH: CANVAS_H, footer: FOOTER });
+    const pins = buildScene(photos, FRAME, 1, { canvasH: CANVAS_H, footer: FOOTER });
     for (const p of pins) {
       const cap = p.photos.length < MAX_HANG ? p.photos.length : MAX_HANG;
       assert.ok(p.shown <= cap, `${p.name} 挂了 ${p.shown} 张，上限是 ${cap}`);
@@ -762,32 +876,46 @@ test('布局：shown 不超上限，且 shown>0 必然蕴含 expanded（空间�
 });
 
 test('布局：同一输入两次调用逐字节相同（布局没有隐藏的随机/顺序依赖）', () => {
-  const a = JSON.stringify(buildScene(denseScene(), W, MAP_H, 1, { canvasH: CANVAS_H, footer: FOOTER }));
-  const b = JSON.stringify(buildScene(denseScene(), W, MAP_H, 1, { canvasH: CANVAS_H, footer: FOOTER }));
+  const a = JSON.stringify(buildScene(denseScene(), FRAME, 1, { canvasH: CANVAS_H, footer: FOOTER }));
+  const b = JSON.stringify(buildScene(denseScene(), FRAME, 1, { canvasH: CANVAS_H, footer: FOOTER }));
   assert.equal(a, b);
 });
 
-test('布局：画布不比地图块高时，HangEnvelope 等于没给（退化成"地图下面没有余量"）', () => {
-  const base = buildScene(denseScene(), W, MAP_H, 1);
-  const lower = buildScene(denseScene(), W, MAP_H, 1, { canvasH: 100 });
+test('布局：画布不比地图块高时，HangEnvelope 等于没给（退化成"地图块下面没有余量"）', () => {
+  const base = buildScene(denseScene(), FRAME, 1);
+  // 画布高 = 块高 / 比块还矮 → 都按"画布就是地图块"处理，结果必须逐字节相同
+  const same = buildScene(denseScene(), FRAME, 1, { canvasH: FRAME.blockH });
+  assert.equal(JSON.stringify(base), JSON.stringify(same));
+  const lower = buildScene(denseScene(), FRAME, 1, { canvasH: 100 });
   assert.equal(JSON.stringify(base), JSON.stringify(lower));
-  // 页脚把挂载区吃到与地图块齐平 → 同样退化（不是"没有约束"，是"没有余量"）
-  const noRoom = buildScene(denseScene(), W, MAP_H, 1, { canvasH: CANVAS_H, footer: CANVAS_H - MAP_H });
-  assert.equal(JSON.stringify(base), JSON.stringify(noRoom));
-  // 退化时也**不许**出画布（画布就是地图块）
-  const cards = sceneCards(base, W, MAP_H);
-  for (const r of cards) { assert.ok(r.y + r.h <= MAP_H + 1e-6, `退化时卡片越过了地图块底：${r.y + r.h}`); }
+});
+
+test('布局：页脚把挂载区吃到地图框底 —— 照片只在框内展开，一张都不越线', () => {
+  // "地图下面没有余量"在新几何里是这样表达的：页脚 = 块底 − 框底
+  const env = { canvasH: CANVAS_H, footer: CANVAS_H - FRAME_BOTTOM };
+  assert.equal(hangBottom(FRAME, env), FRAME_BOTTOM, '页脚没有把挂载区底压到框底');
+  const pins = buildScene(denseScene(), FRAME, 1, env);
+  const cards = sceneCards(pins, W, FRAME_BOTTOM);
+  assert.ok(cards.length > 0, '框内一张都挂不出来 —— 这条测试失去判别力');
+  for (const r of cards) {
+    assert.ok(r.y + r.h <= FRAME_BOTTOM + 1e-6, `卡片越过了地图框底：${r.y + r.h} > ${FRAME_BOTTOM}`);
+    assert.ok(r.y >= -1e-6, `卡片跑到画布上面去了：${r.y}`);
+  }
+  // 余量更少时挂出来的张数不可能更多
+  const roomy = sceneCards(buildScene(denseScene(), FRAME, 1), W, BOTTOM);
+  assert.ok(cards.length <= roomy.length, `框内挂了 ${cards.length} 张，比有余量时（${roomy.length}）还多`);
 });
 
 test('布局：画布越矮，挂出来的张数不会变多（挂载区底只会更紧）', () => {
   // 单向性：底边抬高只会让"放得下"更难，不会凭空多出一张。反过来（变大）不保证单调 ——
   // 一个钉子长高之后可能挡住后面的钉子，所以只钉这一侧。
   let prev = Number.POSITIVE_INFINITY;
-  for (const bottom of [MAP_H + 420, MAP_H + 300, MAP_H + 200, MAP_H + 120, MAP_H]) {
-    const pins = buildScene(denseScene(), W, MAP_H, 1, { canvasH: bottom, footer: 0 });
-    const cards = sceneCards(pins, W, BOTTOM);
-    assert.ok(cards.length <= prev, `挂载区底=${bottom} 时挂了 ${cards.length} 张，比更宽松的画布还多`);
-    assert.equal(countOverlapPairs(cards), 0, `挂载区底=${bottom} 时出现重叠`);
+  for (const envH of [FRAME_BOTTOM + 420, FRAME_BOTTOM + 300, FRAME_BOTTOM + 200, FRAME_BOTTOM + 120, FRAME_BOTTOM]) {
+    const env = { canvasH: envH, footer: 0 };
+    const pins = buildScene(denseScene(), FRAME, 1, env);
+    const cards = sceneCards(pins, W, hangBottom(FRAME, env));
+    assert.ok(cards.length <= prev, `挂载区底=${envH} 时挂了 ${cards.length} 张，比更宽松的画布还多`);
+    assert.equal(countOverlapPairs(cards), 0, `挂载区底=${envH} 时出现重叠`);
     prev = cards.length;
   }
 });
@@ -818,7 +946,7 @@ test('arcSpreadNeed：按它给的弦宽排出来的卡片**真的**不重叠（
   }
 });
 
-test('arcSpreadNeed：单调递增；360 宽的画布上 8、9 张放不下（这就是"一屏最多 7 张"的成因）', () => {
+test('arcSpreadNeed：单调递增；360 宽的画布上 9 张放得下、10 张放不下（"一屏最多 9 张"的成因）', () => {
   assert.equal(arcSpreadNeed(0), 0);
   assert.equal(arcSpreadNeed(1), 0);
   let prev = 0;
@@ -827,11 +955,16 @@ test('arcSpreadNeed：单调递增；360 宽的画布上 8、9 张放不下（�
     assert.ok(s > prev, `n=${n} 需要的最小弦宽没有比 n-1 大`);
     prev = s;
   }
-  // 画布能给的最大弦宽是 0.72×360 = 259.2；7 张要 254.6（放得下），8 张要 303.9（放不下）
-  assert.ok(arcSpreadNeed(7) <= arcSpread(7, W));
-  assert.ok(arcSpreadNeed(8) > arcSpread(8, W));
-  assert.ok(arcSpreadNeed(9) > arcSpread(9, W));
-  assert.ok(Math.abs(arcSpread(8, W) - W * 0.72) < 1e-9, 'arcSpread 的上限变了');
+  // 26×34 的卡片：画布能给的最大弦宽是 0.80×360 = 288；
+  // 9 张要 ≈ 269.7（放得下）、10 张要 ≈ 308（放不下）→ 一屏最多 9 张，正好是 MAX_HANG。
+  assert.ok(arcSpreadNeed(9) <= arcSpread(9, W) + 1e-9, '9 张现在放不下了 —— "一屏最多几张"要重新算');
+  assert.ok(arcSpreadNeed(10) > arcSpread(10, W), '10 张竟然放得下 —— 那 MAX_HANG 就不再是紧的');
+  assert.ok(Math.abs(arcSpread(10, W) - W * 0.80) < 1e-9, 'arcSpread 的上限变了');
+  assert.equal(MAX_HANG, 9, 'MAX_HANG 变了 —— 上面的"一屏最多 9 张"要跟着改');
+  // 9 张需要的弦宽（把实测值钉在一个窄区间里：改常数会让它动，动出区间就该重新算"一屏几张"）
+  assert.ok(arcSpreadNeed(9) > 260 && arcSpreadNeed(9) < 288, `arcSpreadNeed(9) 的实测值是 ${arcSpreadNeed(9)}`);
+  // 注：34×44 的旧卡宽下同一个公式给出 353.7pt —— 远超 0.72×360 = 259.2（当时的安全上限），
+  // 所以那时"一屏最多 7 张"。缩到 26×34 才腾出第 8、9 张的位置（数字见 task-14 报告）。
 });
 
 test('clampRect：钳制本身是有效的，并且如实报出"被挪动过"', () => {
@@ -847,16 +980,155 @@ test('clampRect：钳制本身是有效的，并且如实报出"被挪动过"', 
   assert.equal(tiny.moved, true);
 });
 
+// ── 旅行轨迹：把钉子按拍摄时间连成一条折线（task-14 的形态改造） ──────────────
+
+/** 三个不同时间、不同地方的钉子（真实坐标），用来钉住轨迹的顺序与坐标。 */
+function trailScene(): WallPhoto[] {
+  return [
+    ph('bj1', 39.9042, 116.4074, Date.UTC(2024, 4, 1)),      // 北京 2024-05-01（最早）
+    ph('sh1', 31.2304, 121.4737, Date.UTC(2024, 6, 10)),     // 上海 2024-07-10
+    ph('gz1', 23.1066, 113.3245, Date.UTC(2024, 8, 20)),     // 广州 2024-09-20（最晚）
+    ph('ls1', 29.6577, 91.1170, 0)                           // 拉萨：时间未知 → 排最后
+  ];
+}
+
+test('trajectoryOrder：按拍摄时间正序，时间未知的排最后；并列按 pinId（可复现）', () => {
+  const pins = buildScene(trailScene(), FRAME, 1);
+  const order = trajectoryOrder(pins);
+  assert.equal(order.length, pins.length);
+  const names = order.map((p: ScenePin) => p.name);
+  // 北京(05-01) → 上海(07-10) → 广州(09-20) → 拉萨(未知)
+  assert.ok(names[0].indexOf('北京') === 0, `第 1 个不是北京：${names[0]}`);
+  assert.ok(names[1].indexOf('上海') === 0, `第 2 个不是上海：${names[1]}`);
+  assert.ok(names[2].indexOf('广东') === 0 || names[2].indexOf('广州') === 0, `第 3 个不是广州：${names[2]}`);
+  assert.ok(names[3].indexOf('拉萨') >= 0 || names[3].indexOf('西藏') === 0, `时间未知的没有排在最后：${names[3]}`);
+  // 每个钉子自己的时间：取组内**最早**那张
+  for (const p of order) {
+    const t = pinTime(p);
+    if (p === order[3]) { assert.equal(t, 0, '拉萨应当没有已知时间'); }
+    else { assert.ok(t > 0, `${p.name} 应当有已知时间`); }
+  }
+  // 时间正序（未知的排在最后，不参与比较）
+  for (let i = 1; i < 3; i++) {
+    assert.ok(pinTime(order[i - 1]) < pinTime(order[i]), `第 ${i} 个的时间没有比前一个大`);
+  }
+  // **不动入参**：pins 自己的顺序仍然按 pinId（可复现），轨迹返回的是新数组
+  assert.notEqual(order, pins);
+  const byId = pins.map((p: ScenePin) => p.pinId);
+  const sorted = byId.slice(0, byId.length).sort();
+  assert.deepEqual(byId, sorted, 'buildScene 的钉子顺序应当仍是 pinId 字典序');
+});
+
+test('trajectoryOrder：组内取**最早**的时间，且未知时间的钉子之间按 pinId 排', () => {
+  const photos = [
+    ph('s_old', 31.2304, 121.4737, Date.UTC(2020, 0, 1)),
+    ph('s_new', 31.2304, 121.4737, Date.UTC(2025, 0, 1)),
+    ph('b_none1', 39.9042, 116.4074, 0),
+    ph('b_none2', 39.9042, 116.4074, 0)
+  ];
+  const pins = buildScene(photos, FRAME, 1);
+  const order = trajectoryOrder(pins);
+  // 上海有 2020 那张 → 不管同组里还有 2025 的，它的时间就是 2020（首次到达）
+  assert.equal(pinTime(order[0]), Date.UTC(2020, 0, 1), '组内没有取最早的时间');
+  assert.equal(order.length, pins.length);
+  for (let i = 1; i < order.length; i++) {
+    assert.equal(pinTime(order[i]), 0);
+    assert.ok(order[i - 1].pinId <= order[i].pinId, '时间未知的钉子之间没有按 pinId 排');
+  }
+});
+
+test('trajectoryPath：按轨迹序连成 M…L…L…，坐标与钉子的实际坐标逐点相同', () => {
+  const pins = buildScene(trailScene(), FRAME, 1);
+  const d = trajectoryPath(pins);
+  const order = trajectoryOrder(pins);
+  assert.ok(d.startsWith('M'), 'path 未以 M 开头');
+  assert.equal((d.match(/[ML]/g) || []).length, order.length, '顶点数与轨迹序的钉子数不一致');
+  assert.equal(d.split('M').length - 1, 1, '折线只应有一条子路径');
+  assert.equal(d.split('L').length - 1, order.length - 1, 'L 的段数不对');
+  // 逐点核对：第 i 个顶点必须是轨迹序里第 i 个钉子的坐标（2 位小数）
+  const pts = d.replace(/[ML]/g, ' ').trim().split(/\s+/).map((s: string) => Number(s));
+  for (let i = 0; i < order.length; i++) {
+    assert.ok(Math.abs(pts[i * 2] - order[i].x) < 0.005, `第 ${i} 个顶点的 x 不对：${pts[i * 2]} vs ${order[i].x}`);
+    assert.ok(Math.abs(pts[i * 2 + 1] - order[i].y) < 0.005, `第 ${i} 个顶点的 y 不对：${pts[i * 2 + 1]} vs ${order[i].y}`);
+  }
+  // 相邻顶点不重合（重合说明有两个钉子叠在一起，那这条线就断了）
+  for (let i = 1; i < order.length; i++) {
+    const dx = order[i].x - order[i - 1].x;
+    const dy = order[i].y - order[i - 1].y;
+    assert.ok(Math.sqrt(dx * dx + dy * dy) > 1, `第 ${i} 段长度为 0`);
+  }
+});
+
+test('trajectoryPath：少于 2 个钉子返回空串（一个点不成线），且不抛错', () => {
+  assert.equal(trajectoryPath([]), '');
+  const one = buildScene([ph('a', 31.2304, 121.4737, 1)], FRAME, 1);
+  assert.equal(one.length, 1);
+  assert.equal(trajectoryPath(one), '');
+});
+
+test('trajectoryPath：不产出 NaN（未知时间 / 空照片列表都不会把线弄断）', () => {
+  const pins = buildScene(trailScene(), FRAME, 1);
+  const d = trajectoryPath(pins);
+  assert.ok(!d.includes('NaN') && !d.includes('Infinity'), `轨迹里有 NaN/Infinity：${d}`);
+});
+
+test('sceneToSvg：轨迹画在图层的正确位置上（国界之上、照片之下）', () => {
+  const pins = buildScene(trailScene(), FRAME, 1);
+  const od = parseOutline(GOOD_OUTLINE);
+  assert.ok(od !== undefined);
+  const svg = sceneToSvg(pins, W, H, outlinePath(od.rings, FRAME, od.bounds));
+  assert.ok(svg.includes('<g id="trajectory">'), '缺少轨迹层');
+  const mapAt = svg.indexOf('fill="#E8F0E4"');
+  const trackAt = svg.indexOf('<g id="trajectory">');
+  const cardsAt = svg.indexOf('<g id="pins">');
+  const anchorsAt = svg.indexOf('<g id="anchors">');
+  assert.ok(mapAt >= 0 && trackAt > mapAt, '轨迹必须在国界之上');
+  assert.ok(cardsAt > trackAt, '轨迹必须在照片之下（否则压住照片）');
+  assert.ok(anchorsAt > cardsAt, '钉点层必须在最后（否则邻钉卡片会盖住地名）');
+  // 线的颜色/粗细与设计一致
+  assert.ok(svg.includes('stroke="#D08A46"'), '轨迹颜色变了');
+  assert.ok(svg.includes(`stroke-width="${TRACK_WIDTH}"`), '轨迹粗细变了');
+});
+
+test('sceneToSvg：轨迹的路径与 trajectoryPath 逐字节相同（预览与设备不会各画一条）', () => {
+  const pins = buildScene(trailScene(), FRAME, 1);
+  const svg = sceneToSvg(pins, W, H, '');
+  const d = trajectoryPath(pins);
+  assert.ok(svg.includes(`<path d="${d}"`), 'sceneToSvg 画的轨迹与 trajectoryPath 不一致');
+});
+
+
 test('布局：为了躲开邻居而收窄的弧仍然是弧（不是被压平的竖线或横线）', () => {
-  const pins = buildScene(denseScene(), W, MAP_H, 1, { canvasH: CANVAS_H, footer: FOOTER });
+  // 为什么要**收紧**画布才测这条：26 宽之后卡片小了一圈，360×720 的宽松画布上
+  // 密集场景里没有一个钉子的弧需要收窄（实测 narrowed=0）—— 那样这条测试就没有判别力了。
+  // footer=160 → 挂载区底 560：紧到必须"用形状换位置"，但还没紧到全部收成点。
+  const env = { canvasH: CANVAS_H, footer: 160 };
+  const bottom = hangBottom(FRAME, env);
+  assert.equal(bottom, 560, `挂载区底不是预期的 560：${bottom}`);
+  const pins = buildScene(denseScene(), FRAME, 1, env);
+  const cards = sceneCards(pins, W, bottom);
+  assert.equal(countOverlapPairs(cards), 0, '收窄之后反而重叠了');
+  for (const r of cards) {
+    assert.ok(r.x >= -1e-6 && r.x + r.w <= W + 1e-6, `卡片横向越界：${r.x}..${r.x + r.w}`);
+    assert.ok(r.y + r.h <= bottom + 1e-6, `卡片越过挂载区底：${r.y + r.h}`);
+  }
   let narrowed = 0;
+  let checked = 0;
   for (const p of pins) {
     if (p.shown <= 1) { continue; }
     if (p.spread < arcSpread(p.shown, W) - 1e-9) { narrowed++; }
     const offs = hangOffsets(p.shown, p.spread);
+    // 收窄之后依然必须是**弧**：dx 不是常数（不是竖线）、dy 中间最大（不是横线）、等半径
     assert.ok(Math.abs(offs[0].dx - offs[p.shown - 1].dx) > 1, `${p.name} 的弧被压成了竖线`);
-    assert.ok(offs[0].dy > 0 && offs[0].dy < offs[(p.shown - 1) / 2 | 0].dy + 1e-9, `${p.name} 的弧被压平了`);
+    assert.ok(offs[0].dy > 0, `${p.name} 有卡片跑到钉子上面`);
+    assert.ok(offs[0].dy < offs[(p.shown - 1) / 2 | 0].dy + 1e-9, `${p.name} 的弧被压平了`);
+    const r0 = Math.sqrt(offs[0].dx * offs[0].dx + offs[0].dy * offs[0].dy);
+    for (const o of offs) {
+      assert.ok(Math.abs(Math.sqrt(o.dx * o.dx + o.dy * o.dy) - r0) < 1e-9, `${p.name} 的卡片不在同一个圆上`);
+    }
+    checked++;
   }
+  assert.ok(checked >= 3, `只核对到 ${checked} 个展开的钉子`);
   assert.ok(narrowed > 0, '这个场景里居然没有一个钉子需要收窄 —— 那这条测试就没有判别力了');
 });
 

@@ -9,13 +9,13 @@
  *   几何全部来自 `core/render.ts` —— 与 `tools/render-preview.ts` 产出的 SVG **逐点相同**，
  *   所以"在电脑上先看见"这件事是真的，不是近似。
  *
- * ── 渲染方式：国界用 Path/Shape，照片用 Image 组件（不是 Canvas）─────────────
+ * ── 渲染方式：国界/轨迹用 Path/Shape，照片用 Image 组件（不是 Canvas）────────
  *   选它的理由（性能判断写在下面）：
  *   · **照片必须是真的照片**。`Image(uri)` 由 ArkUI 负责异步解码、按显示尺寸下采样、
  *     内存紧张时自动回收缓存 —— 这些正是最容易被自己写坏的部分。改成 `Canvas.drawImage`
- *     就得自己持有每张的 `PixelMap` 并管理生命周期（20 张 34×44vp 的卡片按 3 倍屏解码
- *     约 20×54KB ≈ 1MB，看起来不多，但一旦用户在详情里看大图就会翻几倍，而释放时机
- *     得自己判）。**这份复杂度换不来任何东西**。
+ *     就得自己持有每张的 `PixelMap` 并管理生命周期（最坏 15 钉 × 9 张 = 135 张 26×34vp
+ *     的卡片按 3 倍屏解码约 135×32KB ≈ 4MB，看起来不多，但一旦用户在详情里看大图就会
+ *     翻几倍，而释放时机得自己判）。**这份复杂度换不来任何东西**。
  *   · **几何已经是数字了**。`hangRects()` 给的就是画布坐标，`.position({x,y})` 一对一；
  *     预览与设备共用同一个函数，不存在"两边各画一遍"的漂移。
  *   · **场景是算一次的**，不是每帧算。`buildScene` 只在「数据变了」或「画布尺寸变了」时跑；
@@ -25,6 +25,13 @@
  *   · **交互天然可用**：钉点/角标/卡片各自是一个组件，`.onClick` 直接绑；用 Canvas 就得
  *     自己写命中检测。
  *
+ * ── 三个 `Shape`（国界 / 轨迹 / 挂线）都显式给 viewPort，且等于自身尺寸 ────────
+ *   ArkUI 的 `Shape` 用 `viewPort` 把"用户坐标"映射到组件自身尺寸（官方文档的每个例子
+ *   都显式给了 viewPort 与 `Path().width()/height()`）。不给就等于把缩放语义交给默认值 ——
+ *   真机上反馈"地图只占屏幕左上角一小块"就有这一层嫌疑。这里把 viewPort 写成
+ *   `{x:0, y:0, width: boxW, height: boxH}`：**恒等映射**，画什么坐标就是什么位置，
+ *   三个图层与 `.position()` 摆放的卡片共用同一个坐标系，怎么都不会漂。
+ *  *
  * ── 索引必须先 buildFrom **再** awaitIdle（两行都要）─────────────────────────
  *   见 `data/locationIndex.ets` 的契约：
  *   · 只 `buildFrom`：并发时它**返回快照**，可能少照片（"这张的 EXIF 还没读到"被误当成没地点）；
@@ -32,8 +39,8 @@
  *   两行合起来才是"触发补读 + 等它稳定"。这里与 `PlaceStore.entryAfterIdle` 是同一个道理。
  *
  * ── 与预览刻意不同的两处（都是"设备上才成立"的理由）─────────────────────────
- *   1. **卡片上不叠日期文字**。`HANG_PHOTO_W×H = 34×44` 是预览与设备共用的几何，而预览里
- *      那个 `font-size 4.6`（SVG 用户单位）在真机上约等于 2pt 印字，糊成一团。设备侧卡片
+ *   1. **卡片上不叠日期文字**。`HANG_PHOTO_W×H = 26×34` 是预览与设备共用的几何，而预览里
+ *      那个 `font-size 4.2`（SVG 用户单位）在真机上约等于 2pt 印字，糊成一团。设备侧卡片
  *      直接就是照片本身；**日期改在「点开钉子」的详情里显示**（那里字号正常、还能看大图）。
  *   2. **地名标签用 8fp**（预览里是 6.5 用户单位）。预览是 2 倍图，8fp 与它的视觉大小同量级，
  *      但在真屏上是从"一道糊影"变成"能认出字"的那一档。宽度按字数估算，居中于钉子。
@@ -50,10 +57,11 @@ import { router } from '@kit.ArkUI';
 import { CHINA_REGION } from '../core/projection';
 import { parseAreaData } from '../core/areaData';
 import {
-  HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W,
-  buildScene, dateLabel, hangOffsets, hangRects, mapBoxHeight, outlinePath, parseOutline
+  HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, TRACK_COLOR, TRACK_WIDTH,
+  badgeRect, buildScene, dateLabel, hangBottom, hangOffsets, hangRects, mapFrame, outlinePath,
+  parseOutline, trajectoryPath
 } from '../core/render';
-import type { CardRect, HangOffset, OutlineData, ScenePin, WallPhoto } from '../core/render';
+import type { CardRect, HangOffset, MapFrame, OutlineData, ScenePin, WallPhoto } from '../core/render';
 // MAX_HANG 只在 core/placement.ts 里定义（设计 §6.2 的阈值那儿一份），render.ts 不转手导出。
 import { MAX_HANG } from '../core/placement';
 import { DecisionStore } from '../data/decisionStore';
@@ -73,7 +81,7 @@ const DIAG: string = 'WALLDIAG';
 const AREA_RAW_NAME: string = 'china_areas.json';
 const OUTLINE_RAW_NAME: string = 'china_outline.json';
 
-/** 地图块/挂载区底部的留白（pt）：给"点开钉子"的提示条留位置。 */
+/** 挂载区底部的留白（pt）：给"点开钉子"的提示条留位置。 */
 const BOTTOM_RESERVE = 26;
 /** 钉点标签的字号（fp）。见文件头"与预览刻意不同"的第 2 条。 */
 const LABEL_FP = 8;
@@ -96,10 +104,18 @@ struct WallPage {
   @State badges: WallBadge[] = [];
   @State chinaPath: string = '';
   @State linkPath: string = '';
+  /** 旅行轨迹折线（按拍摄时间把钉子连起来）。见 core/render.trajectoryPath。 */
+  @State trackPath: string = '';
   // 尺寸
+  // `boxW×boxH` = **地图块** = 整个主体区。地图是这整块区域的底色，照片浮在它上面。
   @State boxW: number = 0;
   @State boxH: number = 0;
+  // `mapW/mapH/mapX/mapY` = 块里那个**不变形**的中国绘制框（居中）。见 core/render.MapFrame。
+  // 为什么不叫"地图块高"：块高就是 `boxH`；`mapH` 是"能画出的最大的、不变形的中国"有多高。
+  @State mapW: number = 0;
   @State mapH: number = 0;
+  @State mapX: number = 0;
+  @State mapY: number = 0;
   // 状态
   @State phase: number = 0;          // 0 读取中 / 1 完成 / 2 出错
   @State walledTotal: number = 0;    // 已上墙张数（decisionStore 说的）
@@ -209,19 +225,27 @@ struct WallPage {
         `${DIAG} rebuild 跳过：画布还没量到（boxW=${this.boxW} boxH=${this.boxH}）`);
       return;
     }
-    const mapH: number = mapBoxHeight(this.boxW, CHINA_REGION.bounds);
-    this.mapH = mapH;
-    const bottom: number = this.boxH - BOTTOM_RESERVE > mapH ? this.boxH - BOTTOM_RESERVE : mapH;
+    // 地图块 = 整个主体区（地图是这整块区域的底色）；框 = 块里那个不变形的中国（居中）。
+    // 这一步替代了旧的 `mapH = mapBoxHeight(boxW)` —— 那时地图只占上方 37% 的一条。
+    const frame: MapFrame = mapFrame(this.boxW, this.boxH, CHINA_REGION.bounds);
+    this.mapX = r2(frame.x);
+    this.mapY = r2(frame.y);
+    this.mapW = r2(frame.w);
+    this.mapH = r2(frame.h);
+    // 挂载区底：与 buildScene 内部**同一个** hangBottom（两边各算一遍就会漂移）
+    const bottom: number = hangBottom(frame, { canvasH: this.boxH, footer: BOTTOM_RESERVE });
 
-    // 国界：视口剔除在 outlinePath 里（地图块外的小岛不产出子路径）
+    // 国界：坐标已按 frame 平移过（与钉子同一个坐标系）；视口剔除也在 outlinePath 里
     let chinaPath: string = '';
     if (this.outlineData !== undefined) {
-      chinaPath = outlinePath(this.outlineData.rings, this.boxW, mapH, this.outlineData.bounds);
+      chinaPath = outlinePath(this.outlineData.rings, frame, this.outlineData.bounds);
     }
     this.chinaPath = chinaPath;
 
-    const pins: ScenePin[] = buildScene(this.photos, this.boxW, mapH, 1, { canvasH: this.boxH, footer: BOTTOM_RESERVE });
+    const pins: ScenePin[] = buildScene(this.photos, frame, 1, { canvasH: this.boxH, footer: BOTTOM_RESERVE });
     this.pins = pins;
+    // 轨迹：按拍摄时间把钉子连成一条折线（时间未知的排最后）。少于 2 个钉子时是空串。
+    this.trackPath = trajectoryPath(pins);
 
     // 把场景摊成三个扁平数组：ForEach 只能遍历数组，而 Stack 里每一项是一个组件。
     const cards: WallCard[] = [];
@@ -244,12 +268,11 @@ struct WallPage {
         }
         shownTotal += shown;
         if (n > shown) {
-          // 「+N」的位置与判据用的 badgeRect 同一处几何：弧线最低那张卡片的下方
-          let low: number = 0;
-          for (let k = 0; k < offs.length; k++) { if (offs[k].dy > low) { low = offs[k].dy; } }
+          // 「+N」的位置**必须**用 core/render 的 badgeRect：那个矩形参与了 planPin 的避让，
+          // 位置自己再算一遍就会与"判据以为它在哪儿"漂移（旧代码写死 x-8/w16，与 BADGE_W=10 不符）。
+          const b: CardRect = badgeRect(p.x, p.y, shown, p.spread);
           badges.push({
-            idx: i, x: r2(p.x - 8), y: r2(p.y + HANG_GAP + low + HANG_PHOTO_H + 1),
-            w: 16, text: `+${n - shown}`
+            idx: i, x: r2(b.x), y: r2(b.y), w: r2(b.w), text: `+${n - shown}`
           });
         }
       }
@@ -271,14 +294,17 @@ struct WallPage {
     this.locatedTotal = located;
     this.shownTotal = shownTotal;
     // ── 诊断（临时）：真机上抓不到 hilog，所以把同样的数字也画在屏幕上 ──────────
-    // 要的就是这一行的真值：`boxW / boxH` 是 onAreaChange 给的画布，`mapH` 是地图块高，
-    // `pathLen` 是国界 path 的字符数（=0 就说明国界根本没画出来，那是另一类缺陷）。
-    this.diag = `box ${r2(this.boxW)}×${r2(this.boxH)} ｜ mapH ${r2(mapH)}`
-      + ` ｜ pins ${pins.length} ｜ cards ${cards.length} ｜ pathLen ${chinaPath.length}`
+    // 要的就是这一行的真值：`boxW / boxH` 是 onAreaChange 给的**地图块**（整个主体区），
+    // `map W×H@(x,y)` 是块里那个不变形的绘制框，`pathLen` 是国界 path 的字符数
+    //（=0 就说明国界根本没画出来，那是另一类缺陷），`track` 是轨迹折线的字符数。
+    this.diag = `box ${r2(this.boxW)}×${r2(this.boxH)} ｜ 图框 ${this.mapW}×${this.mapH}@(${this.mapX},${this.mapY})`
+      + ` ｜ pins ${pins.length} ｜ cards ${cards.length} ｜ pathLen ${chinaPath.length} ｜ track ${this.trackPath.length}`
       + ` ｜ 上墙 ${this.walledTotal} 命中 ${located} 实挂 ${shownTotal}`;
     hilog.info(DOMAIN, TAG, '%{public}s',
-      `${DIAG} rebuild：boxW=${this.boxW} boxH=${this.boxH} mapH=${mapH} bottom=${bottom}`
-      + ` pins=${pins.length} cards=${cards.length} chinaPath.length=${chinaPath.length}`
+      `${DIAG} rebuild：boxW=${this.boxW} boxH=${this.boxH}`
+      + ` blockH=${frame.blockH} mapW=${frame.w} mapH=${frame.h} mapX=${frame.x} mapY=${frame.y}`
+      + ` bottom=${bottom} pins=${pins.length} cards=${cards.length}`
+      + ` chinaPath.length=${chinaPath.length} trackPath.length=${this.trackPath.length}`
       + ` linkPath.length=${this.linkPath.length} walled=${this.walledTotal} located=${located} shown=${shownTotal}`);
     // ── 这里**不许**再写 `this.selIndex = -1` ────────────────────────────────
     // 这行曾经在：`rebuild()` 只在"数据到了"或"画布尺寸变了"时跑，而 `onAreaChange` 每次
@@ -323,26 +349,43 @@ struct WallPage {
       }
       .width('100%').padding({ left: 12, right: 12, top: 10, bottom: 8 })
 
-      // ── 主体 ────────────────────────────────────────────────────────────
+      // ── 主体：整块都是地图（地图块 = 这个 Stack 的全部）─────────────────
       Stack({ alignContent: Alignment.TopStart }) {
-        // 地图块的底色（与预览同一块分区：0 → mapH）
-        Column().width('100%').height(this.mapH > 0 ? this.mapH : 1).backgroundColor('#F2F7EF')
+        // 地图块的底色 = 整个主体区。这一层就是"地图铺满主体区"最直接的体现：
+        // 它替代了旧版那条只占上方 37% 的 `height(this.mapH)` 色带。
+        Column().width('100%').height('100%').backgroundColor('#F2F7EF')
 
-        // 国界：一条 path 装下 96 个环（不放 96 个组件）
+        // 国界：一条 path 装下 96 个环（不放 96 个组件）。
+        // 坐标已经在 core/render.outlinePath 里按地图框平移过 —— 与钉子、卡片同一个坐标系。
         if (this.chinaPath.length > 0) {
           Shape() {
-            Path().commands(this.chinaPath)
+            Path().width(this.boxW).height(this.boxH).commands(this.chinaPath)
           }
-          .width(this.boxW).height(this.mapH)
+          .width(this.boxW).height(this.boxH)
+          .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
           .fill('#E8F0E4').stroke('#BFD3B8').strokeWidth(0.8)
+        }
+
+        // 旅行轨迹：按拍摄时间把钉子连成一条折线。画在国界**之上**、照片**之下** ——
+        // 它是"我走过哪里"的背景叙事，压住照片就成了噪声。
+        if (this.trackPath.length > 0) {
+          Shape() {
+            Path().width(this.boxW).height(this.boxH).commands(this.trackPath)
+          }
+          .width(this.boxW).height(this.boxH)
+          .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
+          .fill(Color.Transparent).stroke(TRACK_COLOR).strokeWidth(TRACK_WIDTH)
+          .strokeOpacity(0.85)
+          .strokeLineCap(LineCapStyle.Round).strokeLineJoin(LineJoinStyle.Round)
         }
 
         // 钉子的线：同样一条 path 装下全部（M…L…M…L…）
         if (this.linkPath.length > 0) {
           Shape() {
-            Path().commands(this.linkPath)
+            Path().width(this.boxW).height(this.boxH).commands(this.linkPath)
           }
           .width(this.boxW).height(this.boxH)
+          .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
           .fill(Color.Transparent).stroke('#C3B49B').strokeWidth(0.6)
         }
 
@@ -372,19 +415,20 @@ struct WallPage {
             .position({ x: a.cx - a.labelW / 2, y: a.labelY })
         }, (a: WallAnchor) => `${a.idx}@${a.cx},${a.cy}`)
 
-        // 「+N」：挂不全时出现，点它等于点钉子
+        // 「+N」：挂不全时出现，点它等于点钉子。
+        // 位置来自 core/render.badgeRect（它参与 planPin 的避让，不能自己再算一遍）。
         ForEach(this.badges, (b: WallBadge) => {
           Text(b.text)
-            .fontSize(9).fontColor('#8A8A8A')
-            .width(b.w).textAlign(TextAlign.Center)
-            .position({ x: b.x, y: b.y })
+            .fontSize(8).fontColor('#8A8A8A')
+            .width(b.w + 8).textAlign(TextAlign.Center)
+            .position({ x: b.x - 4, y: b.y })
             .onClick(() => { this.open(b.idx); })
         }, (b: WallBadge) => `${b.idx}@${b.x},${b.y}`)
 
         // ── 空态 / 读取中 / 退化说明 ──────────────────────────────────────
         if (this.phase === 0) {
           Text('正在读取地点…').fontSize(13).fontColor('#999')
-            .width('100%').textAlign(TextAlign.Center).position({ x: 0, y: 60 })
+            .width('100%').textAlign(TextAlign.Center).position({ x: 0, y: this.mapY + 60 })
         } else if (this.phase === 1 && this.cards.length === 0) {
           Column() {
             Text(this.walledTotal === 0
@@ -392,7 +436,7 @@ struct WallPage {
               : `上墙的 ${this.walledTotal} 张都没有地点，墙上没有可挂的钉子。\n上墙时如果照片没有 GPS，可以手选省 / 市 / 县，那个地点就会成为墙上的一个钉子。`)
               .fontSize(13).fontColor('#999').textAlign(TextAlign.Center)
           }
-          .width('100%').padding({ left: 28, right: 28 }).position({ x: 0, y: 48 })
+          .width('100%').padding({ left: 28, right: 28 }).position({ x: 0, y: this.mapY + 48 })
         }
       }
       .width('100%').layoutWeight(1).clip(true)
