@@ -2,6 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { router } from '@kit.ArkUI';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { ClaimStore, pickPhotos } from '../data/claimStore';
+import { DecisionStore } from '../data/decisionStore';
 // 以下 import 是为了把 core 层留在 ArkTS 编译图内（Ruling 17）。
 // 重要：必须出现在「值位置」——只当类型用会被 ArkTS 擦成 type-only import，
 // 那些模块就不会被编译，而构建照样 BUILD SUCCESSFUL（假绿）。
@@ -69,7 +70,23 @@ struct ClaimPage {
 
   private async doPick(): Promise<void> {
     try {
-      const uris: string[] = await pickPhotos();
+      // 把「已认领但还没刷过」的照片作为**预选项**传给选图器：它们会以选中状态呈现，
+      // 用户点系统「完成」即可一键把这批全部认领，不必再逐张重新点选。
+      // 想加新的就在同一个网格里顺便多选几张 —— 新照片会被 addBatch/mergeBatch 追加为新批次。
+      //
+      // 判据必须与 SwipePage.aboutToAppear 的入队过滤**逐字一致**
+      //（pages/SwipePage.ets 的 `d === undefined || d.state === 'unseen'`）：
+      // 只有「没有决策记录」或「决策仍是 unseen」才算还没刷过。
+      // 若两处判据漂移，会出现「选图器里没有它、队列里却有它」这类自相矛盾的状态。
+      const claimed = this.store.load();
+      const decisions = new DecisionStore(this.ctx).loadAll();
+      const undecided: string[] = [];
+      for (let i = 0; i < claimed.photos.length; i++) {
+        const id = claimed.photos[i].photoId;
+        const d = decisions.get(id);
+        if (d === undefined || d.state === 'unseen') { undecided.push(id); }
+      }
+      const uris: string[] = await pickPhotos(undecided);
       if (uris.length === 0) { this.msg = '没有选中照片'; return; }
       const next = this.store.addBatch(uris, Date.now());
       this.claimed = next.photos.length;

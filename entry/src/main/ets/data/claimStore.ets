@@ -4,11 +4,28 @@ import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { ClaimState, ClaimedPhoto, emptyClaimState, mergeBatch, claimStorePath } from '../core/claim';
 import { fileIo } from '@kit.CoreFileKit';
 
-export async function pickPhotos(): Promise<string[]> {
+/**
+ * 打开系统选图器。
+ * @param preselectedUris 预选中的照片（通常是「已认领但尚未刷过」的那批）：
+ *        传进去后它们会以**选中状态**呈现，用户点「完成」即可一键全部认领，
+ *        不必逐张重新点选 —— 这是第三方应用能拿到的最接近「一键多选」的能力
+ *        （「全选 / 推荐照片」属系统图库 UI 特权，SDK 未对第三方开放）。
+ *        已刷过的照片**不要**放进来：它们不再是队列的一部分，出现只会干扰。
+ * @returns 用户最终确认选中的照片 URI。用户取消选图器时的行为（resolve 空数组 vs reject）
+ *        本项目仍在真机验收清单里待验，本函数**不**对其做任何假设或兜底。
+ */
+export async function pickPhotos(preselectedUris: string[]): Promise<string[]> {
   const picker = new photoAccessHelper.PhotoViewPicker();
   const opt: photoAccessHelper.PhotoSelectOptions = new photoAccessHelper.PhotoSelectOptions();
   opt.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE;
   opt.maxSelectNumber = 500;
+  opt.isSearchSupported = true;   // 打开选图器内搜索，便于按内容/时间找照片
+  // 只在非空时设置：undefined 与空数组语义不同，后者可能被当成「预选了 0 张」。
+  if (preselectedUris.length > 0) {
+    // 预选数不能超过上限，否则可能整批被拒
+    opt.preselectedUris = preselectedUris.length > 500
+      ? preselectedUris.slice(0, 500) : preselectedUris;
+  }
   const result: photoAccessHelper.PhotoSelectResult = await picker.select(opt);
   return result.photoUris;
 }
