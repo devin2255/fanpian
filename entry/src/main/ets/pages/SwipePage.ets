@@ -140,22 +140,25 @@ struct SwipePage {
     // 判别联合已保证不存在「回弹却带真实决策动作」这种组合（那会让卡片飞走、决策静默丢失）。
     const rolledBack: boolean = outcome.kind === 'rollback';
     const action: string = rolledBack ? 'none'
-      : (outcome.kind === 'decision' ? outcome.action : '');
+      : (outcome.kind === 'decision' ? outcome.action
+        : (outcome.kind === 'wall' ? 'wall' : ''));
 
     // 先挡住非法 action：它既不该被当成归档写盘，也不该进入验收指标
     //（进入 metrics 会污染 medianDecisionMs 的样本与 rollbackRate 的分母）。
     // 守卫必须在 recordSwipe 之前（放到之后会让未知动作污染指标），
     // 并用 rolledBack 放行回弹路径——回弹事件是「回弹率」的唯一数据源，
     // 若把它一并拦掉，回弹率的分子会结构性恒为 0、指标恒显示"达标"。
+    // 'wall' 必须一并放行：它是「卡片上直接上墙」这条合法路径（kind: 'wall'，
+    // 见 ui/CardStack.ets 的 SwipeOutcome），不是未知动作——漏放行会让按钮点了没反应。
     // 类型层面已由 SwipeOutcome 判别联合保证（'rollback' 不携带 action、'decision'
-    // 只携带 'fav' / 'archive'），此处保留仅为运行期防御：将来若有人用 `as` 断言
-    // 绕过类型检查（或退回旧的 onDecide(id, 'none') 形态），这道守卫仍能拦住未知动作，
-    // 不让它静默归档或污染指标。
+    // 只携带 'fav' / 'archive'、'wall' 单独一支），此处保留仅为运行期防御：将来若有人
+    // 用 `as` 断言绕过类型检查（或退回旧的 onDecide(id, 'none') 形态），这道守卫仍能拦住
+    // 未知动作，不让它静默归档或污染指标。
     // 它的地位：对任何合法的 SwipeOutcome 取值，这个分支不可达（挡的不是正常路径），
     // 挡的是经 `as` 断言洗过的值——例如 `{kind:'none'} as Object as SwipeOutcome`
     // 这类双重断言仍能编译，类型系统拦不住它。所以它不是「可证不可达」的死代码，
     // 不要因为「类型已保证」就把它删掉。
-    if (!rolledBack && action !== 'fav' && action !== 'archive') { return; }
+    if (!rolledBack && action !== 'fav' && action !== 'archive' && action !== 'wall') { return; }
 
     const now = Date.now();
     this.metrics = recordSwipe(this.metrics, {
@@ -169,13 +172,22 @@ struct SwipePage {
 
     const prev = this.decisions.get(photoId);
     const d = prev === undefined ? emptyDecision(photoId) : prev;
-    const nextAction = action === 'fav' ? 'fav' : 'archive';
+    // 三个合法动作各自映射：'wall' 必须显式映射为 'wall'，否则会落到 else 的
+    // 'archive' 上——照片会被当场上墙，却在盘上被记成归档（决策丢失）。
+    // 标注不能写成 `: string`：applyDecision 的第二参是 core/queue.ts 的 Action 联合，
+    // 传 string 会编译失败（实测报错 "Argument of type 'string' is not assignable to
+    // parameter of type 'Action'"）。这里收窄成实际可达的三值，既过编译又让
+    // 「本函数只产出这三种」成为类型事实（将来加分支会被编译器要求显式处理）。
+    let nextAction: 'fav' | 'archive' | 'wall' = 'archive';
+    if (action === 'fav') { nextAction = 'fav'; }
+    else if (action === 'wall') { nextAction = 'wall'; }
     const next = applyDecision(d, nextAction, now);
     this.decisions.set(photoId, next);
     // 落盘改防抖合并：内存 Map 已是权威副本，崩溃/被杀最多丢 1 秒内的决策
     this.scheduleSave();
 
-    // 右滑收藏后把「上墙」入口更新为这张；归档不动它
+    // 顶部「挂上墙」入口只服务于「右滑收藏了但还没上墙」的那张；
+    // 直接上墙（'wall'）后这张已上墙，无需再提示。
     if (nextAction === 'fav') {
       this.lastFaved = photoId;
     }

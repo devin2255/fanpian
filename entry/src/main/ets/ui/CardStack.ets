@@ -29,6 +29,11 @@ export interface QueueItem { photoId: string; thumbUri: string }
  * 另注：本联合只编码 action↔rolledBack 的配对，不编码「出口↔kind」对应 ——
  * 新增手势出口时需自行确认它上报的 kind 与实际行为一致。
  *
+ * 'wall' 分支（kind: 'wall'）表示「这张直接上墙，不必先收藏」：用户看到照片的当下
+ * 就可能已经有上墙判断，不必被迫先右滑收藏、再回来点顶部入口。它不含 action 字段 ——
+ * 上墙不是方向性决定（没有「滑向哪边」可言），所以它既不复用 'decision' 的
+ * action↔配对约束，也不会被 SwipePage 的解码误当成归档。
+ *
  * 注意：'skip' 与删除不在此列 —— 它们不是滑动手势（跳过在长按菜单、删除另设路径）。
  *
  * ArkTS 硬约束决定了这里只能写成两个「具名 interface」的联合，而非内联对象类型：
@@ -38,8 +43,9 @@ export interface QueueItem { photoId: string; thumbUri: string }
  * 这两条只影响「怎么写」，不改变上面「边界」所述的判别范围。
  */
 export interface SwipeDecision { kind: 'decision'; action: 'fav' | 'archive' }
+export interface SwipeWall { kind: 'wall' }
 export interface SwipeRollback { kind: 'rollback' }
-export type SwipeOutcome = SwipeDecision | SwipeRollback;
+export type SwipeOutcome = SwipeDecision | SwipeWall | SwipeRollback;
 
 @Component
 export struct CardStack {
@@ -49,6 +55,8 @@ export struct CardStack {
   // 字面量形态下传错组合（例如回弹却带 action）会在编译期报错，而不是运行期被
   // handle() 的守卫静默丢弃；变量形态可绕过（见 SwipeOutcome 上方「边界」），
   // 且「出口↔kind」对应不在编码范围内 —— 新增出口时请自行核对。
+  // 当前四个出口：右滑 → 'decision'/fav、左滑 → 'decision'/archive、
+  // 卡片上「上墙」按钮 → 'wall'（当场上墙，不经收藏）、回弹 → 'rollback'。
   onDecide: (photoId: string, outcome: SwipeOutcome) => void = () => {};
   @State dx: number = 0;
   @State dy: number = 0;
@@ -75,10 +83,30 @@ export struct CardStack {
 
   build() {
     Column() {
-      Image(this.item.thumbUri)
-        .width('100%').height('100%')
-        .objectFit(ImageFit.Cover)
-        .borderRadius(16)
+      // 卡片内容层：照片 + 叠在「卡片内侧底部」的「上墙」按钮。
+      // 这里的 Stack 尺寸 = 卡片本身（100% x 100%），所以 alignContent: Bottom
+      // 只把按钮放到卡片底边，不会像页面级 Stack 那样把它甩到屏幕底部去
+      // （那个坑：卡片居中只占 62% 高，页面级 Bottom 的按钮会离卡片 19% 页高）。
+      Stack({ alignContent: Alignment.Bottom }) {
+        Image(this.item.thumbUri)
+          .width('100%').height('100%')
+          .objectFit(ImageFit.Cover)
+          .borderRadius(16)
+
+        // 「上墙」= 当场把这张挂上地图，不必先收藏（真机反馈后新增的第三入口）。
+        // 位置：卡片内侧底部、半透明（#CC 前缀 = 80% 不透明），只压住照片下沿，
+        // 不遮挡主体。它刻意不写自己的 translate/rotate —— 它是卡片根节点的子节点，
+        // 随卡片一起位移与倾斜（写了会与父节点的 transform 叠加成双倍位移）。
+        Button('上墙')
+          .fontSize(13).height(34).width(96)
+          .backgroundColor('#CC1F6FEB')
+          .margin({ bottom: 12 })
+          .onClick(() => {
+            const out: SwipeWall = { kind: 'wall' };
+            this.onDecide(this.item.photoId, out);
+          })
+      }
+      .width('100%').height('100%')
     }
     // 86% 与 SwipePage.ets 的 CARD_WIDTH_RATIO 是同一个事实的两处表达：改一处必须改另一处。
     .width('86%').height('62%')
