@@ -117,6 +117,27 @@ export class DecisionStore {
   // SwipePage 已改为「内存 Map 为权威副本 + 防抖合并全量写」，单条写入口再无调用者。
   // 将来若确实需要单条写，先确认调用点不在热路径上，并且手上已有一份全量 Map。
 
+  /**
+   * 撤销一张照片的决策（「返回上一张」用：回到刚看过的那张，让它重新可决定）。
+   * 返回是否真的删掉了一条（false = 盘上本来就没有它，无需删）。
+   * 注：saveAll() 内部只告警不抛错，所以 true 只保证「读到了、且已尝试落盘」。
+   *
+   * 为什么必须**当场写盘**、不能只改内存再等 SwipePage 的 1 秒防抖合并：
+   * 撤销的正确性依赖「内存与盘同时回到未决策」。若只改内存，用户在这 1 秒内杀掉 App，
+   * 盘上仍留着那条 archived / faved / walled，下次启动时 SwipePage.aboutToAppear 会把它
+   * 当「已决策」过滤掉 —— 用户「回去重新决定」的意图静默失效（照片再也不会出现在队列里）。
+   * 代价（已知并接受）：这里是全量读 + 全量写在 UI 线程上，与上面 set() 注释所反对的形态同类；
+   * 区别在调用频率 —— 它只有 SwipePage.navigate() 一个调用点，且只在「用户主动返回上一张」
+   * 这条低频路径上，不在「每滑一张」的热路径上。
+   */
+  remove(photoId: string): boolean {
+    const m = this.loadAll();
+    if (!m.has(photoId)) { return false; }
+    m.delete(photoId);
+    this.saveAll(m);
+    return true;
+  }
+
   /** 收藏池：含已上墙的（上墙是从收藏里精选，两者不是互斥状态） */
   favedIds(): string[] {
     const out: string[] = [];
