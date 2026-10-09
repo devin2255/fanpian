@@ -1356,6 +1356,49 @@ export function outlinePath(rings: number[][], frame: MapFrame): string {
   return parts.join('');
 }
 
+// ── 省级边界：与国界同一条 path 机制，只换颜色与线宽 ──────────────────────────
+//
+// 用户原话：「还有地图至少要有省级划分的边界线 现在整个地图都是一片」。
+// 数据在 `resources/rawfile/china_provinces.json`（34 个省级行政区、107 环，见
+// `tools/build-provinces.ts` 与 THIRD_PARTY_NOTICES.md 第 3 节），形状与国界**完全一样**
+// （`OutlineData` 的 `{v,src,license,bounds,rings}`），所以：
+//   · 解析复用 `parseOutline`（同一套校验，包括"环必须是 ≥6 的偶数长度有限数数组"）；
+//   · 生成 path 复用 `outlinePath`（同一套投影 + 视口剔除 + 2 位小数 + `frame.bounds`）；
+//   · **本模块没有为省界新写任何一个几何函数** —— 需要区分的只有颜色和线宽这两件事，
+//     那就是下面这两个常量。
+//
+// 这两个常量放在 core 里（而不是各写一份在 WallPage 与预览里）的理由与 `TRACK_COLOR`
+// 完全相同：两边写死同一个字符串不会漂，而"预览细一点、设备粗一点"这种差异会让
+// "在电脑上先看见"这件事打折扣。
+
+/**
+ * 省级界线的颜色。
+ *
+ * ── 取值与**为什么与国界同色**（这是实测调出来的，不是配色偏好）──────────────────
+ *   国界的描边是 `#BFD3B8`。省界一开始用了一档更浅的 `#CBDCC4`（想靠"更淡"来分主次），
+ *   渲染出来**太淡了**：在 376×663.71pt 的真机尺寸下，内陆的分省线几乎看不出来 ——
+ *   那正是用户抱怨的那个"整个地图都是一片"，等于没修。
+ *   改成本常量（**与国界同一个 `#BFD3B8`**）之后，主次关系改由**线宽**表达
+ *   （`PROVINCE_WIDTH` 0.5 vs 国界 0.8，见下），颜色不再承担"分主次"的职责。
+ *   同色还有两个附带好处：
+ *     · 沿海省份的界线与海岸线**重合**时不会出现两种深浅叠在一起的毛边；
+ *     · 与暖赭的轨迹（`#D08A46`）和照片卡片在色相上天然分得开（冷绿 vs 暖赭）。
+ */
+export const PROVINCE_STROKE = '#BFD3B8';
+
+/**
+ * 省级界线的线宽（pt）：**国界（0.8）的 0.63 倍**。
+ *
+ * 0.5 是"看得见"与"不织成一张网"之间的取值：3 倍屏上是 1.5px。
+ * 一开始取 0.4（国界的一半）时同样偏细，配合上面那个更浅的颜色几乎消失 ——
+ * 所以线宽和颜色是**一起**调上来的，两个数字要一起看。
+ *
+ * 这也是"放大 9.5 倍时省界必须仍然清晰"的另一半答案（另一半是数据侧的容差 0.08pt，
+ * 见 `tools/build-provinces.ts` 文件头）：**线宽不随缩放变化**，放大后线的粗细不变，
+ * 而放大后被拉开的是线本身的**位置精度** —— 数据侧已经把它压到 0.76pt 的亚像素级。
+ */
+export const PROVINCE_WIDTH = 0.5;
+
 // ── 旅行轨迹：钉子按时间连成一条折线 ────────────────────────────────────────
 
 /**
@@ -1469,11 +1512,21 @@ export function dateLabel(takenAt: number): string {
  *
  * ── 图层顺序（由下到上，改这里之前先想清楚谁压谁）────────────────────────────
  *   ① 底 `#F2F7EF`（**地图块的底色**，与设备侧 Stack 的底色逐字节相同 —— 地图铺满主体区）
- *   → ② 国界（调用方传进来的 `chinaPath`）→ ③ **轨迹折线** → ④ 照片+挂线
+ *   → ② 国界（调用方传进来的 `chinaPath`）→ ②′ **省界**（`provincePath`）
+ *   → ③ **轨迹折线** → ④ 照片+挂线
  *   → ⑤ 钉点与地名（单独一层，永远在最上面，否则邻钉的卡片会盖住地名）。
  * 轨迹放在地图之上、照片之下：它是"我走过哪里"的背景叙事，压住照片就成了噪声。
+ *
+ * ── 省界为什么必须画在国界**之后**（而不是之前、也不是同一层）────────────────────
+ *   国界那一层不是一条线，而是一个**填充面**（`fill="#E8F0E4"` + `stroke`）：陆地是浅绿、
+ *   海是底色。省界是陆地**内部**的线，画在填充之前会被那块填充**整个盖掉** ——
+ *   症状是"数据明明有 107 条环，图上一条都看不见"。所以顺序只能是 填充 → 省界线。
+ *   同理它必须在**轨迹与照片之前**：省界是底图信息，不是内容。
+ *
+ * `provincePath` 缺省 = 空串 = 不画省界（没有那份 rawfile 时的退化路径，与国界一致）。
  */
-export function sceneToSvg(pins: ScenePin[], w: number, h: number, chinaPath: string, scale?: number): string {
+export function sceneToSvg(pins: ScenePin[], w: number, h: number, chinaPath: string, scale?: number,
+  provincePath?: string): string {
   const s: number = scale === undefined || !(scale > 0) ? 1 : scale;
   const out: string[] = [];
   out.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${r2(w * s)}" height="${r2(h * s)}" `
@@ -1484,6 +1537,15 @@ export function sceneToSvg(pins: ScenePin[], w: number, h: number, chinaPath: st
   if (chinaPath !== undefined && chinaPath !== null && chinaPath.length > 0) {
     out.push(`<path d="${escapeXml(chinaPath)}" fill="#E8F0E4" stroke="#BFD3B8" `
       + `stroke-width="0.8" stroke-linejoin="round" fill-rule="evenodd"/>`);
+  }
+  // ②′ 省界：**必须在国界的填充之后**（见函数注释"省界为什么必须画在国界之后"）。
+  // fill="none"：它是线，不是面 —— 数据里的环有外环也有内环（岛礁），
+  // 填充它们会在陆地上挖出一堆洞；省界只画线。
+  if (provincePath !== undefined && provincePath !== null && provincePath.length > 0) {
+    out.push(`<g id="provinces">`);
+    out.push(`<path d="${escapeXml(provincePath)}" fill="none" stroke="${PROVINCE_STROKE}" `
+      + `stroke-width="${PROVINCE_WIDTH}" stroke-linejoin="round"/>`);
+    out.push(`</g>`);
   }
   // 轨迹折线：由 pins 自己算（调用方不用多传一个参数，设备与预览就不可能忘了画）
   const track: string = trajectoryPath(pins);

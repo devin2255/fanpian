@@ -16,9 +16,10 @@ import { CHINA_REGION, projectMercator } from './projection.ts';
 import { MAX_HANG, MIN_PIN_DIST_PT } from './placement.ts';
 import {
   HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, HANG_OVERLAP_EPS, HANG_SWEEP_RAD, MIN_VIEW_SPAN_DEG, TRACK_WIDTH,
-  VIEW_PAD_RATIO, arcSpread, arcSpreadNeed, buildScene, clampRect, dateLabel, fitBounds, fitViewToCanvas,
-  frameBounds, geoAspect, hangBottom, hangOffsets, hangRects, mapBoxHeight, mapFrame, normalizeBounds,
-  outlinePath, parseOutline, pinTime, rectOverlapArea, sceneToSvg, trajectoryOrder, trajectoryPath, viewZoomOf
+  VIEW_PAD_RATIO, PROVINCE_STROKE, PROVINCE_WIDTH, arcSpread, arcSpreadNeed, buildScene, clampRect,
+  dateLabel, fitBounds, fitViewToCanvas, frameBounds, geoAspect, hangBottom, hangOffsets, hangRects,
+  mapBoxHeight, mapFrame, normalizeBounds, outlinePath, parseOutline, pinTime, rectOverlapArea, sceneToSvg,
+  trajectoryOrder, trajectoryPath, viewZoomOf
 } from './render.ts';
 import type { CardRect, MapFrame, ScenePin, WallPhoto } from './render.ts';
 
@@ -890,6 +891,219 @@ test('china_outline.json：投到地图框上的路径非空、无 NaN、且没�
   }
   // 地图块外的 19 条环（8~11.4°N 的南海诸岛）被剔除 → 子路径数少于环数，但数据里一条不少
   assert.ok(d.split('M').length - 1 < od.rings.length, '视口外的环没被剔除');
+});
+
+// ── 真实省级边界文件（china_provinces.json，task-16 的第 1 件事）─────────────
+//
+// 用户的第二条反馈：「还有地图至少要有省级划分的边界线 现在整个地图都是一片」。
+// 成因是只有国界：`china_outline.json` 是**一个填充面**，内陆一条线都没有，
+// 放大到一座城之后屏幕上就是一整片同一个颜色。
+//
+// 这份数据与国界**共用同一套机制**（同一个 parseOutline / outlinePath / MapFrame），
+// 所以下面测的是"数据本身对不对"，机制部分是上面那批测试已经在守的。
+
+const PROVINCE_URL = new URL('../../resources/rawfile/china_provinces.json', import.meta.url);
+
+test('china_provinces.json：真实文件能解析、许可与出处齐、环数与字节数不超限', () => {
+  const text = fs.readFileSync(PROVINCE_URL, 'utf8');
+  const bytes = Buffer.byteLength(text, 'utf8');
+  // 工单的硬约束：≤ 150 KB
+  assert.ok(bytes <= 150 * 1024, `省级边界文件超过 150KB：${bytes} 字节`);
+  const pd = parseOutline(text);
+  assert.ok(pd !== undefined, 'china_provinces.json 过不了 parseOutline —— 设备上省界整层消失（静默失败）');
+  // 与国界同一口径：bounds 必须等于 CHINA_REGION.bounds（数据完整性的表述，不参与投影）
+  assert.deepEqual(pd.bounds, CHINA_REGION.bounds);
+  assert.ok(pd.license.length > 0, '缺少许可字段');
+  assert.ok(pd.license.indexOf('Public Domain') >= 0, `许可没写明：${pd.license}`);
+  assert.ok(pd.src.indexOf('Natural Earth') >= 0, `来源字段没写清出处：${pd.src}`);
+  // 版本标记里**必须能读出容差**（与 build-outline.ts 的同一条规矩：默认值就是入库口径，
+  // 改成更大会静默降精度，而"能不能解析"这类自检在降精度后照样通过）
+  assert.ok(pd.v.indexOf('dp0.08') > 0, `版本字段里读不出容差：${pd.v}`);
+  // **107 条环**（大陆 31 个省级 93 环 + 台港澳 14 环），一条都不许少
+  assert.equal(pd.rings.length, 107, `环数变了：${pd.rings.length}`);
+  // 总点数：容差被偷偷调大时它会掉（0.08→0.15 会从 11840 掉到 7766）
+  let pts = 0;
+  for (let i = 0; i < pd.rings.length; i++) { pts += pd.rings[i].length / 2; }
+  assert.equal(pts, 11840, `总点数变了：${pts}（容差或抽取口径被改动了？）`);
+  // 每条环都是合法的绘制输入（parseOutline 已校验，这里再从"能不能画出一个面"复核一次）
+  for (let i = 0; i < pd.rings.length; i++) {
+    const ring = pd.rings[i];
+    assert.ok(ring.length >= 8 && ring.length % 2 === 0, `第 ${i} 条环形状不对：${ring.length}`);
+    for (let j = 0; j < ring.length; j++) {
+      assert.ok(Number.isFinite(ring[j]), `第 ${i} 条环里有非有限坐标`);
+    }
+  }
+});
+
+/**
+ * 一批"这条省级边界应当存在"的粗略区域。每项是
+ * `[名字, minLon, minLat, maxLon, maxLat]`（**顺序**：经度下界、纬度下界、经度上界、纬度上界）。
+ * 判据是"某条环的**包围盒中心**落在这个盒子里" —— 比"某个点恰好相等"稳得多，
+ * 也不会因为简化掉了某个顶点而误报。盒子都放得比省界本身宽，只用来证明"这一带**有**线"。
+ */
+const PROVINCE_PROBES: string[][] = [
+  ['新疆', '73', '34', '97', '49'],
+  ['西藏', '78', '26', '100', '37'],
+  ['黑龙江', '121', '43', '136', '54'],
+  ['海南岛', '108', '18', '112', '21'],
+  ['上海', '120.8', '30.6', '122.2', '31.9'],
+  ['宁夏', '104', '35', '108', '40'],
+  ['北京/天津/河北', '114.5', '36', '120', '42.5'],
+  // ── 下面三条就是工单里的"含港澳台"，逐条机械核对 ──
+  ['台湾', '119', '21', '123', '26'],
+  ['香港', '113.7', '22.0', '114.6', '22.7'],
+  ['澳门', '113.4', '22.0', '113.7', '22.3'],
+];
+
+test('china_provinces.json：**含港澳台**，且各大区都有边界（用环包围盒落点核对，不靠肉眼）', () => {
+  const pd = parseOutline(fs.readFileSync(PROVINCE_URL, 'utf8'));
+  assert.ok(pd !== undefined);
+  // 预先算好每条环的包围盒中心
+  const centers: number[][] = [];
+  for (let i = 0; i < pd.rings.length; i++) {
+    const ring = pd.rings[i];
+    let minLon = Number.POSITIVE_INFINITY;
+    let maxLon = Number.NEGATIVE_INFINITY;
+    let minLat = Number.POSITIVE_INFINITY;
+    let maxLat = Number.NEGATIVE_INFINITY;
+    for (let j = 0; j + 1 < ring.length; j += 2) {
+      if (ring[j] < minLon) { minLon = ring[j]; }
+      if (ring[j] > maxLon) { maxLon = ring[j]; }
+      if (ring[j + 1] < minLat) { minLat = ring[j + 1]; }
+      if (ring[j + 1] > maxLat) { maxLat = ring[j + 1]; }
+    }
+    centers.push([(minLon + maxLon) / 2, (minLat + maxLat) / 2]);
+  }
+  for (let k = 0; k < PROVINCE_PROBES.length; k++) {
+    const p = PROVINCE_PROBES[k];
+    // 数组顺序是 [名字, minLon, minLat, maxLon, maxLat]（见上面那段注释）
+    const minLon = Number(p[1]);
+    const minLat = Number(p[2]);
+    const maxLon = Number(p[3]);
+    const maxLat = Number(p[4]);
+    let hit = false;
+    for (let i = 0; i < centers.length && !hit; i++) {
+      if (centers[i][0] >= minLon && centers[i][0] <= maxLon
+        && centers[i][1] >= minLat && centers[i][1] <= maxLat) { hit = true; }
+    }
+    assert.ok(hit, `${p[0]} 那一带一条省级边界环都没有（框 ${minLon}~${maxLon}E / ${minLat}~${maxLat}N）`
+      + ' —— 抽取规则漏了它？');
+  }
+  // 反面：全体环的**包围盒并集**必须跨得很开（少了新疆或黑龙江就会明显缩水）。
+  // 注意这里比的是**边界**（不是上面那些中心）—— 新疆那条环的中心在 85°E，
+  // 但它的西边界在 73.6°E；拿中心去比"够不够西"是量错了东西（这个坑真踩到了）。
+  let uMinLon = Number.POSITIVE_INFINITY;
+  let uMaxLon = Number.NEGATIVE_INFINITY;
+  let uMinLat = Number.POSITIVE_INFINITY;
+  let uMaxLat = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < pd.rings.length; i++) {
+    const ring = pd.rings[i];
+    for (let j = 0; j + 1 < ring.length; j += 2) {
+      if (ring[j] < uMinLon) { uMinLon = ring[j]; }
+      if (ring[j] > uMaxLon) { uMaxLon = ring[j]; }
+      if (ring[j + 1] < uMinLat) { uMinLat = ring[j + 1]; }
+      if (ring[j + 1] > uMaxLat) { uMaxLat = ring[j + 1]; }
+    }
+  }
+  assert.ok(uMinLon < 76, `西边界不够西（新疆西端在 73.6°E）：${uMinLon}`);
+  assert.ok(uMaxLon > 132, `东边界不够东（黑龙江东端在 134.8°E）：${uMaxLon}`);
+  assert.ok(uMinLat < 20, `南边界不够南（海南南端在 18.2°N）：${uMinLat}`);
+  assert.ok(uMaxLat > 52, `北边界不够北（漠河在 53.6°N）：${uMaxLat}`);
+  // 中心数：107 条环每一个都算出来了（不是空跑）
+  assert.equal(centers.length, pd.rings.length);
+});
+
+test('china_provinces.json：投到地图框上的路径非空、无 NaN，且路径比国界**密**（线更多）', () => {
+  const pd = parseOutline(fs.readFileSync(PROVINCE_URL, 'utf8'));
+  const od = parseOutline(fs.readFileSync(OUTLINE_URL, 'utf8'));
+  assert.ok(pd !== undefined && od !== undefined);
+  const mapH = mapBoxHeight(W, CHINA_REGION.bounds);
+  const frame: MapFrame = mapFrame(W, mapH, CHINA_REGION.bounds);
+  const dp = outlinePath(pd.rings, frame);
+  const dc = outlinePath(od.rings, frame);
+  assert.ok(dp.length > 0, '省界 path 是空的');
+  assert.ok(!dp.includes('NaN') && !dp.includes('Infinity'));
+  // 全国视野下省界的 path 必须比国界**长得多**：国界只有海岸线 + 国境线，
+  // 省界是内陆的分省线网。这条断言抓的是"省界层被误当成国界层画了"（同一个数据文件）。
+  assert.ok(dp.length > dc.length * 1.5,
+    `省界 path（${dp.length} 字符）没有比国界（${dc.length}）明显更长 —— 两层是不是用了同一份数据？`);
+  // 坐标全部落在块内
+  const nums = dp.replace(/[MLZ]/g, ' ').trim().split(/\s+/).map((s: string) => Number(s));
+  assert.ok(nums.length > 1000, `坐标太少：${nums.length}`);
+  for (let i = 0; i + 1 < nums.length; i += 2) {
+    assert.ok(nums[i] >= -0.01 && nums[i] <= W + 0.01, `省界 x 越界：${nums[i]}`);
+    assert.ok(nums[i + 1] >= -0.01 && nums[i + 1] <= mapH + 0.01, `省界 y 越界：${nums[i + 1]}`);
+  }
+});
+
+test('省界与国界用**同一个** frame.bounds：同一经纬度在两条 path 上落在同一个画布点', () => {
+  // 与国界那条"同一个 bounds"的测试同源：两层都调 outlinePath(rings, frame)，
+  // 所以"各传一套参数"在类型上就写不出来。这里用一个能同时出现在两个环里的点验证行为。
+  const lon = 116.4;
+  const lat = 39.9;
+  const ring = [lon, lat, lon + 0.1, lat, lon + 0.1, lat + 0.1, lon, lat + 0.1];
+  const b = fitBounds([ph('bj', lat, lon, 0)], VIEW_PAD_RATIO);
+  assert.ok(b !== undefined);
+  const frame: MapFrame = mapFrame(DEV_BOX_W, DEV_BOX_H, fitViewToCanvas(b, DEV_BOX_W, DEV_BOX_H));
+  const dProv = outlinePath([ring], frame);
+  const dChina = outlinePath([ring], frame);
+  assert.equal(dProv, dChina, '同一个环在同一 frame 下必须产出逐字节相同的 path');
+  assert.ok(dProv.startsWith('M'));
+  // 换一个 frame（不同 bounds）→ path 必然不同（否则说明 bounds 根本没被用上）
+  const other: MapFrame = mapFrame(DEV_BOX_W, DEV_BOX_H, CHINA_REGION.bounds);
+  assert.notEqual(outlinePath([ring], other), dProv);
+});
+
+test('sceneToSvg：省界画在国界**之后**（填充面上）、轨迹与照片**之前**', () => {
+  // 这一条守的是一个真会发生的静默失败：国界那一层是**填充面**（fill="#E8F0E4"），
+  // 省界是陆地内部的线 —— 画在填充之前会被整块盖掉，症状是"数据里 107 条环、
+  // 图上一条都看不见"，而任何解析/校验都不会报错。
+  const pins = demoPins();
+  const svg = sceneToSvg(pins, W, H, 'M1 1L2 2Z', 1, 'M3 3L4 4Z');
+  const iChina = svg.indexOf('M1 1L2 2Z');
+  const iProv = svg.indexOf('M3 3L4 4Z');
+  const iTrack = svg.indexOf('<g id="trajectory">');
+  const iPins = svg.indexOf('<g id="pins">');
+  assert.ok(iChina >= 0 && iProv >= 0, '两层 path 都应当出现在 SVG 里');
+  assert.ok(iChina < iProv, '省界必须画在国界之后（否则被国界的填充盖掉）');
+  assert.ok(iProv < iTrack && iProv < iPins, '省界必须在轨迹与照片之前（它是底图信息）');
+  // 省界是线不是面：fill="none"，否则内环会在陆地上挖洞。
+  // （取整段 <path …> 元素：固定 20 个字符的窗口会在 "fill=" 那里被截断，
+  //   那样断言永远失败 —— 这个坑真踩到了。）
+  const provStart = svg.lastIndexOf('<path', iProv);
+  const provTag = svg.substring(provStart, svg.indexOf('/>', provStart) + 2);
+  assert.ok(provTag.indexOf('fill="none"') >= 0, `省界的 path 不该填充：${provTag}`);
+  assert.ok(provTag.indexOf(`stroke="${PROVINCE_STROKE}"`) >= 0, `省界颜色没走常量：${provTag}`);
+  // 缺省（不传）时不画省界 —— 老调用点与"没有那份 rawfile"的退化路径都不受影响
+  const svgNoProv = sceneToSvg(pins, W, H, 'M1 1L2 2Z', 1);
+  assert.equal(svgNoProv.indexOf('M3 3L4 4Z'), -1);
+  assert.equal(svgNoProv.indexOf('<g id="provinces">'), -1);
+  // 省界的样式取自 core 的常量（设备与预览共用同一份，不是各写一个数）
+  assert.ok(svg.indexOf(PROVINCE_STROKE) >= 0);
+  assert.ok(svg.indexOf(`stroke-width="${PROVINCE_WIDTH}"`) >= 0);
+});
+
+test('省界在**真机那一档视野**下确实还有线可画（放大 9.5 倍后不能一条都不剩）', () => {
+  // 用户的抱怨是"放大之后整个地图是一片"。所以"全国视野下有省界"不够 ——
+  // 必须验证**真机那一档**（376×663.71 + 上海/北京/天津）视野里也有省界。
+  const photos = [ph('sh', SH_LAT, SH_LON, 0), ph('bj', BJ_LAT, BJ_LON, 0), ph('tj', TJ_LAT, TJ_LON, 0)];
+  const vb = fitBounds(photos, VIEW_PAD_RATIO);
+  assert.ok(vb !== undefined);
+  const frame: MapFrame = mapFrame(DEV_BOX_W, DEV_BOX_H, fitViewToCanvas(vb, DEV_BOX_W, DEV_BOX_H));
+  const pd = parseOutline(fs.readFileSync(PROVINCE_URL, 'utf8'));
+  assert.ok(pd !== undefined);
+  const dp = outlinePath(pd.rings, frame);
+  const subpaths = dp.split('M').length - 1;
+  // 实测 38/107 条环落在这个视野里（真机诊断行会印 `省界 <字符数>`，可对照）
+  assert.equal(subpaths, 38, `真机那一档视野里的省级子路径数变了：${subpaths}`);
+  assert.ok(dp.length > 50000, `省界 path 太短（${dp.length}）—— 放大后省界可能已经看不见了`);
+  assert.ok(!dp.includes('NaN'));
+  // 判别力：如果只有国界，这一档视野里几乎只剩海岸线 —— 字符数会差一个量级
+  const od = parseOutline(fs.readFileSync(OUTLINE_URL, 'utf8'));
+  assert.ok(od !== undefined);
+  const dc = outlinePath(od.rings, frame);
+  assert.ok(dp.length > dc.length * 1.5,
+    `真机视野下省界（${dp.length}）没有比国界（${dc.length}）密 —— 用户会再次看到"一片"`);
 });
 
 // ── 地图框：铺满主体区 + 不变形 + 居中（task-14 的形态改造） ─────────────────

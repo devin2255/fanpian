@@ -61,7 +61,7 @@ import { parseAreaData } from '../core/areaData';
 import {
   HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, TRACK_COLOR, TRACK_WIDTH, VIEW_PAD_RATIO,
   badgeRect, buildScene, dateLabel, fitBounds, fitViewToCanvas, geoAspect, hangBottom, hangOffsets, hangRects,
-  mapFrame, outlinePath, parseOutline, trajectoryPath, viewZoomOf
+  mapFrame, outlinePath, parseOutline, PROVINCE_STROKE, PROVINCE_WIDTH, trajectoryPath, viewZoomOf
 } from '../core/render';
 import type { CardRect, HangOffset, MapFrame, OutlineData, ScenePin, WallPhoto } from '../core/render';
 // MAX_HANG 只在 core/placement.ts 里定义（设计 §6.2 的阈值那儿一份），render.ts 不转手导出。
@@ -82,6 +82,11 @@ const TAG: string = 'WallPage';
 const DIAG: string = 'WALLDIAG';
 const AREA_RAW_NAME: string = 'china_areas.json';
 const OUTLINE_RAW_NAME: string = 'china_outline.json';
+/**
+ * 省级边界数据（`tools/build-provinces.ts` 产出，34 个省级行政区 / 107 环）。
+ * 与国界**同一套解析与同一条 path 生成器**，只是颜色与线宽不同（见 core/render 的两个常量）。
+ */
+const PROVINCE_RAW_NAME: string = 'china_provinces.json';
 
 /** 挂载区底部的留白（pt）：给"点开钉子"的提示条留位置。 */
 const BOTTOM_RESERVE = 26;
@@ -105,6 +110,12 @@ struct WallPage {
   @State anchors: WallAnchor[] = [];
   @State badges: WallBadge[] = [];
   @State chinaPath: string = '';
+  /**
+   * 省级边界的 path。**与国界同一套机制**：同一个 `parseOutline` 解析、同一个 `outlinePath`
+   * 生成（含视口剔除），区别只有颜色和线宽（`PROVINCE_STROKE` / `PROVINCE_WIDTH`）。
+   * 读不到数据时是空串 → 那一层不画（退化路径，墙照样能用）。
+   */
+  @State provincePath: string = '';
   @State linkPath: string = '';
   /** 旅行轨迹折线（按拍摄时间把钉子连起来）。见 core/render.trajectoryPath。 */
   @State trackPath: string = '';
@@ -145,6 +156,8 @@ struct WallPage {
   private photos: WallPhoto[] = [];      // 原始照片（重算场景用）
   private pins: ScenePin[] = [];         // 上一次算出的场景（点开详情时查它）
   private outlineData: OutlineData | undefined = undefined;
+  /** 省级边界数据。形状与国界**同一个** `OutlineData`，所以解析/绘制都能复用。 */
+  private provinceData: OutlineData | undefined = undefined;
 
   aboutToAppear(): void {
     hilog.info(DOMAIN, TAG, '%{public}s', `${DIAG} aboutToAppear：页面进入，开始 load()`);
@@ -181,6 +194,22 @@ struct WallPage {
     } catch (e) {
       this.note = appendNote(this.note, '国界数据未装载：本次不画国界线');
       hilog.warn(DOMAIN, TAG, '%{public}s', `国界数据读取失败：${errText(e)}`);
+    }
+
+    // 2′) 省级边界。**与国界完全同一条路径**（同一个 parseOutline、同一个 OutlineData 形状），
+    //     所以这里除了文件名之外没有第二套逻辑。读不到就只少一层线，页面上留一行说明。
+    //     为什么要有它：用户原话「至少要有省级划分的边界线 现在整个地图都是一片」——
+    //     只有国界时，放大到一座城之后内陆没有任何线，屏幕上就是一整片同一个颜色。
+    try {
+      const bytes: Uint8Array = await ctx.resourceManager.getRawFileContent(PROVINCE_RAW_NAME);
+      this.provinceData = parseOutline(buffer.from(bytes).toString('utf-8'));
+      if (this.provinceData === undefined) {
+        this.note = appendNote(this.note, '省级边界解析失败：本次不画省界');
+        hilog.warn(DOMAIN, TAG, '%{public}s', `省级边界解析失败（${bytes.length} 字节）`);
+      }
+    } catch (e) {
+      this.note = appendNote(this.note, '省级边界未装载：本次不画省界');
+      hilog.warn(DOMAIN, TAG, '%{public}s', `省级边界读取失败：${errText(e)}`);
     }
 
     // 3) 地点索引：**先触发补读，再等它稳定**（两行都要，契约见文件头）
@@ -265,6 +294,15 @@ struct WallPage {
     }
     this.chinaPath = chinaPath;
 
+    // 省界：**同一个 outlinePath、同一个 frame**（含视口剔除）。放大到一座城时
+    // 大部分环会被剔掉（真机 376×663.71 那一档实测 38/107 条可见），这是预期的：
+    // 视野附近那些线会露出来，其余不画。
+    let provincePath: string = '';
+    if (this.provinceData !== undefined) {
+      provincePath = outlinePath(this.provinceData.rings, frame);
+    }
+    this.provincePath = provincePath;
+
     const pins: ScenePin[] = buildScene(this.photos, frame, 1, { canvasH: this.boxH, footer: BOTTOM_RESERVE });
     this.pins = pins;
     // 轨迹：按拍摄时间把钉子连成一条折线（时间未知的排最后）。少于 2 个钉子时是空串。
@@ -335,7 +373,9 @@ struct WallPage {
     this.diag = `box ${r2(this.boxW)}×${r2(this.boxH)} ｜ 图框 ${this.mapW}×${this.mapH}@(${this.mapX},${this.mapY})`
       + ` ｜ 视野 ${diagBounds}${vb !== undefined ? '(数据)' : '(全国)'}`
       + ` ｜ 放大 ${r2(viewZoomOf(dataBounds))}×→${r2(viewZoomOf(bounds))}×`
-      + ` ｜ pins ${pins.length} ｜ cards ${cards.length} ｜ pathLen ${chinaPath.length} ｜ track ${this.trackPath.length}`
+      + ` ｜ pins ${pins.length} ｜ cards ${cards.length}`
+      + ` ｜ 国界 ${chinaPath.length} 省界 ${provincePath.length}`
+      + ` ｜ track ${this.trackPath.length}`
       + ` ｜ 上墙 ${this.walledTotal} 命中 ${located} 实挂 ${shownTotal}`;
     hilog.info(DOMAIN, TAG, '%{public}s',
       `${DIAG} rebuild：boxW=${this.boxW} boxH=${this.boxH}`
@@ -346,7 +386,9 @@ struct WallPage {
       + ` viewZoomData=${r2(viewZoomOf(dataBounds))} viewZoomFilled=${r2(viewZoomOf(bounds))}`
       + ` geoAspect=${geoAspect(bounds).toFixed(4)} canvasAspect=${(this.boxW / this.boxH).toFixed(4)}`
       + ` bottom=${bottom} pins=${pins.length} cards=${cards.length}`
-      + ` chinaPath.length=${chinaPath.length} trackPath.length=${this.trackPath.length}`
+      + ` chinaPath.length=${chinaPath.length} provincePath.length=${provincePath.length}`
+      + ` provinceRings=${this.provinceData === undefined ? 0 : this.provinceData.rings.length}`
+      + ` trackPath.length=${this.trackPath.length}`
       + ` linkPath.length=${this.linkPath.length} walled=${this.walledTotal} located=${located} shown=${shownTotal}`);
     // ── 这里**不许**再写 `this.selIndex = -1` ────────────────────────────────
     // 这行曾经在：`rebuild()` 只在"数据到了"或"画布尺寸变了"时跑，而 `onAreaChange` 每次
@@ -406,6 +448,20 @@ struct WallPage {
           .width(this.boxW).height(this.boxH)
           .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
           .fill('#E8F0E4').stroke('#BFD3B8').strokeWidth(0.8)
+        }
+
+        // 省界：与国界**同一套机制**的第二条 path。
+        // ⚠️ 顺序不能反：国界那一层是**填充面**（陆地 `#E8F0E4`），省界是陆地内部的线 ——
+        // 画在填充之前会被整块盖掉（症状："数据里 107 条环，图上一条都看不见"）。
+        // 也不能放到轨迹/照片之后：省界是底图信息，不是内容。
+        if (this.provincePath.length > 0) {
+          Shape() {
+            Path().width(this.boxW).height(this.boxH).commands(this.provincePath)
+          }
+          .width(this.boxW).height(this.boxH)
+          .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
+          .fill(Color.Transparent).stroke(PROVINCE_STROKE).strokeWidth(PROVINCE_WIDTH)
+          .strokeLineJoin(LineJoinStyle.Round)
         }
 
         // 旅行轨迹：按拍摄时间把钉子连成一条折线。画在国界**之上**、照片**之下** ——

@@ -128,3 +128,88 @@ Natural Earth 的数据属于公有领域，其官方声明为：
 （<https://www.naturalearthdata.com/about/terms-of-use/>）
 
 本项目仍然在此保留来源与署名，以便追溯数据的出处与改动过程。
+
+---
+
+## 3. Natural Earth — Admin 1 – States/Provinces（中国省级边界）
+
+- **来源**：Natural Earth, <https://www.naturalearthdata.com/>
+- **数据集**：
+  - **Admin 1 – States/Provinces**（`ne_10m_admin_1_states_provinces`，1:10m 比例尺的矢量省级边界）
+  - 外加 **Admin 0 – Countries** 的 3 个要素（台湾 / 香港 / 澳门 —— 理由是它们的省级边界
+    就是全境轮廓，见下"抽取规则"）
+- **下载文件**（**不入库**，见 `.gitignore` 的 `/tools/raw/`）：
+
+  | 文件 | 字节数 |
+  | --- | --- |
+  | `ne_10m_admin_1_states_provinces.geojson` | 40,726,851 |
+  | `ne_10m_admin_0_countries.geojson` | 13,287,234（与第 2 节同一份） |
+
+  下载地址：`https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_1_states_provinces.geojson`
+- **许可**：**Public Domain（公有领域）** —— 与第 2 节同一份许可（Natural Earth 由 NACIS 发布，
+  无版权限制、无需署名即可使用）。此处仍写明来源与改动过程以便追溯。
+- **版权行**：`Natural Earth — public domain. Courtesy of Natural Earth (naturalearthdata.com).`
+- **本项目的使用方式**：抽取中国全部 **34 个省级行政区**的边界，简化后内嵌进 App，
+  画在国界**之上**、轨迹与照片**之下**（细线淡色）。
+- **产出**：`entry/src/main/resources/rawfile/china_provinces.json`（**149,688 字节 = 146.2 KB**）
+- **可复现**：`tools/build-provinces.ts`（默认参数即入库口径：10m 源 + 容差 0.08pt）
+
+### 抽取规则（由数据**自己的字段**决定，**没有任何按名字的挑选**）
+
+先读了数据看有哪些字段，再用属性判断。⚠️ 两份源的**字段名大小写不同**、且 admin_1
+里**没有** `sovereignt` 字段（那只是 admin_0 的）：
+
+| 组 | 规则 | 实测结果 |
+| --- | --- | --- |
+| ① 大陆省级 | `admin_1`: `properties.admin === 'China'` **且** `properties.geonunit === 'China'` | **31** 个（22 省 + 5 自治区 + 4 直辖市），93 环 / 53,214 点 |
+| ② 台湾 | `admin_0`: `ADMIN === 'Taiwan'` | 1 个（8 环 / 561 点） |
+| ③ 香港 | `admin_0`: `SOVEREIGNT === 'China'` 且 `ADMIN` 含 `Hong Kong` | 1 个（4 环 / 398 点） |
+| ④ 澳门 | `admin_0`: `SOVEREIGNT === 'China'` 且 `ADMIN` 含 `Macao` | 1 个（2 环 / 92 点） |
+| | **合计** | **34 个省级行政区**，107 环 |
+
+两条**有意排除**的规则（都写明了理由，不是漏了）：
+
+- `geonunit === 'Paracel Islands'`（西沙群岛）虽然 `admin === 'China'`，但它**不是省级单位**，
+  Natural Earth 把它单列成一个 geounit。它的岛礁形状已由第 2 节的国界层（南海诸岛 12 环）画出。
+  加上 `geonunit === 'China'` 这一条就把它排除了。
+- admin_1 里 **台湾被拆成 21 个县市、香港被拆成 18 个区**。直接取用会把它们画成 21 块 / 18 块，
+  那不是"省级划分"。它们真正的省级边界**就是全境轮廓**，所以从 admin_0 取各自那一个要素。
+
+### 本项目做了哪些简化
+
+1. **投影**：`core/projection.ts` 的 `projectMercator`，参考画布 **360 × 267.72pt**
+   （与 `build-outline.ts` **同一个**尺寸，容差数字才可比）。
+2. **Douglas–Peucker 简化**：同样在**投影后的画布空间**里做。**容差 0.08pt**，实测最大偏差 **0.0800pt**。
+   为什么比国界的 0.15pt 小：国界是在"整块中国都看得见"时看的，而省界是用户**放大 9.5 倍**
+   （真机诊断行的 `放大 9.5×`）之后看的，屏幕误差 = 参考容差 × 放大倍数：
+   0.15pt → **1.42pt**（看得出线在抖）；**0.08pt → 0.76pt**（亚像素）。
+   0.08 是 **150KB 上限之内能做到的最小容差**（0.07pt 就是 159.7KB，超限）。
+3. **坐标精度**：经纬度各保留 **2 位小数**。0.01° 经度 = 0.058pt（参考画布），
+   在 9.5 倍下是 0.55pt —— 与 DP 容差同量级，所以**没有再降到 1 位**。
+   **例外**：2 条不足 3 个顶点的岛礁环**按源数据全精度保留**，不做四舍五入（否则等于删要素）。
+4. **没有删除任何要素**：107 个环全部保留（0 条丢弃），其中 2 条是小岛/岛礁、原样保留。
+5. **没有增补任何要素**：没有手工画线、没有合并、没有平滑。
+
+| | |
+| --- | --- |
+| 省级行政区 | **34** |
+| 源点数 | 54,265 |
+| 简化后点数 | **11,840**（21.8%） |
+| 环数 | **107**（0 条丢弃） |
+| 产出的文件 | `entry/src/main/resources/rawfile/china_provinces.json` |
+| 产出字节数 | **149,688 字节（146.2 KB）**，上限 150 KB |
+| 数据版本标记（文件内 `v` 字段） | `ne10m-admin1-dp0.08-2dec` |
+
+**为什么用 10m 而不是 50m**（实测，不是偏好）：同样 34 个省级单位，**10m 有 107 条环、
+50m 只有 49 条** —— 少掉的 58 条全是小岛/岛礁。50m 确实能在 0.02pt 容差下只占 95.6KB，
+但代价是永久丢掉 58 条地理要素。这与第 2 节 `china_outline.json` 的经验一致
+（50m 的中国只有 19 环、10m 有 96 环）。
+
+### 坐标系说明
+
+与第 2 节相同：Natural Earth 是 **WGS-84**，本项目未做坐标系转换。
+
+### 许可见证
+
+与第 2 节同一份许可见证（Natural Earth 官方声明的 public domain 全文），不再重复抄录。
+

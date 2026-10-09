@@ -66,9 +66,9 @@ import { parseAreaData } from '../entry/src/main/ets/core/areaData.ts';
 import { CHINA_REGION, projectMercator } from '../entry/src/main/ets/core/projection.ts';
 import { MIN_ZOOM_FOR_EXPAND } from '../entry/src/main/ets/core/placement.ts';
 import {
-  BLOCK_FILL, HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, VIEW_PAD_RATIO, arcSpread, arcSpreadNeed, buildScene,
-  fitBounds, fitViewToCanvas, frameBounds, geoAspect, hangBottom, hangOffsets, mapFrame, outlinePath,
-  parseOutline, sceneToSvg, trajectoryOrder, viewZoomOf
+  BLOCK_FILL, HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, PROVINCE_STROKE, PROVINCE_WIDTH, VIEW_PAD_RATIO,
+  arcSpread, arcSpreadNeed, buildScene, fitBounds, fitViewToCanvas, frameBounds, geoAspect, hangBottom,
+  hangOffsets, mapFrame, outlinePath, parseOutline, sceneToSvg, trajectoryOrder, viewZoomOf
 } from '../entry/src/main/ets/core/render.ts';
 import type { MapFrame, ScenePin, WallPhoto } from '../entry/src/main/ets/core/render.ts';
 
@@ -76,6 +76,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
 const AREA_RAW = path.join(REPO, 'entry/src/main/resources/rawfile/china_areas.json');
 const OUTLINE_RAW = path.join(REPO, 'entry/src/main/resources/rawfile/china_outline.json');
+const PROVINCE_RAW = path.join(REPO, 'entry/src/main/resources/rawfile/china_provinces.json');
 
 // ── 参数 ────────────────────────────────────────────────────────────────────
 
@@ -266,8 +267,24 @@ function main(): number {
     }
   }
 
+  // 省界：与国界**同一套机制**（同一个 parseOutline、同一个 outlinePath、同一个 frame），
+  // 只是换颜色与线宽（`PROVINCE_STROKE` / `PROVINCE_WIDTH`，与设备侧共用常量）。
+  // 读不到就退化成"只有国界"，脚本仍然能跑。
+  let provincePath = '';
+  let provinceNote = '（没有 china_provinces.json，本次不画省界）';
+  if (fs.existsSync(PROVINCE_RAW)) {
+    const pd = parseOutline(fs.readFileSync(PROVINCE_RAW, 'utf8'));
+    if (pd === undefined) {
+      provinceNote = '（china_provinces.json 解析失败，本次不画省界）';
+    } else {
+      provincePath = outlinePath(pd.rings, frame);
+      const provRings = provincePath.length === 0 ? 0 : provincePath.split('M').length - 1;
+      provinceNote = `省界 ${provRings}/${pd.rings.length} 环`;
+    }
+  }
+
   const pins: ScenePin[] = buildScene(loaded.photos, frame, o.zoom, { canvasH: o.h, footer: o.footer });
-  let svg = sceneToSvg(pins, o.w, o.h, chinaPath, o.scale);
+  let svg = sceneToSvg(pins, o.w, o.h, chinaPath, o.scale, provincePath);
 
   // 分区：地图框 / 挂载区。挂载区底 = h − footer（图例的地盘不许被卡片压住）。
   const hangBottomPt = hangBottom(frame, { canvasH: o.h, footer: o.footer });
@@ -329,7 +346,7 @@ function main(): number {
   legend.push(`<g id="legend" font-size="6.5" fill="#7A8577">`);
   legend.push(`<text x="8" y="${round2(legendH - 23)}">地图墙预览 ｜ ${pins.length} 钉子 ｜ 轨迹 ${track.length} 点 ｜ 挂出 ${drawn} / 上墙 ${onWall} 张 ｜ 输入 ${total} 张（无地点 ${total - onWall}）</text>`);
   legend.push(`<text x="8" y="${round2(legendH - 12)}">视野 数据 ${dataText}${vb !== undefined ? '(数据)' : '(全国)'} → 铺满 ${boundsText} ｜ 放大 ${round2(zoomData)}×→${round2(zoomFactor)}×</text>`);
-  legend.push(`<text x="8" y="${round2(legendH - 1)}">地图框 ${round2(frame.w)}×${round2(frame.h)}@(${round2(frame.x)},${round2(frame.y)}) 信箱 x${round2(frame.x)} y${round2(frame.y)} ｜ 卡片 ${HANG_PHOTO_W}×${HANG_PHOTO_H} ｜ 地图框外 ${outside.length} ｜ 时间未知 ${undated} ｜ ${escapeText(outlineShort)}</text>`);
+  legend.push(`<text x="8" y="${round2(legendH - 1)}">地图框 ${round2(frame.w)}×${round2(frame.h)}@(${round2(frame.x)},${round2(frame.y)}) 信箱 x${round2(frame.x)} y${round2(frame.y)} ｜ 卡片 ${HANG_PHOTO_W}×${HANG_PHOTO_H} ｜ 地图框外 ${outside.length} ｜ 时间未知 ${undated} ｜ ${escapeText(outlineShort)} ${escapeText(provinceNote)}</text>`);
   legend.push(`</g>`);
   svg = svg.replace('</svg>', legend.join('\n') + '\n</svg>');
 
@@ -366,6 +383,7 @@ function main(): number {
         : '≤ 画布宽 → **填满高度成功**（地图铺满屏幕）')}`);
   console.log(`      挂载区 ${round2(hangTop)}→${round2(hangBottomPt)}pt（${round2(hangBottomPt - hangTop)}pt，${round2(((hangBottomPt - hangTop) / o.h) * 100)}%） ｜ 图例 ${o.footer}pt  zoom=${o.zoom}${o.zoom < MIN_ZOOM_FOR_EXPAND ? '（< 展开阈值，全部收成点）' : ''}`);
   console.log(`国界：${outlineNote}`);
+  console.log(`省界：${provinceNote}　（${PROVINCE_STROKE} ${PROVINCE_WIDTH}pt —— 与国界同色、线宽是它的 ${PROVINCE_WIDTH}/0.8）`);
   console.log(`卡片：${HANG_PHOTO_W}×${HANG_PHOTO_H}pt（挂线留白 ${HANG_GAP}pt）`);
   console.log(`轨迹：${track.length} 个钉子按拍摄时间连线${track.length < 2 ? '（少于 2 个钉子，不成线）' : ''}`);
   console.log(`钉子 ${pins.length} 个（轨迹序 = 时间正序，时间未知的排最后）：`);
