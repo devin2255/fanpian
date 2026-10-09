@@ -59,8 +59,17 @@ import { MAX_HANG } from '../core/placement';
 import { DecisionStore } from '../data/decisionStore';
 import { LocationIndex, LocationEntry } from '../data/locationIndex';
 
-const DOMAIN: number = 0x0000;
+/**
+ * hilog 的 domain。
+ *
+ * 为什么从 `0x0000` 换成 `0x1234`：真机上抓不到这个页面的任何一行日志，而 `0x0000` 是
+ * 系统/保留域（有些版本会把非系统进程往 0x0000 写的行丢掉）。`0x1234` 是应用可自选的普通域。
+ * 同时每条诊断消息都带 `WALLDIAG` 前缀 —— 方便 `hdc shell hilog | findstr WALLDIAG` 一把捞全。
+ */
+const DOMAIN: number = 0x1234;
 const TAG: string = 'WallPage';
+/** 诊断消息前缀（见 DOMAIN 的注释）。 */
+const DIAG: string = 'WALLDIAG';
 const AREA_RAW_NAME: string = 'china_areas.json';
 const OUTLINE_RAW_NAME: string = 'china_outline.json';
 
@@ -108,6 +117,10 @@ struct WallPage {
   @State selName: string = '';       // 面板标题里的地名
   @State selShown: number = 0;       // 该钉子在墙上真正挂出来的张数
   @State selPhotos: WallPhoto[] = []; // 该钉子的**全部**照片（挂出来的 + 没挂出来的）
+  // ── 诊断行（临时）────────────────────────────────────────────────────────────
+  // 真机上抓不到 hilog，所以把同样的数字**画在屏幕上**：用户截一张图就等于把日志交回来了。
+  // 这一行是为了拿 `boxW / boxH / mapH` 的真值（地图为什么小），定位完就该删掉。
+  @State diag: string = '';
 
   private store: DecisionStore = new DecisionStore(getContext(this) as common.UIAbilityContext);
   private idx: LocationIndex = new LocationIndex(getContext(this) as common.UIAbilityContext);
@@ -116,6 +129,7 @@ struct WallPage {
   private outlineData: OutlineData | undefined = undefined;
 
   aboutToAppear(): void {
+    hilog.info(DOMAIN, TAG, '%{public}s', `${DIAG} aboutToAppear：页面进入，开始 load()`);
     this.load();
   }
 
@@ -125,6 +139,7 @@ struct WallPage {
     this.close();
     const walled: string[] = this.store.walledIds();
     this.walledTotal = walled.length;
+    hilog.info(DOMAIN, TAG, '%{public}s', `${DIAG} load 开始：decisions 上墙 ${walled.length} 张（此时画布 ${this.boxW}×${this.boxH}）`);
 
     // 1) 区划数据：buildScene 内部要 nearestCounty 反查地名（退化路径）。
     //    读不到也继续 —— 有 place 的照片不依赖它，没有 place 的会退回坐标标签。
@@ -179,7 +194,9 @@ struct WallPage {
     this.phase = 1;
     this.rebuild();
     hilog.info(DOMAIN, TAG, '%{public}s',
-      `地图墙就绪：上墙 ${walled.length} 张，索引命中 ${photos.length} 张`);
+      `${DIAG} load 结束：上墙 ${walled.length} 张，索引条目命中 ${photos.length} 张`
+      + `，有地点的 ${this.locatedTotal} 张，实挂 ${this.shownTotal} 张`
+      + `，钉子 ${this.pins.length} 个，画布 ${this.boxW}×${this.boxH}`);
   }
 
   /**
@@ -187,7 +204,11 @@ struct WallPage {
    * 画布尺寸没拿到（首帧之前）时什么都不做，等 `onAreaChange` 再来一次。
    */
   private rebuild(): void {
-    if (this.boxW <= 0 || this.boxH <= 0) { return; }
+    if (this.boxW <= 0 || this.boxH <= 0) {
+      hilog.info(DOMAIN, TAG, '%{public}s',
+        `${DIAG} rebuild 跳过：画布还没量到（boxW=${this.boxW} boxH=${this.boxH}）`);
+      return;
+    }
     const mapH: number = mapBoxHeight(this.boxW, CHINA_REGION.bounds);
     this.mapH = mapH;
     const bottom: number = this.boxH - BOTTOM_RESERVE > mapH ? this.boxH - BOTTOM_RESERVE : mapH;
@@ -249,6 +270,16 @@ struct WallPage {
     for (let i = 0; i < pins.length; i++) { located += pins[i].photos.length; }
     this.locatedTotal = located;
     this.shownTotal = shownTotal;
+    // ── 诊断（临时）：真机上抓不到 hilog，所以把同样的数字也画在屏幕上 ──────────
+    // 要的就是这一行的真值：`boxW / boxH` 是 onAreaChange 给的画布，`mapH` 是地图块高，
+    // `pathLen` 是国界 path 的字符数（=0 就说明国界根本没画出来，那是另一类缺陷）。
+    this.diag = `box ${r2(this.boxW)}×${r2(this.boxH)} ｜ mapH ${r2(mapH)}`
+      + ` ｜ pins ${pins.length} ｜ cards ${cards.length} ｜ pathLen ${chinaPath.length}`
+      + ` ｜ 上墙 ${this.walledTotal} 命中 ${located} 实挂 ${shownTotal}`;
+    hilog.info(DOMAIN, TAG, '%{public}s',
+      `${DIAG} rebuild：boxW=${this.boxW} boxH=${this.boxH} mapH=${mapH} bottom=${bottom}`
+      + ` pins=${pins.length} cards=${cards.length} chinaPath.length=${chinaPath.length}`
+      + ` linkPath.length=${this.linkPath.length} walled=${this.walledTotal} located=${located} shown=${shownTotal}`);
     // ── 这里**不许**再写 `this.selIndex = -1` ────────────────────────────────
     // 这行曾经在：`rebuild()` 只在"数据到了"或"画布尺寸变了"时跑，而 `onAreaChange` 每次
     // 画布尺寸变化都会调它（页面刚进来时布局还没稳定 → 会连着跑好几次）。
@@ -369,6 +400,13 @@ struct WallPage {
         // 拿到的宽高是 vp（与 pt 同数值），正是 core/render 需要的画布尺寸
         const w: number = Number(newArea.width);
         const h: number = Number(newArea.height);
+        // **原值先记下来**：`Area.width/height` 的类型是 `Length`（number | string | Resource），
+        // `Number()` 对它是不是可靠只能靠真值说话 —— 这一行会把 `Length` 的原样和转换结果
+        // 一起打出来（`String(...)` 而不是 `Number(...)`，字符串带单位时会原形毕露）。
+        hilog.info(DOMAIN, TAG, '%{public}s',
+          `${DIAG} onAreaChange 原值 w="${String(newArea.width)}" h="${String(newArea.height)}"`
+          + ` → Number 后 ${w}×${h}（旧 ${this.boxW}×${this.boxH}）`
+          + ` 有限=${Number.isFinite(w) && Number.isFinite(h)}`);
         if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0
           && (Math.abs(w - this.boxW) > 0.5 || Math.abs(h - this.boxH) > 0.5)) {
           this.boxW = w;
@@ -381,6 +419,11 @@ struct WallPage {
       if (this.note.length > 0) {
         Text(this.note).fontSize(10).fontColor('#B08A5A')
           .width('100%').padding({ left: 12, right: 12, bottom: 3 })
+      }
+      // ── 诊断行（临时）：让用户截一张图就等于把日志交回来（真机上 hilog 抓不到）──
+      if (this.diag.length > 0) {
+        Text(`诊断 ${this.diag}`).fontSize(9).fontColor('#B08A5A')
+          .width('100%').padding({ left: 12, right: 12, bottom: 2 })
       }
       Text('点钉子或「+N」看它挂着的全部照片').fontSize(10).fontColor('#AAA')
         .width('100%').padding({ left: 12, right: 12, bottom: 8 })
