@@ -18,7 +18,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { parseAreaData, provinces, findCounty } from './areaData.ts';
 import type { CountyHit } from './areaData.ts';
-import { buildAreaTree, hitFromPick, hasPlace, placeSource, formatPlace } from './placePick.ts';
+import { buildAreaTree, hitFromPick, hasPlace, placeSource, formatPlace, nameStopsAtProvince } from './placePick.ts';
 import type { AreaPickNode } from './placePick.ts';
 
 const DATA_URL = new URL('../../resources/rawfile/china_areas.json', import.meta.url);
@@ -263,12 +263,61 @@ test('formatPlace：普通三级 = 省·市·县，且用的就是数据里的**
   assert.equal(s.includes('自治区'), false);
 });
 
-test('formatPlace：直辖市不重复（省=市同名只留一级）', () => {
-  assert.equal(formatPlace(realHit('上海', '上海', '浦东新区')), '上海·浦东新区');
-  assert.equal(formatPlace(realHit('北京', '北京', '东城')), '北京·东城');
+test('formatPlace：直辖市**只到市**，不带区（用户原话："统一到直辖市就行"）', () => {
+  // 用户截图里出现过的三行（北京·东城 / 上海·徐汇 / 天津·和平）现在的产出
+  assert.equal(formatPlace(realHit('北京', '北京', '东城')), '北京');
+  assert.equal(formatPlace(realHit('北京', '北京', '海淀')), '北京');
+  assert.equal(formatPlace(realHit('上海', '上海', '徐汇')), '上海');
+  assert.equal(formatPlace(realHit('上海', '上海', '浦东新区')), '上海');
+  assert.equal(formatPlace(realHit('天津', '天津', '和平')), '天津');
+  assert.equal(formatPlace(realHit('天津', '天津', '滨海新区')), '天津');
+  // 重庆：数据里被上游拆成合成市「重庆城区／重庆郊县」—— 两片都要给出 `重庆`
+  assert.equal(formatPlace(realHit('重庆', '重庆城区', '万州')), '重庆');
+  assert.equal(formatPlace(realHit('重庆', '重庆城区', '渝中')), '重庆');
+  assert.equal(formatPlace(realHit('重庆', '重庆郊县', '城口')), '重庆');
+  assert.equal(formatPlace(realHit('重庆', '重庆郊县', '巫溪')), '重庆');
+  // 反面：这正是要消灭的形态（省·市同名只留一级已经做不到这件事了 —— 重庆的市名不是"重庆"）
+  assert.notEqual(formatPlace(realHit('重庆', '重庆城区', '万州')), '重庆·重庆城区·万州');
+  assert.notEqual(formatPlace(realHit('上海', '上海', '徐汇')), '上海·徐汇');
+  assert.notEqual(formatPlace(realHit('北京', '北京', '东城')), '北京·北京·东城');
+});
+
+test('nameStopsAtProvince：真实数据 35 个省里恰好 7 个为真（逐省钉死，防止判据静默漂移）', () => {
+  const fired: string[] = [];
+  const notFired: string[] = [];
+  const all: string[] = provinces();
+  for (let i = 0; i < all.length; i++) {
+    if (nameStopsAtProvince(all[i])) { fired.push(all[i]); } else { notFired.push(all[i]); }
+  }
+  // 这 4 个是**用户要求**的直辖市；香港/澳门/国外本来就产出同一个字符串（见下一条测试）
+  assert.deepEqual(fired, ['北京', '天津', '上海', '重庆', '香港', '澳门', '国外']);
+  assert.equal(all.length, 35);
+  assert.equal(notFired.length, 28);
+  // 吉林是"前缀陷阱"：吉林市以"吉林"开头，但吉林还有长春 → 必须为 false，否则会丢掉市名
+  assert.equal(nameStopsAtProvince('吉林'), false);
+  assert.equal(nameStopsAtProvince('河北'), false);
+  assert.equal(nameStopsAtProvince('新疆'), false);
+  // 退化路径：空名字 / 数据里没有的省 → false（**不能**把普通省误判成直辖市）
+  assert.equal(nameStopsAtProvince(''), false);
+  assert.equal(nameStopsAtProvince('   '), false);
+  assert.equal(nameStopsAtProvince('不存在的省'), false);
+});
+
+test('formatPlace：港澳与"国外"的产出**逐字不变**（本批只动直辖市，不动它们）', () => {
+  // 三级同名 → 改动前就是这一个名字；判据换了，字符串必须一个字节都没变
+  assert.equal(formatPlace(realHit('香港', '香港', '香港')), '香港');
+  assert.equal(formatPlace(realHit('澳门', '澳门', '澳门')), '澳门');
+});
+
+test('formatPlace：直辖市不重复（省=市同名只留一级）且"直筒子市"形态**未受影响**', () => {
+  // 港澳：省=市=县 三级全同名 → 只剩一个名字
+  assert.equal(formatPlace(realHit('香港', '香港', '香港')), '香港');
+  assert.equal(formatPlace(realHit('澳门', '澳门', '澳门')), '澳门');
   // 反面：这正是要消灭的形态
   assert.notEqual(formatPlace(realHit('上海', '上海', '浦东新区')), '上海·上海·浦东新区');
   assert.notEqual(formatPlace(realHit('北京', '北京', '东城')), '北京·北京·东城');
+  // 直筒子市（市=县同名，**非直辖市**）：用户没反对，本批**不动** —— 仍然是"省·市"
+  assert.equal(formatPlace(realHit('广东', '东莞', '东莞')), '广东·东莞');
 });
 
 test('formatPlace：单名县（市=县同名）只留一级 —— 这是一整类，不是孤例', () => {
@@ -280,16 +329,18 @@ test('formatPlace：单名县（市=县同名）只留一级 —— 这是一整
   assert.equal(formatPlace(realHit('澳门', '澳门', '澳门')), '澳门');
 });
 
-test('formatPlace：只合并**全等**的相邻级，不同名一律保留（吉林 vs 吉林市、重庆 vs 重庆城区）', () => {
-  // 数据里唯一带"市"后缀的市名：与省名"吉林"不同名字 → 两级都要在
+test('formatPlace：只合并**全等**的相邻级，不同名一律保留（吉林 vs 吉林市）', () => {
+  // 数据里唯一带"市"后缀的市名：与省名"吉林"不同名字 → 两级都要在。
+  // 这一条也是 `nameStopsAtProvince` 那个"全称判据"的**反证**：若判据写成
+  // "市名以省名开头就合并"，`吉林·吉林市·永吉` 会退化成 `吉林` —— 这里会红。
   assert.equal(formatPlace(realHit('吉林', '吉林市', '永吉')), '吉林·吉林市·永吉');
-  // 上游把重庆拆成合成市"重庆城区/重庆郊县"：不是重复，原样保留（城/郊 的信息有用）
-  assert.equal(formatPlace(realHit('重庆', '重庆城区', '万州')), '重庆·重庆城区·万州');
+  assert.equal(formatPlace(realHit('吉林', '长春', '农安')), '吉林·长春·农安');
 });
 
-test('formatPlace：对**全部 2851** 个可落点县都不丢县名、不出现相邻重复、不无中生有', () => {
+test('formatPlace：对**全部 2851** 个可落点县都不出现相邻重复、不无中生有，直辖市恰好只给省名', () => {
   let cityEqProv = 0;      // 省=市同名的叶子（直辖市/港澳那一类）
   let countyEqCity = 0;    // 市=县同名的叶子（东莞那一类）
+  let municipalityLeaves = 0;   // 落在"只给省名"那一支上的叶子
   for (let i = 0; i < FLAT.length; i++) {
     const t = FLAT[i];
     const hit = findCounty(t[0], t[1], t[2]);
@@ -297,13 +348,21 @@ test('formatPlace：对**全部 2851** 个可落点县都不丢县名、不出�
     const h = hit as CountyHit;
     const s = formatPlace(h);
     const segs = s.split('·');
+    const municipal = nameStopsAtProvince(h.province);
 
-    // a) 非空，且**一定包含县名**（"至少要有县/区名"这条硬要求在合并/不合并两种情形下都成立）
+    // a) 非空
     assert.ok(s.length > 0, `空显示名：${t.join('/')}`);
-    assert.ok(s.includes(h.county), `显示名里没有县名：${s} ← ${t.join('/')}`);
-    // b) 最多三级，且以省名开头
-    assert.ok(segs.length >= 1 && segs.length <= 3, `级数异常 ${segs.length}: ${s}`);
-    assert.equal(segs[0], h.province, `第一级必须是省名：${s}`);
+    // a2) **含县名**这条老不变量只对非直辖市成立（规则 0 有意打破它：直辖市不带区名）
+    if (municipal) {
+      municipalityLeaves++;
+      assert.equal(s, h.province, `直辖市应只给省名：${s} ← ${t.join('/')}`);
+      assert.equal(segs.length, 1, `直辖市只有一级：${s}`);
+    } else {
+      assert.ok(s.includes(h.county), `显示名里没有县名：${s} ← ${t.join('/')}`);
+      // b) 最多三级，且以省名开头
+      assert.ok(segs.length >= 1 && segs.length <= 3, `级数异常 ${segs.length}: ${s}`);
+      assert.equal(segs[0], h.province, `第一级必须是省名：${s}`);
+    }
     // c) 相邻级不得相同
     for (let k = 1; k < segs.length; k++) {
       assert.notEqual(segs[k], segs[k - 1], `相邻级重复：${s} ← ${t.join('/')}`);
@@ -324,6 +383,9 @@ test('formatPlace：对**全部 2851** 个可落点县都不丢县名、不出�
   assert.equal(cityEqProv, 50, '省=市同名的叶子数（北京16+天津16+上海16+香港1+澳门1）');
   assert.equal(countyEqCity, 37, '市=县同名的叶子数（东莞/中山/仙桃/潜江/天门/济源/嘉峪关/' +
     '海南12个省直辖县/新疆13个兵团市/香港/澳门）');
+  // 规则 0 的覆盖面：直辖市 48 个叶子（北京16+天津16+上海16）+ 重庆 37 个（城区25+郊县12）
+  // + 香港1 + 澳门1 = 87。**重庆那 37 个正是"只按省==市判定"会漏掉的部分**。
+  assert.equal(municipalityLeaves, 87, '落在"只给省名"那一支上的叶子数（48 直辖市 + 37 重庆 + 港澳2）');
   // 反查一下"市=县同名"确实**不是孤例**（本规则要是只为东莞写，就不该有 37 条命中）
   assert.ok(countyEqCity > 10, '若这个数掉到个位数，说明数据源换了，规则 2 需要重新评审');
 });
@@ -337,6 +399,8 @@ test('formatPlace：纯函数（同输入同输出、不改动入参、不共享
   assert.equal(JSON.stringify(h), snapshot, 'formatPlace 不得改动入参');
   // 另一条独立来的同一个县：结果必须逐字相同（没有依赖调用顺序/缓存）
   assert.equal(formatPlace(realHit('河北', '石家庄', '正定')), a);
+  // 直辖市那一支也是纯的
+  assert.equal(formatPlace(realHit('北京', '北京', '东城')), formatPlace(realHit('北京', '北京', '海淀')));
 });
 
 test('formatPlace：空名字的级跳过，三级全空给空串（调用方按"没有名字"处理）', () => {
