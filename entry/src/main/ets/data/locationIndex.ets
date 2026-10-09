@@ -16,6 +16,23 @@ import { readExif } from './exifReader';
 const DOMAIN = 0x0000;
 const TAG = 'PhotoWall';
 
+/**
+ * 把 catch 到的值转成一行可打印文本。**本文件所有告警都用它**。
+ *
+ * 为什么需要它：ArkTS 禁 `any`，catch 参数不能当 any 用，要取 `message` 必须显式转换；
+ * 同时又**不能假设抛出来的都是 Error**（fileIo 抛的是 BusinessError —— 它是 Error 的子类，
+ * 但 SDK 违约路径上什么都可能抛）。非 Error 时退化成 `JSON.stringify(e)`：
+ * 至少保证日志里留下一行能搜的东西，而不是 `undefined`。
+ *
+ * 只打 message 不打 code 是够的：fileIo 的 BusinessError 把 errno 描述直接写在 message 里
+ *（13900025 → "No space left on device"），区分「磁盘满」与「I/O 错误」不需要再取 code
+ *（取 code 要 import BusinessError，见本文件写侧不做多余 import 的取舍）。
+ */
+function errText(e: Object): string {
+  if (e instanceof Error) { return e.message; }
+  return JSON.stringify(e);
+}
+
 export interface LocationEntry {
   photoId: string;   // 就是照片 URI（选图器回传的 photoId 与 thumbUri 同源）
   lat: number;       // 十进制度；与 lon 同时为 0 = 没有 GPS（读不到或照片本来没记录）
@@ -83,16 +100,26 @@ export class LocationIndex {
       const parsed = JSON.parse(text) as LocationEntry[];
       // 数据边界层校验（Ruling 18 同类要求）：外部文件不得静默通过。
       if (!Array.isArray(parsed)) {
-        hilog.warn(DOMAIN, TAG, '%{public}s', 'locations.json 不是数组，已按空索引处理');
+        // 不是异常、没有 e 可打：带上**实际类型**，否则真机上只能看到一句"不是数组"。
+        // （`JSON.parse('null')` 与 `'"x"'` 都落在这一支，两者要能分开。）
+        hilog.warn(DOMAIN, TAG, '%{public}s',
+          `locations.json 顶层不是数组（实际是 ${typeof parsed}），已按空索引处理`);
         return [];
       }
       const out: LocationEntry[] = [];
       let skipped = 0;
+      // 跳过有两种成因，分开计数：真机上"有 12 条非法"没法下手，得知道是整条为 null
+      // 还是 photoId 缺失（后者通常意味着写入方改了字段名）。
+      let skippedNoId = 0;
       for (let i = 0; i < parsed.length; i++) {
         const e = parsed[i];
         if (e === null || e === undefined) { skipped = skipped + 1; continue; }
         // photoId 是索引的键：没有它这条记录无法归属到任何照片，只能整条丢掉。
-        if (typeof e.photoId !== 'string' || e.photoId === '') { skipped = skipped + 1; continue; }
+        if (typeof e.photoId !== 'string' || e.photoId === '') {
+          skipped = skipped + 1;
+          skippedNoId = skippedNoId + 1;
+          continue;
+        }
         // 坐标与时间是**可选**信息：非有限数一律置 0，**不跳过整条** ——
         // 没有 GPS 是照片的常态（截图、关闭定位时拍的），不是数据损坏。
         // 置 0 而不是保留 NaN，是因为 NaN 经 JSON.stringify 会写成 null，读回来又是 0，两轮不一致。
@@ -104,17 +131,28 @@ export class LocationIndex {
         });
       }
       if (skipped > 0) {
-        hilog.warn(DOMAIN, TAG, '%{public}s', `地点索引中有 ${skipped} 条非法记录，已跳过`);
+        // 这一处不是异常、拿不到 e：给**分类计数**当上下文（见上面两个计数器的注释）。
+        hilog.warn(DOMAIN, TAG, '%{public}s',
+          `地点索引中有 ${skipped} 条非法记录，已跳过（其中 ${skippedNoId} 条 photoId 缺失/非字符串，` +
+          `${skipped - skippedNoId} 条整条为 null/undefined）`);
       }
       return out;
     } catch (e) {
-      hilog.warn(DOMAIN, TAG, '%{public}s', '地点索引文件存在但读取/解析失败，已按空索引处理');
+      // 必须带 e：这一支的四种成因（JSON 语法错、编码错、短读越界、fileIo 报错）
+      // 在日志里长得一模一样，只有 e.message 能分开 —— 而它正是"索引为什么空了"的答案。
+      hilog.warn(DOMAIN, TAG, '%{public}s', `地点索引文件存在但读取/解析失败，已按空索引处理: ${errText(e)}`);
       return [];
     }
   }
 
   /**
    * 原子写：先写 `.tmp`，再 rename 覆盖；写到一半失败不会留下半个文件（内部只告警不抛错）。
+   *
+   * **rename 只在 writeSync 的返回值等于 payload 的 UTF-8 字节数时才执行**：
+   * 短写（POSIX 语义下 ENOSPC 等可以短计数而**不抛**）若不检出，截断的 `.tmp` 会覆盖掉
+   * 一份好索引 → 下次 `load()` 的 JSON.parse 抛错 → 告警 → 返回空索引 → 地图墙空白，
+   * 而用户会以为"照片都没 GPS"（正是读侧短读要防的那个最坏后果，换到了写侧）。
+   *
    * 失败时可能残留一个 `locations.json.tmp`：无害，下次 save 用 TRUNC 打开它即被覆盖。
    */
   save(list: LocationEntry[]): void {
@@ -124,20 +162,35 @@ export class LocationIndex {
       const file = fileIo.openSync(tmp,
         fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
       try {
-        fileIo.writeSync(file.fd, JSON.stringify(list));
+        const payload: string = JSON.stringify(list);
+        // 必须按**字节数**比对，不是 payload.length —— 非 ASCII 的 photoId 会让两者不等。
+        // 短写若不检出，截断的 .tmp 会覆盖掉好索引，下次 load() 解析失败 → 空索引 → 地图空白
+        //（读侧已修的同一个最坏后果，换到了写侧）。
+        const want: number = buffer.from(payload).length;
+        const w: number = fileIo.writeSync(file.fd, payload);
+        if (w !== want) {
+          // 抛进 catch：于是**不会**执行下面的 renameSync，盘上的好索引原封不动。
+          throw new Error(`writeSync 短写：期望 ${want} 字节，实际写入 ${w} 字节`);
+        }
       } finally {
+        // 保持不动：无论上面抛不抛，句柄都在这里关掉（短写路径也要关，否则泄漏 fd）。
         fileIo.closeSync(file);
       }
+      // 只有上面**没抛**（即 w === want）才可能走到这一行 —— 这就是"绝不拿截断的 .tmp 覆盖好索引"。
       fileIo.renameSync(tmp, locationIndexPath(dir));
     } catch (e) {
-      hilog.warn(DOMAIN, TAG, '%{public}s', '地点索引落盘失败');
+      hilog.warn(DOMAIN, TAG, '%{public}s', `地点索引落盘失败: ${errText(e)}`);
     }
   }
 
   /**
    * 增量构建：只读 `uris` 里**索引还没有**的那些，读到的并入内存，最后**一次性** save。
    *
-   * @param uris 关心的照片 URI（通常是本次会话的队列）。可含重复项，也允许含已索引的项。
+   * @param uris 关心的照片 URI = **整个已授权池**（`ClaimStore.load()` 里的**全部** `photoId`），
+   *        **不是**本次会话抽中的那几十张。必须传整池：地图墙（Task 10）要渲染**全部**照片，
+   *        只索引一局会让**未抽中**的那些照片在地图上消失 —— 那正是批 26 修掉的缺陷
+   *        （当时的 @param 写的是"通常是本次会话的队列"，照它传 `session.queue` 就会复现）。
+   *        可含重复项，也允许含已索引的项。
    * @param onProgress 每读完一张回调一次 `(已完成, 本批待读总数)`；不传就不回调。
    *        它是 UI 侧唯一能知道"还要多久"的入口（本方法刻意不碰任何 UI 状态）。
    * @returns 合并后的全量索引（顺序 = 原有条目在前、本批新读的在后）。
@@ -174,14 +227,20 @@ export class LocationIndex {
       hilog.info(DOMAIN, TAG, '%{public}s', '地点索引正在构建中，本次调用跳过（返回当前盘上的索引）');
       return this.load();
     }
-    // 上面的「检查」与这里的「置位」之间**没有 await**：单线程事件循环下这一段是原子的，
+    // 上面的「检查」与下面的「置位」之间**没有 await**：单线程事件循环下这一段是原子的，
     // 两次并发调用不可能同时通过检查 —— 这正是这个标记成立的全部依据，不要在其中插入异步。
-    building = true;
-    // 从调用 doBuild 到 `pendingBuild = run` 之间**同样没有 await**：所以"看得见 building 为真"
-    // 的观察者一定也看得见 pendingBuild 非空（awaitIdle 的循环依赖这一点，它另有防御条件）。
-    const run: Promise<LocationEntry[]> = this.doBuild(uris, onProgress);
-    pendingBuild = run;
+    //
+    // **置位必须是 try 的第一行**（不是 try 之前）：否则将来若有语句插在置位与 try 之间并抛错，
+    // `building` 就**永久为真** —— 之后每次 buildFrom 都走上头的"并发快照"分支秒回，
+    // awaitIdle 因 while 条件立即为假而直接返回，症状是**静默"少照片"且永不报错**
+    //（比"并发写坏一次、下次重建"严重得多：它是永久性的）。放进 try 后，任何抛错都经过 finally 复位。
     try {
+      building = true;
+      // 从 `building = true` 到 `pendingBuild = run` 之间**同样没有 await**（两者都在 try 内、
+      // 都在第一个 await 之前）：所以"看得见 building 为真"的观察者一定也看得见 pendingBuild 非空
+      //（awaitIdle 的循环依赖这一点，它另有防御条件）。
+      const run: Promise<LocationEntry[]> = this.doBuild(uris, onProgress);
+      pendingBuild = run;
       return await run;
     } finally {
       // **必须**放 finally：一旦某次构建抛错而标记没复位，索引就永远无法再构建了
@@ -214,7 +273,10 @@ export class LocationIndex {
         // 别人构建失败**不该**让 awaitIdle 抛错：否则地图页会因为一次与它无关的失败而白屏。
         // 吞掉即可 —— finally 已经把 building 复位，下一轮循环条件必为假、正常退出，
         // 调用方拿到的是"此刻盘上有什么"（与并发时 buildFrom 的返回值同一语义，不是错误）。
-        hilog.warn(DOMAIN, TAG, '%{public}s', '等待地点索引构建时，正在进行的构建失败（已忽略，返回盘上索引）');
+        // 但要带上 e：这是"构建为什么失败"唯一能被记下来的地方（少了它，真机上只剩
+        // 一句"构建失败"，与"什么都没读到"无法区分）。
+        hilog.warn(DOMAIN, TAG, '%{public}s',
+          `等待地点索引构建时，正在进行的构建失败（已忽略，返回盘上索引）: ${errText(e)}`);
       }
     }
     // 从"循环条件为假"到这里**没有 await**：单线程事件循环下，「确认没人构建」与「读盘」
