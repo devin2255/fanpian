@@ -468,26 +468,18 @@ export struct CardStack {
 
   /** 「主页面」= 回首页（认领页）。导航出口，不产生决策，所以不走 commit()、也不写 decidedId。 */
   private tapHome(): void {
-    // 闸门口径与其余三个按钮（commit）和「上一张」（tapNav）**完全一致**，两条都要：
+    // 闸门口径与其余三个按钮（归档 / 上墙 / 收藏，统一走 commit）**完全一致**，两条都要：
     //   - animating：翻出动画期间卡片视觉上已经飞走、而 idx 还要等 navOut 的 210ms 回调才推进，
     //     这段窗口里点「主页面」会让用户在「下一张正在就位」的中途离开这一页 —— 该点按落在
     //     哪一张的语义不确定（他们可能是想对下一张做决定）。与按钮闸门同一取舍：动画期间一律不受理。
     //   - isGestureVoided()：正在拖这张卡的那根手指（另一根手指点按钮）会让「这次点按属于哪张」
-    //     同样不确定；与 commit/tapNav 同口径。
+    //     同样不确定；与 commit 同口径。
     if (this.animating) { return; }
     if (this.isGestureVoided()) { return; }
     // 不调用 endSpringWindow()、不归零 dx/dy：那两件事是「这张卡到此为止」的收尾，而回首页
     // 不改这张卡的状态 —— 页面紧接着就退出，未落盘的决策由 SwipePage.onPageHide/aboutToDisappear
     // 的 flushSave() 收尾（见 pages/SwipePage.ets），不依赖这里做任何状态清理。
     this.onHome();
-  }
-
-  /** 「上一张」= 下滑手势的同一个出口（队列边界时点了不响应：不播动画、不计指标）。 */
-  private tapNav(dir: number): void {
-    if (this.animating) { return; }
-    if (this.isGestureVoided()) { return; }
-    if (!this.canNav(dir)) { return; }
-    this.navOut(dir);
   }
 
   /**
