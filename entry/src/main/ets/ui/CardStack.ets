@@ -103,7 +103,8 @@ export struct CardStack {
   // 判据 1 的时限。光看 photoId 恒等分不清「窗口」与「陈旧」—— 「点击 → 换卡」那一帧内
   // item 就是这张，而「← 返回上一张」回到同一张之后 item 又是这张（见 isGestureVoided）。
   private decidedDuringGesture: boolean = false;
-  // 本次手势「是在哪张卡上开始的」：onActionStart 里无条件记录，每次新手势刷新。
+  // 本次手势「是在哪张卡上开始的」：onActionStart 里无条件记录（每次新手势刷新），
+  // 手势结束时由 onActionEnd 清空 —— 它必须只在手势在途期间非空，见 isGestureVoided 判据 2。
   // 作废判据必须依据它，而不是 this.item.photoId —— 定案/翻页后父组件重渲染会在约一帧内
   // 把 @Prop item 换成另一张，此后 item.photoId 已经不是那张卡了，而在途手势仍属于它：
   // 拿 item 去比会漏掉这个手势，那正是本缺陷的形态（手指会在换卡之后继续产生几百毫秒的 update）。
@@ -167,7 +168,8 @@ export struct CardStack {
    *   2) 手势起点卡已不是当前显示的那张 —— 换卡本身即作废。它让作废跨过换卡继续有效，
    *      并覆盖「decidedId 被下一次定案覆盖」的情形（两指连点两次按钮：第二次把
    *      decidedId 写成新卡后，判据 1 就认不出第一根手指的在途手势了）；而且不可逆 ——
-   *      起点卡再也回不到当前位，所以一个被作废的手势终生作废。这正是不必在
+   *      起点卡再也回不到当前位，所以一个被作废的手势在它自己结束之前始终作废
+   *      （手势结束即由 onActionEnd 清空 gestureId，此后判据 2 不再说话）。这正是不必在
    *      onActionStart 早退的前提：基线照常刷新，但刷新的基线永远用不到决策上。
    * 判据一律看「手势起点」而不是「当前显示的那张」：定案/翻页后约一帧内 item 就会换成
    * 另一张，用 item 比对会漏掉在途手势（它属于旧卡），那个漏网正是本缺陷的形态。
@@ -243,7 +245,20 @@ export struct CardStack {
             this.lastT = now;
             this.dy = e.offsetY;   // 只跟手写 dy：横向（dx）在本模型下没有写入路径
           })
-          .onActionEnd((e: GestureEvent) => { this.settle(); })
+          .onActionEnd((e: GestureEvent) => {
+            // 顺序不可颠倒：settle() 要靠 gestureId 判定「这次手势该不该作废」，
+            // 先清空等于抽掉它唯一的判据（见 isGestureVoided 判据 2）。
+            this.settle();
+            // 手势已结束：清掉「手势起点」记录。
+            // 不清的后果是主流程可达的按钮全失效 —— gestureId 的语义是「本次手势的起点」，
+            // 而按钮点击不产生手势，于是上滑 A→B 后 gestureId 仍停在 A，
+            // 判据 2（gestureId !== item.photoId）对 B 上的任何按钮点击恒真 → 点了没反应，
+            // 直到用户在卡上再拖一次（≥5vp）才刷新。手势结束即作废判据的生命周期终点。
+            this.gestureId = '';
+            // **不**在此清 decidedDuringGesture：判据 1 要求 gestureId === decidedId ≠ ''，
+            // 而上面刚把 gestureId 清空 —— 手势结束后它已无读取者，清它是无读者的冗余写入。
+            // 它的生命周期由 onActionStart（清）与 commit（置真）划定，不再加第三个写入点。
+          })
       )
 
       // 四个按钮：卡片外侧、卡片下方一行等分（layoutWeight(1)）。位置取舍见 M1 报告：
