@@ -46,12 +46,21 @@ struct SwipePage {
       const d = existing.get(p.photoId);
       return d === undefined || d.state === 'unseen';
     });
-    // 注意：不能写成 .map((p) => ({ ... })) —— 对象字面量在 map 回调里
-    // 拿不到显式声明的类型，ArkTS 会报 arkts-no-untyped-obj-literals。
-    const q: QueueItem[] = fresh.map((p): QueueItem => {
-      const one: QueueItem = { photoId: p.photoId, thumbUri: p.photoId };
-      return one;
-    });
+    // 去重：同一 photoId 只留一张。重复项会让卡片队列出现幽灵项（同一张被滑掉后又出现一次），
+    // 而 handle() 的去重是「已决策就跳过」—— 旧版那里只 return 不推进 idx（硬锁），
+    // 此处是第一道防线，让重复项根本不进队列。保留首次出现的位置（去重不改变相对顺序）。
+    // 写成显式循环 + 显式类型的 one: QueueItem，而不是 fresh.map((p) => ({ ... }))：
+    // 对象字面量在箭头函数里**直接返回**时拿不到显式声明的类型，
+    // ArkTS 会报 arkts-no-untyped-obj-literals（本文件原先的注释记的就是这条约束）。
+    const seen: Set<string> = new Set();
+    const q: QueueItem[] = [];
+    for (let i = 0; i < fresh.length; i++) {
+      const pid = fresh[i].photoId;
+      if (seen.has(pid)) { continue; }
+      seen.add(pid);
+      const one: QueueItem = { photoId: pid, thumbUri: pid };
+      q.push(one);
+    }
     // 真实实现：用 EXIF 拍摄时间排序（Task 9），这里先按认领顺序倒序
     this.items = q.reverse();
     this.idx = 0;
@@ -193,9 +202,23 @@ struct SwipePage {
     if (rolledBack) { return; }   // 回弹不消耗队列
 
     // 第二道防线：同一张照片在一次队列里只应被决策一次。
-    // 重复上报会让 idx 连跳、静默跳过照片（按钮与手势两条路径并发时可达：
-    // 翻页的 210ms 翻出窗口由 CardStack 的 animating 闸门挡住；动作按钮在同一帧内被点两次
-    // ——例如两指同点——则 @Prop item 要到下一帧才更新，第二次仍带着旧 photoId 进来）。
+    // 走到这里有两种来源，它们要的 idx 行为**正好相反**，所以不能一律 return：
+    //   (a) 同一次决策被重复上报：翻页的 210ms 翻出窗口由 CardStack 的 animating 闸门挡住；
+    //       动作按钮在同一帧内被点两次（例如两指同点）时 @Prop item 要到下一帧才更新，
+    //       第二次仍带着**旧 photoId** 进来。这条路上第一条事件已经推进过 idx，再推进就会
+    //       静默跳过一张**未决策**的照片（队列少一张、「剩余」多减一）。
+    //   (b) 同一张因**重复入队**再次出现（例如认领时预选项回传的 URI 与首次认领形式不同，
+    //       core/claim.ts 的 mergeBatch 按 URI 全等去重会失效）：第一次滑掉它时 idx 已经前进，
+    //       第二次出现时它必然已被决策。若这里只 return 不推进，卡片动画照播而序号不动
+    //       → 同一张无限循环、四个按钮看似失效 = **硬锁**（与刚修完的 decidedId 自锁同类）。
+    //       重复入队必须是可自愈的：推进 idx 把它跳过，用户无感。
+    // 判据 = **上报的 photoId 是否仍是当前槽位那张**：是 → 队列把已决策的照片又发了一次，
+    // 跳过并前进（自愈）；不是 → 这是对上一张的陈旧重复上报，只 return 不推进。
+    // 安全性（可证）：只有「当前槽位那张**已被决策**」时才推进，所以被跳过的必定是已决策项，
+    // 这条路径不可能吃掉一张未决策的照片。
+    // 顺带守住 idx 边界：idx 已到队尾（items[idx] 不存在）时一律不推进，否则 idx 会超过
+    // items.length —— 顶部会显示「剩余 -1」，且完成态的「← 返回上一张」（判据 idx > 0）
+    // 会去读 items[idx-1] 而越界。
     // 判据用 state !== 'unseen' 而不是「是否出现过」：core/queue.ts 的 defer 会把照片
     // 重置回 'unseen'（applyDecision 的 skip 分支）——那是有意的重新决策，不能被挡住。
     // 本批只做 fav/archive/wall，SwipePage 不产生 skip/unfav（nextAction 的取值被收窄成三值、
@@ -207,6 +230,12 @@ struct SwipePage {
     // 已不参与滑动口径（见 core/metrics.ts），故不会污染回弹率与中位数。
     const already = this.decisions.get(photoId);
     if (already !== undefined && already.state !== 'unseen') {
+      const atSlot: string = this.idx < this.items.length ? this.items[this.idx].photoId : '';
+      if (atSlot === photoId) {
+        this.idx = this.idx + 1;
+        // 必须重置：否则下一张的「决策耗时」会从这张的显示时刻起算，污染 medianDecisionMs
+        this.shownAt = Date.now();
+      }
       return;
     }
 

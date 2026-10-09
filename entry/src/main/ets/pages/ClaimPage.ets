@@ -88,9 +88,17 @@ struct ClaimPage {
       }
       const uris: string[] = await pickPhotos(undecided);
       if (uris.length === 0) { this.msg = '没有选中照片'; return; }
+      // 「认领前」的张数直接复用上面那次 load 的结果（claimed），不再读一次盘：
+      // addBatch 内部已经要 load() 一次，这里再 load 就是第三次全量读。
+      // 预选功能让「点完成但不加新照片」成为高频路径：此时 uris 是回传的**全部**张数
+      // （含早已认领的），按 uris.length 播报会高报成「本次认领 10 张」而实际一张都没新增。
+      const before = claimed.photos.length;
       const next = this.store.addBatch(uris, Date.now());
+      const added = next.photos.length - before;   // 真正新增的张数
       this.claimed = next.photos.length;
-      this.msg = `本次认领 ${uris.length} 张，累计 ${next.photos.length} 张`;
+      this.msg = added > 0
+        ? `本次认领 ${added} 张，累计 ${next.photos.length} 张`
+        : `没有新增（这 ${next.photos.length} 张都在队列里了）`;
     } catch (e) {
       const err = e as BusinessError;
       this.msg = `认领失败：${err.code} ${err.message}`;
