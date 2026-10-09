@@ -61,6 +61,18 @@ export struct CardStack {
   @State dx: number = 0;
   @State dy: number = 0;
   @State animating: boolean = false;   // 飞出动画期间为真，作为手势闸门（Ruling 27）；回弹不计入
+  // 已经上报过决策的那张照片（当前只有「上墙」按钮在这条路径上当场记录）。
+  // 上墙**不**设 animating —— 它要立即上报、不走 flyOut 的 230ms 延迟，所以多指场景下
+  // 「另一根手指在途的拖拽」会在 idx 已前进后继续写 dx，抬手时 settle() 会以**新**
+  // photoId 上报 → 用户没打算决定的那张被静默消耗。这张记录是否让某个手势作废，
+  // 由 isGestureVoided() 按「手势起点」判定（见该方法的说明）。
+  private decidedId: string = '';
+  // 本次手势「是在哪张卡上开始的」：onActionStart 里无条件记录，每次新手势刷新。
+  // 作废判据必须依据它，而不是 this.item.photoId —— 定案后父组件重渲染会在约一帧内
+  // 把 @Prop item 换成下一张（见「上墙」按钮注释里「同一帧内点两次 item 尚未更新」
+  // 那段），此后 item.photoId 已经不是那张卡了，而在途手势仍属于它：拿 item 去比会
+  // 漏掉这个手势，那正是本缺陷的形态（手指会在换卡之后继续产生几百毫秒的 update）。
+  private gestureId: string = '';
   private lastX: number = 0;
   private lastT: number = 0;
   private velocity: number = 0;
@@ -93,6 +105,28 @@ export struct CardStack {
       clearTimeout(this.springTimer);
       this.springTimer = -1;
     }
+  }
+
+  /**
+   * 这个手势是否已作废（不得再写 dx/dy，也不得在 settle() 里上报）。
+   * 两条互补判据，缺一不可：
+   *   1) 手势起点卡就是刚定案的那张 —— 上墙路径必须**当场**作废：从按钮点击到 @Prop item
+   *      换卡之间还隔着约一帧，在途手指能在这段窗口里把 dx 写歪，而按钮刚显式归过零
+   *      （见按钮 onClick 里「先把位移归零」那段）。
+   *   2) 手势起点卡已不是当前显示的那张 —— 换卡本身即作废。它让作废跨过换卡继续有效，
+   *      并覆盖「decidedId 被下一次定案覆盖」的情形（两指连点两次上墙：第二次把
+   *      decidedId 写成新卡后，判据 1 就认不出第一根手指的在途手势了）；而且不可逆 ——
+   *      起点卡再也回不到当前位，所以一个被作废的手势终生作废。这正是不必在
+   *      onActionStart 早退的前提：基线照常刷新，但刷新的基线永远用不到决策上。
+   * 判据一律看「手势起点」而不是「当前显示的那张」：定案后约一帧内 item 就会换成下一张，
+   * 用 item 比对会漏掉在途手势（它属于旧卡），那个漏网正是本缺陷的形态。
+   * 空字符串表示「还没有记录」：此时不作废 —— 宁可少作废也不误作废，
+   * 误作废会让这一页的手势整段失灵。
+   */
+  private isGestureVoided(): boolean {
+    if (this.decidedId !== '' && this.gestureId === this.decidedId) { return true; }
+    if (this.gestureId !== '' && this.gestureId !== this.item.photoId) { return true; }
+    return false;
   }
 
   build() {
@@ -138,6 +172,10 @@ export struct CardStack {
             // 而这里要立即上报。所以上面这段只是把拖到一半的偏移弹回去，不涉及 animating；
             // 按钮在同一帧内被点两次（两指同点）时 @Prop item 尚未更新、第二次仍带着旧
             // photoId，这种重复由 SwipePage.handle() 的同 photoId 去重兜住。
+            // 但「另一根手指还在拖这张卡」不同：idx 前进后它会以**新** photoId 上报，
+            // 同 photoId 去重拦不住。所以定案必须当场记下，与上报同一个同步块 ——
+            // 且必须在 onDecide 之前：onDecide 会同步推进 idx，之后 item 就不再是这张卡了。
+            this.decidedId = this.item.photoId;
             const out: SwipeWall = { kind: 'wall' };
             this.onDecide(this.item.photoId, out);
           })
@@ -157,12 +195,24 @@ export struct CardStack {
           // 上一次手势的 lastX/lastT，解禁后的首个 update 用陈旧基线算出巨大的
           // 伪速度（|Δ| > 800），使新卡片在几十 vp 拖动下被误判 fav/archive。
           // 闸门职责由 onActionUpdate 与 settle() 承担，这里不早退。
+          // 同理，作废也不在这里早退 —— 本回调是唯一刷新 lastX/lastT 与 gestureId 的地方：
+          //   (a) 跳过基线刷新：一旦「闸门在两次手势之间解除」，解禁后的首个 update 就会用
+          //       陈旧基线算伪速度（上一条注释讲的泄漏会原样重演）；
+          //   (b) 跳过 gestureId 刷新：作废会自持 —— gestureId 停在旧卡、item 已是新卡，
+          //       判据 2 恒真，连新手势也在守卫处被挡，gestureId 再也刷不了
+          //       → 整页手势永久死锁（与 flyOut 的 try/finally 要避免的死锁同类）。
+          // 作废只在 update/settle 两道出口上按 isGestureVoided() 判定，基线照常刷新即可。
+          this.gestureId = this.item.photoId;   // 手势归属：本手势是在这张卡上开始的
           this.lastX = e.offsetX;
           this.lastT = Date.now();
           this.velocity = 0;
         })
         .onActionUpdate((e: GestureEvent) => {
           if (this.animating) { return; }
+          // 这张卡已定案（例如另一根手指刚点了「上墙」），或本次手势的起点卡已经换走：
+          // 作废它的后续手势，否则抬手时的 settle() 会以换卡后的新 photoId 上报，
+          // 静默消耗一张用户没打算决定的照片。
+          if (this.isGestureVoided()) { return; }
           const now = Date.now();
           const dt = now - this.lastT;
           if (dt > 0) { this.velocity = ((e.offsetX - this.lastX) / dt) * 1000; }
@@ -177,6 +227,9 @@ export struct CardStack {
 
   private settle(): void {
     if (this.animating) { return; }   // 已在飞出动画中，忽略（防御性；正常路径已被手势闸门挡住）
+    // 本次手势的卡已定案／已换走：作废，否则会以换卡后的新 photoId 记一次 fav/archive
+    //（或记一次挂在下一张头上的伪回弹）—— 上墙路径没有 animating，这里是唯一出口闸门。
+    if (this.isGestureVoided()) { return; }
     // 用真实宽度算位移阈值：360 只是父组件尚未量出宽度时的兜底，不是判定依据。
     const w = this.cardWidth > 0 ? this.cardWidth : 360;
     const commitDist = w * COMMIT_DISTANCE_RATIO;
