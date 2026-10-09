@@ -4,7 +4,9 @@
  * ── 这个页面只做三件事（几何**一行都不算**） ─────────────────────────────────
  *   1. **取数据**：`DecisionStore.walledIds()`（谁是上墙的，唯一判据）+ `LocationIndex`
  *      （它们在哪、什么时候拍的）；
- *   2. **调 core/render**：`buildScene` 算钉子与挂载方案、`outlinePath` 算国界 path；
+ *   2. **调 core/render**：`fitBounds` 由照片坐标求出**视野框**（本批新增：地图缩放到
+ *     用户的足迹范围，而不是永远画整个中国）、`buildScene` 算钉子与挂载方案、
+ *     国界与照片共用**同一个** `MapFrame`（`frame.bounds` 是唯一的经纬度范围来源）；
  *   3. **把数字摆到屏幕上**：卡片用 `Image` 放在 `hangRects` 给的坐标上，国界用 `Shape`+`Path`。
  *   几何全部来自 `core/render.ts` —— 与 `tools/render-preview.ts` 产出的 SVG **逐点相同**，
  *   所以"在电脑上先看见"这件事是真的，不是近似。
@@ -57,9 +59,9 @@ import { router } from '@kit.ArkUI';
 import { CHINA_REGION } from '../core/projection';
 import { parseAreaData } from '../core/areaData';
 import {
-  HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, TRACK_COLOR, TRACK_WIDTH,
-  badgeRect, buildScene, dateLabel, hangBottom, hangOffsets, hangRects, mapFrame, outlinePath,
-  parseOutline, trajectoryPath
+  HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, TRACK_COLOR, TRACK_WIDTH, VIEW_PAD_RATIO,
+  badgeRect, buildScene, dateLabel, fitBounds, hangBottom, hangOffsets, hangRects, mapFrame, outlinePath,
+  parseOutline, trajectoryPath, viewZoomOf
 } from '../core/render';
 import type { CardRect, HangOffset, MapFrame, OutlineData, ScenePin, WallPhoto } from '../core/render';
 // MAX_HANG 只在 core/placement.ts 里定义（设计 §6.2 的阈值那儿一份），render.ts 不转手导出。
@@ -218,6 +220,18 @@ struct WallPage {
   /**
    * 重算场景。**唯一**的几何入口 —— 只在「数据到了」或「画布尺寸变了」时调用。
    * 画布尺寸没拿到（首帧之前）时什么都不做，等 `onAreaChange` 再来一次。
+   *
+   * ── 视野：由**照片数据**求出，不再是整个中国（本批的核心改动）────────────────
+   * `fitBounds(this.photos, VIEW_PAD_RATIO)` 给出"能看到全部照片"的那一块经纬度范围，
+   * 然后 `mapFrame` 把这块范围放进画布。设备真值（3 个城市、7 张有坐标）下这会把地图
+   * 从"整个中国（经度 62°）"拉近到"经度 6.578°"—— 放大 9.4 倍，地图第一次真的铺满屏幕。
+   *
+   * `vb === undefined`（一张有坐标的都没有）→ 退回 `CHINA_REGION.bounds`，
+   * 与改动前逐点一致（空墙 / 全无 GPS 的那两种退化路径不能变）。
+   *
+   * ⚠️ `bounds` **只算一次、只传一处**：国界（`outlinePath`）与照片（`buildScene`）
+   * 都从这**同一个** `MapFrame` 上读 `frame.bounds` —— 各传一套参数就会出现
+   * "照片用新视野、国界还是全国视野"，照片整体飘到地图轮廓外面，而且两边都不报错。
    */
   private rebuild(): void {
     if (this.boxW <= 0 || this.boxH <= 0) {
@@ -225,9 +239,11 @@ struct WallPage {
         `${DIAG} rebuild 跳过：画布还没量到（boxW=${this.boxW} boxH=${this.boxH}）`);
       return;
     }
-    // 地图块 = 整个主体区（地图是这整块区域的底色）；框 = 块里那个不变形的中国（居中）。
-    // 这一步替代了旧的 `mapH = mapBoxHeight(boxW)` —— 那时地图只占上方 37% 的一条。
-    const frame: MapFrame = mapFrame(this.boxW, this.boxH, CHINA_REGION.bounds);
+    // 视野框：由照片坐标求出（没有有效坐标 → 全国视野，与改动前一致）
+    const vb: number[] | undefined = fitBounds(this.photos, VIEW_PAD_RATIO);
+    const bounds: number[] = vb !== undefined ? vb : CHINA_REGION.bounds;
+    // 地图块 = 整个主体区（地图是这整块区域的底色）；框 = 块里那个不变形的视野（居中）。
+    const frame: MapFrame = mapFrame(this.boxW, this.boxH, bounds);
     this.mapX = r2(frame.x);
     this.mapY = r2(frame.y);
     this.mapW = r2(frame.w);
@@ -235,10 +251,11 @@ struct WallPage {
     // 挂载区底：与 buildScene 内部**同一个** hangBottom（两边各算一遍就会漂移）
     const bottom: number = hangBottom(frame, { canvasH: this.boxH, footer: BOTTOM_RESERVE });
 
-    // 国界：坐标已按 frame 平移过（与钉子同一个坐标系）；视口剔除也在 outlinePath 里
+    // 国界：坐标已按 frame 平移过（与钉子同一个坐标系）；投影用的 bounds 就是 frame.bounds，
+    // 与 buildScene 读的是同一处（outlinePath 已经没有 bounds 参数了）；视口剔除也在里面
     let chinaPath: string = '';
     if (this.outlineData !== undefined) {
-      chinaPath = outlinePath(this.outlineData.rings, frame, this.outlineData.bounds);
+      chinaPath = outlinePath(this.outlineData.rings, frame);
     }
     this.chinaPath = chinaPath;
 
@@ -297,12 +314,21 @@ struct WallPage {
     // 要的就是这一行的真值：`boxW / boxH` 是 onAreaChange 给的**地图块**（整个主体区），
     // `map W×H@(x,y)` 是块里那个不变形的绘制框，`pathLen` 是国界 path 的字符数
     //（=0 就说明国界根本没画出来，那是另一类缺陷），`track` 是轨迹折线的字符数。
+    //
+    // 本批新增：**视野 bounds**（格式 `[minLon,minLat,maxLon,maxLat]`，带 `(数据)`/`(全国)`
+    // 标明来源）与**放大倍数**（相对全国视野，`viewZoomOf` 的口径是经度跨度之比）。
+    // 真机上要核对的正是这两个数：`(数据)` + 放大 9 倍左右 = 数据驱动视野生效了；
+    // `(全国)` = 一张有坐标的都没有（退化路径）；放大 1× = 还是老行为（没生效）。
     this.diag = `box ${r2(this.boxW)}×${r2(this.boxH)} ｜ 图框 ${this.mapW}×${this.mapH}@(${this.mapX},${this.mapY})`
+      + ` ｜ 视野 [${r2(bounds[0])},${r2(bounds[1])},${r2(bounds[2])},${r2(bounds[3])}]${vb !== undefined ? '(数据)' : '(全国)'}`
+      + ` 放大 ${r2(viewZoomOf(bounds))}×`
       + ` ｜ pins ${pins.length} ｜ cards ${cards.length} ｜ pathLen ${chinaPath.length} ｜ track ${this.trackPath.length}`
       + ` ｜ 上墙 ${this.walledTotal} 命中 ${located} 实挂 ${shownTotal}`;
     hilog.info(DOMAIN, TAG, '%{public}s',
       `${DIAG} rebuild：boxW=${this.boxW} boxH=${this.boxH}`
       + ` blockH=${frame.blockH} mapW=${frame.w} mapH=${frame.h} mapX=${frame.x} mapY=${frame.y}`
+      + ` bounds=[${r2(bounds[0])},${r2(bounds[1])},${r2(bounds[2])},${r2(bounds[3])}]`
+      + ` boundsFromData=${vb !== undefined} viewZoom=${r2(viewZoomOf(bounds))}`
       + ` bottom=${bottom} pins=${pins.length} cards=${cards.length}`
       + ` chinaPath.length=${chinaPath.length} trackPath.length=${this.trackPath.length}`
       + ` linkPath.length=${this.linkPath.length} walled=${this.walledTotal} located=${located} shown=${shownTotal}`);

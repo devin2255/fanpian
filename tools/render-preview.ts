@@ -4,6 +4,7 @@
  * 用法（一个脚本必须能重现，默认值就是产出报告里那张图的那一组）：
  *
  *   node --experimental-strip-types tools/render-preview.ts
+ *   node --experimental-strip-types tools/render-preview.ts --nearby
  *   node --experimental-strip-types tools/render-preview.ts --many
  *   node --experimental-strip-types tools/render-preview.ts <数据.json> [输出.svg]
  *
@@ -14,24 +15,35 @@
  *   （位置参数）      数据文件；给了它就不用 --data
  *   --data=PATH      照片数据。两种形状都吃：
  *                      · `locations.json`（data/locationIndex 落盘的那个数组）——**设备导出的真数据**
- *                      · `{ "photos": [...] }`（手写的代表性数据，本仓库 tools/fixtures 下那两份）
+ *                      · `{ "photos": [...] }`（手写的代表性数据，本仓库 tools/fixtures 下那三份）
  *   --decisions=PATH `decisions.json`（data/decisionStore 落盘的那个数组）；
  *                    给了它就只画 `state === "walled"` 的照片 —— 与设备上的墙一致。
  *   --out=PATH       输出 SVG（默认 tools/out/wall-preview.svg）
  *   --w=--h=         画布尺寸（pt，默认 360×720 —— 一台常见鸿蒙手机的 vp 尺寸）
  *   --zoom=          地图缩放（默认 1）。小于 placement.MIN_ZOOM_FOR_EXPAND 时全部收成点。
+ *   --pad=           视野内边距比例（默认 `render.VIEW_PAD_RATIO` = 0.15，**与设备同一个常量**）。
+ *                    0 = 视野紧贴数据；调大 = 四周留白更多（地图更"远"）。
  *   --scale=         SVG 的像素放大倍数（默认 2；**只改 width/height，几何一点不变**）
  *   --footer=        底部图例条的高度（pt，默认 34）。卡片不许压到图例上 —— 这是**分区**的一部分。
+ *   --nearby         用"三个邻近城市"的那份数据（**贴用户真机**：上海+北京+天津）
  *   --many           用 18 个钉子的那份数据（演示"钉子多时收成点"）
  *   --flat           把地图框拉满整块画布（**会变形**，只是留个对照，别用）
+ *
+ * ── 视野（viewport）是怎么定的：**由数据求出**，与设备侧共用 core/render.fitBounds ────
+ *   · `fitBounds(photos, pad)` 求"能看到全部照片"的经纬度范围（一张有坐标的都没有 →
+ *     退回 `CHINA_REGION.bounds`，与设备侧的退化路径逐点一致）；
+ *   · 用它 `mapFrame(w, h, bounds)` 得到不变形的绘制框 —— bounds 存在框里，
+ *     **国界与照片都从框上读**（`frameBounds`），不可能各画各的。
+ *   · 于是"广域数据 → 接近全国视野"与"邻近城市 → 放大 9 倍铺满屏幕"是同一段代码的两个结果，
+ *     差别只在数据。跑 `--nearby` 与默认（广域）两份就能看见这个差别。
  *
  * ── 画布分区是怎么定的（"地图铺满主体区"，与设备侧共用 core/render.mapFrame）────
  *   · **地图块** = 整块画布 `--w × --h`：地图是它的底色，照片浮在它上面。
  *     （老版本这里是"地图只占上方 37% 的一条"，`mapH = mapBoxHeight(宽)`。）
  *   · **地图框** = 地图块里那个**不变形**的矩形（`MapFrame`）：先按"填满高度"算宽度，
- *     宽度放不下就改成"填满宽度"，然后**居中**。360×720 时框是 360×267.72，居中在 y=226.14。
- *     为什么手机上是"填满宽度"而不是"填满高度"，见 `core/render.MapFrame` 的长注释
- *     （填满高度会把北京/上海/广州裁出画面）。
+ *     宽度放不下就改成"填满宽度"，然后**居中**。360×720 + 全国视野时框是 360×267.72，
+ *     居中在 y=226.14；360×720 + 邻近城市视野（宽高比 ≈0.476）时框是 342.4×720 —— 
+ *     **填满高度**，这才是"地图铺满屏幕"。见 `core/render.MapFrame` 的长注释。
  *   · **挂载区** = `[地图框底, 画布高 − footer]`，即地图框之外剩下的部分全给照片。
  *     它是**剩余量**，不是常数：换一块画布（--w/--h/--footer）它自己跟着变。
  *   · 布局只在这个分区内做取舍：放不下就少挂几张、再不行就收成点（见 core/render.ts 的 planPin）。
@@ -47,8 +59,9 @@ import { parseAreaData } from '../entry/src/main/ets/core/areaData.ts';
 import { CHINA_REGION, projectMercator } from '../entry/src/main/ets/core/projection.ts';
 import { MIN_ZOOM_FOR_EXPAND } from '../entry/src/main/ets/core/placement.ts';
 import {
-  BLOCK_FILL, HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, arcSpread, arcSpreadNeed, buildScene, geoAspect,
-  hangBottom, hangOffsets, mapFrame, outlinePath, parseOutline, sceneToSvg, trajectoryOrder
+  BLOCK_FILL, HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, VIEW_PAD_RATIO, arcSpread, arcSpreadNeed, buildScene,
+  fitBounds, frameBounds, geoAspect, hangBottom, hangOffsets, mapFrame, outlinePath, parseOutline, sceneToSvg,
+  trajectoryOrder, viewZoomOf
 } from '../entry/src/main/ets/core/render.ts';
 import type { MapFrame, ScenePin, WallPhoto } from '../entry/src/main/ets/core/render.ts';
 
@@ -68,6 +81,7 @@ interface Options {
   zoom: number;
   scale: number;
   footer: number;
+  pad: number;
   flat: boolean;
 }
 
@@ -81,6 +95,8 @@ function parseArgs(argv: string[]): Options {
     zoom: 1,
     scale: 2,
     footer: 34,
+    // **与设备同一个常量**：两边各写一个数就会变成"电脑上看到的和真机上看到的不是同一张图"
+    pad: VIEW_PAD_RATIO,
     flat: false
   };
   const positional: string[] = [];
@@ -88,6 +104,11 @@ function parseArgs(argv: string[]): Options {
     if (a === '--many') {
       o.data = path.join(HERE, 'fixtures/wall-sample-many.json');
       o.out = path.join(HERE, 'out/wall-preview-many.svg');
+      continue;
+    }
+    if (a === '--nearby') {
+      o.data = path.join(HERE, 'fixtures/wall-sample-nearby.json');
+      o.out = path.join(HERE, 'out/wall-preview-nearby.svg');
       continue;
     }
     if (a === '--flat') { o.flat = true; continue; }
@@ -102,6 +123,7 @@ function parseArgs(argv: string[]): Options {
     if (key === '--zoom') { o.zoom = Number(val); continue; }
     if (key === '--scale') { o.scale = Number(val); continue; }
     if (key === '--footer') { o.footer = Number(val); continue; }
+    if (key === '--pad') { o.pad = Number(val); continue; }
     if (a.startsWith('--')) { throw new Error(`未知参数：${a}`); }
     positional.push(a);
   }
@@ -190,12 +212,23 @@ function main(): number {
 
   const loaded = loadPhotos(o.data, o.decisions);
 
+  // ── 视野：由**数据**求出（与设备侧同一个 fitBounds）─────────────────────────
+  // 一张有效坐标都没有 → 退回全国视野，与设备侧的退化路径逐点一致。
+  // 这一步是整个预览脚本存在意义的所在：`--nearby`（上海+北京+天津）与默认的广域数据
+  // 走的是同一段代码，区别只在数据 —— 于是"地图铺满屏幕"能在电脑上先看见。
+  const vb: number[] | undefined = fitBounds(loaded.photos, o.pad);
+  const bounds: number[] = vb !== undefined ? vb : CHINA_REGION.bounds;
+  const zoomFactor: number = viewZoomOf(bounds);
+
   // 地图块 = 整块画布（地图是主体区的底色）；地图框 = 块里那个**不变形**的矩形（居中）。
-  // `--flat` 是刻意的**反例**：框 = 块（把中国拉满整块画布 → 变形）。
-  const block: MapFrame = mapFrame(o.w, o.h, CHINA_REGION.bounds);
+  // bounds 存在框里（`MapFrame.bounds`），国界与照片都从框上读它 —— 不可能各画各的。
+  // `--flat` 是刻意的**反例**：框 = 块（把视野拉满整块画布 → 变形）。
+  const block: MapFrame = mapFrame(o.w, o.h, bounds);
   const frame: MapFrame = o.flat
-    ? { blockW: o.w, blockH: o.h, x: 0, y: 0, w: o.w, h: o.h }
+    ? { blockW: o.w, blockH: o.h, x: 0, y: 0, w: o.w, h: o.h, bounds: bounds }
     : block;
+  // 投影实际用的 bounds（从框上读，与 buildScene / outlinePath 同一处）
+  const fb: number[] = frameBounds(frame);
 
   // 国界：数据文件在就画，不在就退化成"只有钉子和线"（脚本仍然能跑，报告里说明）
   let chinaPath = '';
@@ -205,8 +238,12 @@ function main(): number {
     if (od === undefined) {
       outlineNote = '（china_outline.json 解析失败，本次不画国界）';
     } else {
-      chinaPath = outlinePath(od.rings, frame, od.bounds);
-      outlineNote = `${od.rings.length} 个环 / ${od.src}`;
+      chinaPath = outlinePath(od.rings, frame);
+      // 视野内的环数：放大之后国界可能**整条**（或大部分）在视野外，图上只剩空白底 + 钉子。
+      // 这不是缺陷而是取舍（见文件头与报告），但要能在图上核对，所以数出来写进图例。
+      const ringsInView = chinaPath.length === 0 ? 0 : chinaPath.split('M').length - 1;
+      outlineNote = `${ringsInView}/${od.rings.length} 个环在视野内 / ${od.src}`;
+      if (ringsInView === 0) { outlineNote += '（**整条在视野外**：只有空白底 + 钉子）'; }
     }
   }
 
@@ -237,25 +274,39 @@ function main(): number {
   const undated = pins.reduce((s, p) => s + p.photos.filter((x) => !(x.takenAt > 0)).length, 0);
   const onWall = pins.reduce((s, p) => s + p.photos.length, 0);
   const total = loaded.photos.length;
-  // 「照片级」的地图块外计数：按**原始坐标**算，不受聚簇影响。
+  // 「照片级」的地图框外计数：按**原始坐标**算，不受聚簇影响。
   // 为什么必须单独算：400km 外的两张照片会在屏幕上被并进同一个钉子（MIN_PIN_DIST_PT=40
-  // 在全国视角下约等于 6.9° 经度），此时"某个钉子在画布外"就再也看不出来了 ——
-  // 三沙永兴岛（16.83°N）正是这样消失的。bounds=[73,18,135,54] 的 minLat=18 是它的成因。
+  // 在全国视野下约等于 6.9° 经度），此时"某个钉子在画布外"就再也看不出来了 ——
+  // 三沙永兴岛（16.83°N）正是这样消失的。用**当前的** `fb` 投影（不是全国 bounds）：
+  // 这个数要回答的是"这张照片的图钉会落在本次画出来的那块地图里吗"。
   const outside: string[] = [];
   for (const ph of loaded.photos) {
     const has = ph.manual === true || ph.lat !== 0 || ph.lon !== 0;
     if (!has) { continue; }
-    const q = projectMercator(ph.lon, ph.lat, frame.w, frame.h, CHINA_REGION.bounds);
+    const q = projectMercator(ph.lon, ph.lat, frame.w, frame.h, fb);
     if (q.x < 0 || q.x > frame.w || q.y < 0 || q.y > frame.h) {
       outside.push(`${ph.place === undefined ? `${ph.lat.toFixed(2)},${ph.lon.toFixed(2)}` : ph.place}(y=${q.y.toFixed(1)})`);
     }
   }
   const track = trajectoryOrder(pins);
+  const boundsText = `[${round2(fb[0])},${round2(fb[1])},${round2(fb[2])},${round2(fb[3])}]`;
   const legend: string[] = [];
+  // 图例画在**顶部**，并带一条底衬 —— **只影响这张 SVG 好不好读，不改任何几何**。
+  // 为什么不放底部（老位置）：视野拉近之后地图框会**填满整块高度**（那正是本批要的效果），
+  // `hangBottom` 的"页脚留白"于是不再有实际余量（框底 = 块底），最南边那个钉子的卡片
+  // 会正好落在底部这几行字的位置上 —— 而真实数据里最南的城市（上海）**永远**是最下面那个钉子，
+  // 也就是说老位置会稳定地挡住用户最想核对的那几卡片。
+  // 顶部为什么一定空着：`fitBounds` 的边距保证最北的钉子至少离画布顶 `pad/(1+2pad)` 的高度
+  // （0.15 → 720pt 上是 83pt，标签再往上 10pt 也够），所以 34pt 的图例条不会压到任何东西。
+  // 设备侧没有这个问题（提示文字在 Stack **外面**、不占画布），所以这是预览**绘制**上的差异，
+  // 不该靠改几何去凑。
+  const legendH: number = o.footer > 20 ? o.footer : 34;
+  legend.push(`<rect x="0" y="0" width="${round2(o.w)}" height="${round2(legendH)}" `
+    + `fill="${BLOCK_FILL}" opacity="0.9"/>`);
   legend.push(`<g id="legend" font-size="7" fill="#7A8577">`);
-  legend.push(`<text x="8" y="${round2(o.h - 26)}">地图墙预览 ｜ ${pins.length} 个钉子 ｜ 轨迹 ${track.length} 点（按拍摄时间连线） ｜ 挂出 ${drawn} 张 / 上墙 ${onWall} 张（图例 ${o.footer}pt ｜ 时间未知 ${undated} 张）</text>`);
-  legend.push(`<text x="8" y="${round2(o.h - 15)}">输入 ${total} 张（无地点不上墙 ${total - onWall} 张 ｜ 地图框外 ${outside.length} 张） ｜ 卡片 ${HANG_PHOTO_W}×${HANG_PHOTO_H}pt ｜ 照片是占位卡片，Node 侧没有像素</text>`);
-  legend.push(`<text x="8" y="${round2(o.h - 4)}">地图块 0→${round2(o.h)}pt（底色） ｜ 地图框 ${round2(frame.w)}×${round2(frame.h)}pt@(${round2(frame.x)},${round2(frame.y)})（墨卡托 ${geoAspect(CHINA_REGION.bounds).toFixed(3)}） ｜ 挂载区 ${round2(hangTop)}→${round2(hangBottomPt)}pt ｜ ${escapeText(outlineNote)}</text>`);
+  legend.push(`<text x="8" y="${round2(legendH - 22)}">地图墙预览 ｜ ${pins.length} 个钉子 ｜ 轨迹 ${track.length} 点（按拍摄时间连线） ｜ 挂出 ${drawn} 张 / 上墙 ${onWall} 张（图例 ${o.footer}pt ｜ 时间未知 ${undated} 张）</text>`);
+  legend.push(`<text x="8" y="${round2(legendH - 11)}">输入 ${total} 张（无地点不上墙 ${total - onWall} 张 ｜ 地图框外 ${outside.length} 张） ｜ 卡片 ${HANG_PHOTO_W}×${HANG_PHOTO_H}pt ｜ 视野 bounds ${boundsText}${vb !== undefined ? '(数据)' : '(全国)'} 放大 ${round2(zoomFactor)}×</text>`);
+  legend.push(`<text x="8" y="${round2(legendH - 1)}">地图块 0→${round2(o.h)}pt（底色） ｜ 地图框 ${round2(frame.w)}×${round2(frame.h)}pt@(${round2(frame.x)},${round2(frame.y)})（墨卡托 ${geoAspect(fb).toFixed(3)}） ｜ 挂载区 ${round2(hangTop)}→${round2(hangBottomPt)}pt ｜ ${escapeText(outlineNote)}</text>`);
   legend.push(`</g>`);
   svg = svg.replace('</svg>', legend.join('\n') + '\n</svg>');
 
@@ -273,10 +324,13 @@ function main(): number {
   console.log(`  读入 ${loaded.photos.length} 条${loaded.dropped > 0 ? `（丢弃 ${loaded.dropped} 条非法记录）` : ''}`);
   console.log(`画布：${o.w}×${o.h}pt（scale=${o.scale} → ${o.w * o.scale}×${o.h * o.scale}px）`);
   console.log(`分区：地图块 0→${round2(o.h)}pt（${round2(100)}%，地图是整块主体区的底色）`);
+  console.log(`视野：bounds ${boundsText}${vb !== undefined ? '(数据：fitBounds)' : '(全国：没有有效坐标的退化路径)'}`
+    + ` ｜ 放大 ${round2(zoomFactor)}×（= 全国经度跨度 62° / 本视野经度跨度 ${round2(fb[2] - fb[0])}°） ｜ pad=${o.pad}`);
   console.log(`      地图框 ${round2(frame.w)}×${round2(frame.h)}pt 左上角 (${round2(frame.x)}, ${round2(frame.y)})`
-    + ` —— 框宽高比 = 墨卡托 ${geoAspect(CHINA_REGION.bounds).toFixed(4)}（**不变形**）`);
-  console.log(`        先按"填满高度"算宽 = ${round2(o.h)}×${geoAspect(CHINA_REGION.bounds).toFixed(4)} = ${round2(o.h * geoAspect(CHINA_REGION.bounds))}pt`
-    + ` ${o.h * geoAspect(CHINA_REGION.bounds) > o.w ? `> 画布宽 ${o.w} → 改成"填满宽度"（否则会裁掉北京/上海/广州）` : '≤ 画布宽 → 填满高度成立'}`);
+    + ` —— 框宽高比 = 墨卡托 ${geoAspect(fb).toFixed(4)}`
+    + `${o.flat ? '（**--flat：框 = 块，会变形**，只是留个对照）' : '（**不变形**）'}`);
+  console.log(`        先按"填满高度"算宽 = ${round2(o.h)}×${geoAspect(fb).toFixed(4)} = ${round2(o.h * geoAspect(fb))}pt`
+    + ` ${o.h * geoAspect(fb) > o.w ? `> 画布宽 ${o.w} → 改成"填满宽度"` : '≤ 画布宽 → **填满高度成功**（地图铺满屏幕）'}`);
   console.log(`      挂载区 ${round2(hangTop)}→${round2(hangBottomPt)}pt（${round2(hangBottomPt - hangTop)}pt，${round2(((hangBottomPt - hangTop) / o.h) * 100)}%） ｜ 图例 ${o.footer}pt  zoom=${o.zoom}${o.zoom < MIN_ZOOM_FOR_EXPAND ? '（< 展开阈值，全部收成点）' : ''}`);
   console.log(`国界：${outlineNote}`);
   console.log(`卡片：${HANG_PHOTO_W}×${HANG_PHOTO_H}pt（挂线留白 ${HANG_GAP}pt）`);
