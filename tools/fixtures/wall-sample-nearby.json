@@ -1,0 +1,55 @@
+{
+  "note": [
+    "地图墙预览的第三份数据：**贴着用户真机**的那一份（上海 + 北京 + 天津，只有 7 张有坐标）。",
+    "",
+    "为什么必须有它（用户反馈『UI 不行，你这个啥并不是』的直接应对）：",
+    "老的两份数据（wall-sample / wall-sample-many）横跨全国 —— 敦煌、拉萨、乌鲁木齐、广州、",
+    "北京、上海全都有。用它们验证「地图铺满屏幕」是验不出来的：数据本身就要求全国视野，",
+    "地图当然只能是一条横带。真实数据是**三个邻近城市**，这一份才代表它。",
+    "",
+    "与设备真值逐条对齐（控制器在真机上核实的数字）：",
+    "  · 28 张已上墙（全部在地点索引里）；",
+    "  · 其中只有 7 张有坐标 —— 另外 21 张是 (0,0)（无 EXIF GPS，也没有手选地点），",
+    "    它们**不上墙**（hasPlace 的规则），预览里会报『无地点不上墙 21 张』；",
+    "  · 涉及地点只有 3 个城市，且这 7 张的坐标跨度正好是",
+    "    经度 116.42~121.48（5.06°）、纬度 31.25~39.93（8.68°）——",
+    "    也就是 fitBounds(photos, 0) 的结果（单测里有一条把这件事钉死）。",
+    "",
+    "坐标都是真实地点（人民广场/景山/小白楼一带），没有编造 —— 编出来的坐标会让",
+    "「反查地名对不对」变成一句空话，而那条路径正是地图墙最可能出错的地方。",
+    "takenAt 用 ISO 字符串只是为了好读；设备落盘的 locations.json 里是 epoch ms 数字。"
+  ],
+  "photos": [
+    { "photoId": "file://media/Photo/101/IMG_20240501_0910/IMG_20240501_091000.jpg", "lat": 31.25, "lon": 121.48, "takenAt": "2024-05-01T09:10:00Z" },
+    { "photoId": "file://media/Photo/102/IMG_20240501_1130/IMG_20240501_113000.jpg", "lat": 31.25, "lon": 121.474, "takenAt": "2024-05-01T11:30:00Z" },
+    { "photoId": "file://media/Photo/103/IMG_20240501_1600/IMG_20240501_160000.jpg", "lat": 31.26, "lon": 121.465, "takenAt": null },
+
+    { "photoId": "file://media/Photo/111/IMG_20231001_0200/IMG_20231001_020000.jpg", "lat": 39.93, "lon": 116.42, "takenAt": "2023-10-01T02:00:00Z" },
+    { "photoId": "file://media/Photo/112/IMG_20231001_0220/IMG_20231001_022000.jpg", "lat": 39.921, "lon": 116.44, "takenAt": "2023-10-01T02:20:00Z" },
+
+    { "photoId": "file://media/Photo/121/IMG_20240615_1000/IMG_20240615_100000.jpg", "lat": 39.12, "lon": 117.21, "takenAt": "2024-06-15T10:00:00Z" },
+    { "photoId": "file://media/Photo/122/IMG_20240615_1030/IMG_20240615_103000.jpg", "lat": 39.135, "lon": 117.225, "takenAt": "2024-06-15T10:30:00Z" },
+
+    { "photoId": "file://media/Photo/201/Screenshot_20240501_2000/Screenshot_20240501_200000.png", "lat": 0, "lon": 0, "takenAt": null },
+    { "photoId": "file://media/Photo/202/Screenshot_20240502_0900/Screenshot_20240502_090000.png", "lat": 0, "lon": 0, "takenAt": null },
+    { "photoId": "file://media/Photo/203/Screenshot_20231001_1200/Screenshot_20231001_120000.png", "lat": 0, "lon": 0, "takenAt": null },
+    { "photoId": "file://media/Photo/204/Screenshot_20240615_1800/Screenshot_20240615_180000.png", "lat": 0, "lon": 0, "takenAt": null },
+    { "photoId": "file://media/Photo/205/Screenshot_20240616_0800/Screenshot_20240616_080000.png", "lat": 0, "lon": 0, "takenAt": null },
+    { "photoId": "file://media/Photo/206/IMG_20240501_2100/IMG_20240501_210000.jpg", "lat": 0, "lon": 0, "takenAt": "2024-05-01T21:00:00Z" },
+    { "photoId": "file://media/Photo/207/IMG_20240502_0800/IMG_20240502_080000.jpg", "lat": 0, "lon": 0, "takenAt": "2024-05-02T08:00:00Z" },
+    { "photoId": "file://media/Photo/208/IMG_20240502_1200/IMG_20240502_120000.jpg", "lat": 0, "lon": 0, "takenAt": "2024-05-02T12:00:00Z" },
+    { "photoId": "file://media/Photo/209/IMG_20240503_0900/IMG_20240503_090000.jpg", "lat": 0, "lon": 0, "takenAt": "2024-05-03T09:00:00Z" },
+    { "photoId": "file://media/Photo/210/IMG_20231001_1000/IMG_20231001_100000.jpg", "lat": 0, "lon": 0, "takenAt": "2023-10-01T10:00:00Z" },
+    { "photoId": "file://media/Photo/211/IMG_20231001_1500/IMG_20231001_150000.jpg", "lat": 0, "lon": 0, "takenAt": "2023-10-01T15:00:00Z" },
+    { "photoId": "file://media/Photo/212/IMG_20231002_0900/IMG_20231002_090000.jpg", "lat": 0, "lon": 0, "takenAt": "2023-10-02T09:00:00Z" },
+    { "photoId": "file://media/Photo/213/IMG_20231002_1800/IMG_20231002_180000.jpg", "lat": 0, "lon": 0, "takenAt": "2023-10-02T18:00:00Z" },
+    { "photoId": "file://media/Photo/214/IMG_20240615_1200/IMG_20240615_120000.jpg", "lat": 0, "lon": 0, "takenAt": "2024-06-15T12:00:00Z" },
+    { "photoId": "file://media/Photo/215/IMG_20240615_1600/IMG_20240615_160000.jpg", "lat": 0, "lon": 0, "takenAt": "2024-06-15T16:00:00Z" },
+    { "photoId": "file://media/Photo/216/IMG_20240616_1000/IMG_20240616_100000.jpg", "lat": 0, "lon": 0, "takenAt": "2024-06-16T10:00:00Z" },
+    { "photoId": "file://media/Photo/217/IMG_20220909_0700/IMG_20220909_070000.jpg", "lat": 0, "lon": 0, "takenAt": "2022-09-09T07:00:00Z" },
+    { "photoId": "file://media/Photo/218/IMG_20220909_1800/IMG_20220909_180000.jpg", "lat": 0, "lon": 0, "takenAt": "2022-09-09T18:00:00Z" },
+    { "photoId": "file://media/Photo/219/IMG_20220101_0900/IMG_20220101_090000.jpg", "lat": 0, "lon": 0, "takenAt": "2022-01-01T09:00:00Z" },
+    { "photoId": "file://media/Photo/220/IMG_20220101_1500/IMG_20220101_150000.jpg", "lat": 0, "lon": 0, "takenAt": "2022-01-01T15:00:00Z" },
+    { "photoId": "file://media/Photo/221/IMG_20211001_1000/IMG_20211001_100000.jpg", "lat": 0, "lon": 0, "takenAt": "2021-10-01T10:00:00Z" }
+  ]
+}

@@ -14,7 +14,9 @@
  *   · placePick.formatPlace    —— 地点显示名的**唯一产出者**（「河北·石家庄·正定」）。
  *   · areaData.nearestCounty   —— EXIF 条目没有 place 时反查最近的县，**退化路径**。
  *   · geo.medianPoint          —— 一个钉子下多张照片取中位数定位（对离群点比平均值稳）。
- *   · projection.projectMercator + CHINA_REGION.bounds —— 经纬度 → 画布坐标。
+ *   · projection.projectMercator + **frame.bounds** —— 经纬度 → 画布坐标。
+ *     视野框不再恒等于 CHINA_REGION.bounds：`fitBounds` 由照片数据求出它（见该函数），
+ *     国界与照片都只读 `frame.bounds`（`frameBounds`），所以两者不可能各画各的。
  *   · placement.clusterByScreen / computeLayout / MAX_HANG / MIN_PIN_DIST_PT
  *                              —— §6.2 的「自适应聚散」阈值**只在 placement.ts 里定义**，
  *                                 本模块只负责把照片喂进去、把结果翻译成绘图语义。
@@ -44,6 +46,26 @@ import { CHINA_REGION, projectMercator } from './projection.ts';
  * 取值仍是 `[73, 18, 135, 54]`（西沙以西到黑龙江以东、南沙以北到漠河）。
  */
 const CHINA_BOUNDS: number[] = CHINA_REGION.bounds;
+
+/**
+ * 把一份 bounds 归一成**可用的** `[minLon, minLat, maxLon, maxLat]`。
+ *
+ * 非法（不是 4 个数 / 含 NaN·Infinity / 跨度不为正）一律退回 `CHINA_REGION.bounds`。
+ * 为什么必须归一而不是"就地拿去用"：`projectMercator` 里 `(maxLon − minLon)` 是**除数**，
+ * 零跨度会产出 `Infinity / NaN` 坐标 —— 而 NaN 坐标会让整条 path **静默消失**
+ * （SVG 与 ArkUI 都不报错），是本模块最怕的一类失败（同 `parseOutline` 的理由）。
+ * 归一之后，"地图框比中国轮廓还大 / 比一个点还小"这类怪结果也不可能出现。
+ */
+export function normalizeBounds(bounds: number[] | undefined): number[] {
+  if (bounds === undefined || bounds === null || !Array.isArray(bounds) || bounds.length !== 4) {
+    return CHINA_BOUNDS;
+  }
+  for (let i = 0; i < 4; i++) {
+    if (!Number.isFinite(bounds[i])) { return CHINA_BOUNDS; }
+  }
+  if (!(bounds[2] > bounds[0]) || !(bounds[3] > bounds[1])) { return CHINA_BOUNDS; }
+  return bounds;
+}
 
 // ── 画布比例：为什么地图不能直接铺满手机屏幕 ────────────────────────────────
 
@@ -129,21 +151,54 @@ export interface MapFrame {
   /** 不变形绘制框的尺寸（`w / h === geoAspect(bounds)`）。 */
   w: number;
   h: number;
+  /**
+   * 这个框的经纬度范围 `[minLon, minLat, maxLon, maxLat]`。
+   *
+   * ── 为什么它必须**长在框上**，而不是各自当参数传（这是本批最容易错的地方）────────
+   * 国界（`outlinePath`）与照片（`buildScene`）都要把经纬度投到画布上，两者**必须**用
+   * 同一份 bounds —— 否则照片用新视野、国界还是全国视野，照片会飘到地图外面，
+   * 而且两个函数都不会报错。把 bounds 放进 `MapFrame` 之后，"各传一套参数"这件事
+   * 在**类型上就写不出来**了：`outlinePath(rings, frame)` 不收 bounds 参数（见它的签名）。
+   *
+   * 缺省 = `CHINA_REGION.bounds`（全国视野）—— 手写的 `MapFrame` 字面量（测试里的
+   * `FULL_FRAME`、预览的 `--flat`）因此仍然可用，语义是"这个框就是整个中国"。
+   * 取值一律经 `normalizeBounds` 校验，非法值退回全国视野。
+   */
+  bounds?: number[];
+}
+
+/**
+ * 一个框实际使用的 bounds。**读 bounds 的唯一入口**：
+ *   · 框上没写 bounds（手写字面量）→ 全国视野；
+ *   · 写了但非法（长度不对 / NaN / 零跨度）→ 全国视野（见 `normalizeBounds`）。
+ *
+ * `buildScene` 与 `outlinePath` 都调它，所以"国界与照片用同一个 bounds"不是靠约定，
+ * 而是靠"两边读的是同一个字段的同一个函数"。单测里有一条把这条钉死
+ * （同一个经纬度在国界 path 与照片钉子上必须落在同一个画布点）。
+ */
+export function frameBounds(frame: MapFrame): number[] {
+  if (frame === undefined || frame === null) { return CHINA_BOUNDS; }
+  return normalizeBounds(frame.bounds);
 }
 
 /**
  * 按"地图块"算出里面那个不变形的绘制框（居中）。见 `MapFrame` 的说明。
  *
+ * `bounds` 是**这个框的经纬度范围**，会被归一化后**存进返回的框**（`MapFrame.bounds`）——
+ * 国界与照片之后都从框上读它，不再各传一份（见 `frameBounds`）。
+ * 调用方给的 bounds 非法（长度不对 / NaN / 零跨度）时退回全国视野。
+ *
  * `blockW/blockH` 非法（非有限数 / ≤ 0）时返回一个全 0 的框 —— 调用方据此跳过绘制，
  * 而不是拿 NaN 去投影（NaN 坐标会让整条 path 静默消失，是最难查的一类失败）。
  */
 export function mapFrame(blockW: number, blockH: number, bounds: number[]): MapFrame {
+  const b: number[] = normalizeBounds(bounds);
   const bw: number = Number.isFinite(blockW) && blockW > 0 ? blockW : 0;
   const bh: number = Number.isFinite(blockH) && blockH > 0 ? blockH : 0;
   if (!(bw > 0) || !(bh > 0)) {
-    return { blockW: bw, blockH: bh, x: 0, y: 0, w: 0, h: 0 };
+    return { blockW: bw, blockH: bh, x: 0, y: 0, w: 0, h: 0, bounds: b };
   }
-  const a: number = geoAspect(bounds);
+  const a: number = geoAspect(b);
   // 1) 先按"填满高度"
   let h: number = bh;
   let w: number = bh * a;
@@ -153,7 +208,7 @@ export function mapFrame(blockW: number, blockH: number, bounds: number[]): MapF
     h = bw / a;
   }
   // 居中：比例刚好匹配时 x/y 是 0；不匹配时两侧/上下各留一半
-  return { blockW: bw, blockH: bh, x: (bw - w) / 2, y: (bh - h) / 2, w: w, h: h };
+  return { blockW: bw, blockH: bh, x: (bw - w) / 2, y: (bh - h) / 2, w: w, h: h, bounds: b };
 }
 
 /**
@@ -261,9 +316,160 @@ export interface OutlineData {
   v: string;
   src: string;
   license: string;
-  /** [minLon, minLat, maxLon, maxLat]，与 CHINA_REGION.bounds 同义（允许不同）。 */
+  /**
+   * 数据文件自己的 `[minLon, minLat, maxLon, maxLat]` = **这份轮廓覆盖哪儿**。
+   *
+   * ⚠️ **它不参与投影**（本批改的）。投影一律用 `frame.bounds`（见 `outlinePath`）：
+   * 视野改成"按数据求"之后，若国界用文件里的全国 bounds、照片用新视野，两者就会分叉，
+   * 症状是照片飘到轮廓之外。这个字段现在的用途只剩两个：数据本身的元信息、
+   * 以及 `build-outline.ts` / 单测对文件的自检（"这份数据是不是全国的"）。
+   */
   bounds: number[];
   rings: number[][];
+}
+
+// ── 视野框：由照片数据求出"能看到它们全部"的那一块 ───────────────────────────
+//
+// 为什么需要它（用户的真机反馈是这一段的存在理由）：
+//   老实现把 `CHINA_REGION.bounds`（经度 62°、纬度 36°）当成**唯一的**视野，
+//   于是地图永远是"整个中国"，而用户的照片只落在上海/北京/天津这三座城里 ——
+//   屏幕上就是一小撮点，"地图铺满屏幕"这件事根本没发生。
+//   同类应用（旅迹 PhotoTrail / 山河旅记 / Polarsteps）之所以"地图铺满"，
+//   是因为它们**缩放到用户的足迹范围**。本函数就是那一件事。
+
+/**
+ * 一次"按数据求视野"的**最小跨度**（度，两个轴各自适用）。
+ *
+ * 为什么必须有它：所有照片挤在同一个点时数据跨度是 0，而 `projectMercator` 的除数是
+ * `(maxLon − minLon)` —— 零跨度 → `Infinity / NaN` 坐标 → 整条 path 静默消失。
+ *
+ * 为什么取 0.6°：
+ *   · **0.6° 纬度 = 66.7 km；0.6° 经度在 36°N ≈ 54 km** —— 一个地级市加近郊的尺度。
+ *     只有一张照片的墙于是回答"这张是在哪座城拍的"，而不是"哪条街"。
+ *   · **我们只有国界数据，没有省界/路网**：再放大也不会有新的线出现，只会剩一个点
+ *     和一大片空底 —— 那既不好看，也不比"一座城"多告诉用户任何东西。
+ *   · **容得下 EXIF 的误差**：手机 GPS 在城市峡谷/室内偏几百米是常态。0.6° 视野下
+ *     300 m 只占画布宽的 0.4%（360pt 上 1.6pt），钉子不会明显漂；再小一档（例如 0.05°）
+ *     就会把"定位误差"画成"换了个地方"。
+ *   · 与真实数据衔接自然：上海—北京—天津这种真实跨度是 5.06°×8.68°，远大于它，
+ *     只有数据真的只有一座城时才会吃到这个下限。
+ */
+export const MIN_VIEW_SPAN_DEG = 0.6;
+
+/**
+ * 内边距比例：视野框在数据盒四周各留「跨度 × 0.15」的余量。
+ *
+ * **设备侧（WallPage）与预览（tools/render-preview.ts）共用这一个常量** ——
+ * 两边各写一个数就会变成"电脑上看到的和真机上看到的不是同一张图"。
+ * 0.15 的效果：近邻城市那一档（经度跨度 5.06°）四周各留 0.76°，钉子的名字标签
+ * （8fp，居中于钉子）与卡片不会贴到画布边上；国家尺度上各留 4.6°，也不会"看不出是地图"。
+ */
+export const VIEW_PAD_RATIO = 0.15;
+
+/** 一根轴上的视野区间（内部用）。 */
+interface ViewSpan { lo: number; hi: number }
+
+/**
+ * 一根轴：数据盒 `[lo, hi]` → 视野盒。三步，**顺序不能换**：
+ *   ① **撑到最小跨度**（绕盒中心，`MIN_VIEW_SPAN_DEG`）—— 消掉零跨度；
+ *   ② **加内边距**（按**当前**跨度的比例，两侧各 `padRatio × 跨度`）；
+ *   ③ **保持跨度地平移到可视范围** `[cLo, cHi]` 内。
+ *
+ * ── 第 ③ 步为什么是"平移"而不是"把两端各夹一下"（这是一个真会被踩到的坑）────────
+ * 两端分别夹会把**跨度压小**，压到 0 就回到了第 ① 步要消灭的那个除零。极端但真实的例子：
+ * 唯一一张照片在东京（139.65°E，中国 bounds 的 maxLon = 135）—— 夹两端得到 `[135, 135]`
+ * 这个**零跨度**框，接着 `projectMercator` 里 `(135 − 135)` 当除数 → 整块画布 NaN →
+ * 地图和照片一起消失（静默）。平移则给出 `[134.4, 135]`：跨度还在，照片点落在框的右外侧
+ * （画布外，但坐标有限），与 render.ts 文件头第 3 条"境外照片不删、只是可能落在画布外"
+ * 的既有约定一致 —— 这也是预览里那行"地图框外 N 张"能报出来的前提。
+ *
+ * 跨度比可视范围还大时（只有 `padRatio` 给得极大才会发生）先把跨度收到可视范围再平移，
+ * 结果仍然是正跨度（这就是"广域数据退回接近全国视野"的那条路径）。
+ */
+function fitAxis(lo: number, hi: number, cLo: number, cHi: number, padRatio: number): ViewSpan {
+  let a: number = lo;
+  let b: number = hi;
+  const span: number = b - a;
+  if (!(span >= MIN_VIEW_SPAN_DEG)) {
+    const mid: number = (a + b) / 2;
+    a = mid - MIN_VIEW_SPAN_DEG / 2;
+    b = mid + MIN_VIEW_SPAN_DEG / 2;
+  }
+  const pad: number = (b - a) * padRatio;
+  a -= pad;
+  b += pad;
+  const cSpan: number = cHi - cLo;
+  if (b - a > cSpan) {
+    const mid2: number = (a + b) / 2;
+    a = mid2 - cSpan / 2;
+    b = mid2 + cSpan / 2;
+  }
+  if (a < cLo) { b += cLo - a; a = cLo; }
+  if (b > cHi) { a -= b - cHi; b = cHi; }
+  if (a < cLo) { a = cLo; }   // 跨度恰好等于 cSpan 时的兜底（上面两步互相顶住）
+  return { lo: a, hi: b };
+}
+
+/**
+ * 由一组照片的坐标求一个"能看到它们全部"的视野框（bounds），带内边距。
+ * 返回 `[minLon, minLat, maxLon, maxLat]`（与 `CHINA_REGION.bounds` 同构）。
+ *
+ * ── 契约（调用方需要知道的全部）──────────────────────────────────────────────
+ *   · **没有有效坐标时返回 `undefined`** → 调用方退回全国视野（`CHINA_REGION.bounds`）。
+ *     这不是异常路径："28 张上墙、只有 7 张有坐标"就是设备上的真实情形。
+ *   · **有效**的定义 = `placePick.hasPlace`（手动 > EXIF，`(0,0)` 不算）**且**坐标是有限数。
+ *     与 `buildScene` 的筛选是**同一套规则** —— 视野框覆盖的照片集合必须正好是
+ *     会被画到墙上的那些，否则会出现"框跟着一张根本没上墙的照片跑"。
+ *   · **结果一定落在 `CHINA_REGION.bounds` 之内**（平移式钳制，见 `fitAxis` 第 ③ 步）。
+ *   · **跨度一定为正**：每个轴要么被撑到 `MIN_VIEW_SPAN_DEG`，要么就是整个中国跨度。
+ *     纬度因此恒在 18~54 之内 —— 墨卡托在极地发散（`mercY → ∞`），这个带是它不发散的区间。
+ *   · `padRatio` 是**相对跨度**的比例（0.15 = 四周各留 15%）；≤0 / NaN 按 0 处理。
+ *
+ * 幂等：同一组照片恒得同一份数值（只做 min/max，与数组顺序无关）——
+ * 预览与设备因此恒得同一张图（`tools/render-preview.ts` 与 WallPage 走的是这个函数）。
+ */
+export function fitBounds(photos: WallPhoto[], padRatio: number): number[] | undefined {
+  let minLon: number = Number.POSITIVE_INFINITY;
+  let minLat: number = Number.POSITIVE_INFINITY;
+  let maxLon: number = Number.NEGATIVE_INFINITY;
+  let maxLat: number = Number.NEGATIVE_INFINITY;
+  let n: number = 0;
+  for (let i = 0; i < photos.length; i++) {
+    const p: WallPhoto | undefined = photos[i];
+    if (p === undefined || p === null) { continue; }
+    if (!hasPlace(p)) { continue; }
+    if (!Number.isFinite(p.lat) || !Number.isFinite(p.lon)) { continue; }
+    n++;
+    if (p.lon < minLon) { minLon = p.lon; }
+    if (p.lon > maxLon) { maxLon = p.lon; }
+    if (p.lat < minLat) { minLat = p.lat; }
+    if (p.lat > maxLat) { maxLat = p.lat; }
+  }
+  if (n === 0) { return undefined; }
+  const pad: number = Number.isFinite(padRatio) && padRatio > 0 ? padRatio : 0;
+  // 两个轴走**同一条**路径：撑开 → 加边距 → 保持跨度平移进中国范围。
+  // 纬度不做额外特判：fitAxis 第 ③ 步把它夹在 [18,54] 内且保跨度，
+  // 比"先把纬度夹进带里再撑开"少一次可能撞上零跨度的机会。
+  const lon: ViewSpan = fitAxis(minLon, maxLon, CHINA_BOUNDS[0], CHINA_BOUNDS[2], pad);
+  const lat: ViewSpan = fitAxis(minLat, maxLat, CHINA_BOUNDS[1], CHINA_BOUNDS[3], pad);
+  return [lon.lo, lat.lo, lon.hi, lat.hi];
+}
+
+/**
+ * 相对"全国视野"的放大倍数（**经度方向**）。
+ *
+ * 定义：`中国经度跨度 / 当前视野经度跨度`。为什么只看经度就够：`projectMercator` 对经度是
+ * 线性拉伸，`frame.w / 经度跨度` 就是"pt / 度"，两个视野在同一块画布上的比值正是 `62 / 跨度`
+ * —— **与画布多宽、框怎么居中无关**，可以当"放大了几倍"的唯一数字用（真机诊断行与预览
+ * 图例里报的就是它）。纬度方向因为墨卡托而不线性，单独算会得到另一个数（近邻城市那一档
+ * 约 0.81 倍），所以不混在一起说。
+ */
+export function viewZoomOf(bounds: number[]): number {
+  const b: number[] = normalizeBounds(bounds);
+  const span: number = b[2] - b[0];
+  const base: number = CHINA_BOUNDS[2] - CHINA_BOUNDS[0];
+  if (!(span > 0)) { return 1; }
+  return base / span;
 }
 
 // ── 排布常数（钉子的视觉尺寸只有这里一份，设备与预览共用） ──────────────────
@@ -733,9 +939,18 @@ function comparePins(a: ScenePin, b: ScenePin): number {
  * 于是 `ScenePin.x/y` 与 `hangRects` 的矩形都落在**整块画布（地图块）的坐标**里。
  * 这么定的原因：布局的边界判据（水平余量、挂载区底）说的是"屏幕边"，
  * 而屏幕边是地图块的边，不是绘制框的边 —— 绘制框居中之后两者不是一回事。
+ *
+ * ── 投影用哪个 bounds：**只从框上读**（本批新增，修的是"照片与国界各画各的"）──────
+ * `const fb = frameBounds(frame)`，两次 `projectMercator` 都用它。以前这里写的是
+ * 模块常量 `CHINA_BOUNDS`，而 `outlinePath` 收一个**自己的** bounds 参数 ——
+ * 一旦调用方给国界传了新视野、这里还按全国投，照片就会整体飘到地图外面，
+ * 而且两个函数都不报错（正是本批最该避免的失败）。现在两处都读 `frame.bounds`，
+ * 参数根本没机会不一致。
  */
 export function buildScene(photos: WallPhoto[], frame: MapFrame, zoom: number, env?: HangEnvelope): ScenePin[] {
   const z: number = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+  // 视野框：**唯一**来源是框自己（见 frameBounds 与 MapFrame.bounds）。国界那边读的是同一个。
+  const fb: number[] = frameBounds(frame);
   // 1) 筛 + 去重（用 Map 当集合：ArkTS 下 Map 是本仓库已验证的写法）
   const usable: WallPhoto[] = [];
   const seen: Map<string, boolean> = new Map<string, boolean>();
@@ -772,7 +987,7 @@ export function buildScene(photos: WallPhoto[], frame: MapFrame, zoom: number, e
       pts.push({ lat: list[j].lat, lon: list[j].lon });
     }
     const mid: GeoPoint = medianPoint(pts);
-    const proj = projectMercator(mid.lon, mid.lat, frame.w, frame.h, CHINA_BOUNDS);
+    const proj = projectMercator(mid.lon, mid.lat, frame.w, frame.h, fb);
     placed.push({ pinId: groupKeys[i], x: r2(proj.x + frame.x), y: r2(proj.y + frame.y) });
   }
 
@@ -813,7 +1028,7 @@ export function buildScene(photos: WallPhoto[], frame: MapFrame, zoom: number, e
     //（长三角并簇时它落在上海与杭州之间，名字却写着"上海"）—— 那是对"照片在哪拍的"
     // 说了一句假话。取中位数落在有一半照片的地方，名字与位置才对得上。
     const mid: GeoPoint = medianPoint(winPts);
-    const proj = projectMercator(mid.lon, mid.lat, frame.w, frame.h, CHINA_BOUNDS);
+    const proj = projectMercator(mid.lon, mid.lat, frame.w, frame.h, fb);
     const name: string = idx.length > 1 ? `${winName}等${idx.length}地` : winName;
     merged.push({ pinId: winName, x: r2(proj.x + frame.x), y: r2(proj.y + frame.y) });
     mergedNames.push(name);
@@ -912,6 +1127,9 @@ export function buildScene(photos: WallPhoto[], frame: MapFrame, zoom: number, e
  * 而不是白屏。校验到"每个 ring 是长度 ≥ 6 的偶数长度数组、元素全是有限数"这一层 ——
  * 这是"绘制命令生成器不会产出 NaN 坐标"的充分条件（NaN 会让整条 path 消失，
  * 而 SVG 不会报错，症状是"地图不见了"这种最难查的静默失败）。
+ *
+ * `bounds` 只是**带出来的元信息**（校验到"4 个有限数"为止，否则退回全国），
+ * **不参与投影** —— 投影读的是 `frame.bounds`（见 `OutlineData.bounds` 与 `outlinePath`）。
  */
 export function parseOutline(text: string): OutlineData | undefined {
   if (text === undefined || text === null || text.length === 0) { return undefined; }
@@ -936,8 +1154,7 @@ export function parseOutline(text: string): OutlineData | undefined {
     clean.push(ring);
   }
   if (clean.length === 0) { return undefined; }
-  const bounds: number[] = Array.isArray(raw.bounds) && raw.bounds.length === 4
-    ? raw.bounds : CHINA_BOUNDS;
+  const bounds: number[] = normalizeBounds(raw.bounds);
   const out: OutlineData = {
     v: raw.v === undefined ? '' : raw.v,
     src: raw.src === undefined ? '' : raw.src,
@@ -959,22 +1176,30 @@ export function parseOutline(text: string): OutlineData | undefined {
  * ── 坐标：投影到**绘制框**（`frame.w × frame.h`）后整体平移 `(frame.x, frame.y)` ──
  * 于是输出的坐标与 `buildScene` 的钉子坐标在**同一个坐标系**里（地图块坐标）：
  * 设备侧可以直接把国界与钉子放进同一个 `Shape`/`Stack`，不需要各自摆位置。
- * 平移量搞错一次的后果是"国界与照片各画各的"（钉子漂到一边去），所以两者共用同一个
- * `MapFrame` 对象，而不是各传一组宽高。
+ *
+ * ── 投影用哪个 bounds：`frame.bounds`，**没有第三个参数**（本批改的）──────────────
+ * 以前这个函数收一个 `bounds` 参数，与 `buildScene` 内部写死的 `CHINA_BOUNDS` 是两份来源 ——
+ * 视野改成"按数据求"之后，那两份一定会分叉（照片用新视野、国界用全国），
+ * 症状是**照片整体飘到地图轮廓之外**，而且两边都不报错。
+ * 现在签名里根本没有这个参数：`frameBounds(frame)` 是唯一读法，
+ * "国界与照片用同一个 bounds"因此在类型层面就成立，不靠调用方守规矩。
  *
  * ── 视口裁剪：整个落在地图块之外的环**不产出子路径** ──────────────────────────
- * 为什么需要：`china_outline.json` 的 `bounds` 与 `CHINA_REGION.bounds` 一致（必须一致，
- * 否则国界与照片会各画各的），而它的 `minLat = 18` —— 南海诸岛在 8~11.4°N，
- * 投影后落在绘制框**下方**（y > frame.y + frame.h）。不裁的话它们会飘到挂照片的区域里，
- * 看着像脏点。数据里一条都没删（96 条环全在文件里，`build-outline.ts` 会数出来
- * 77 条在块内 / 19 条在块外），这里只是**视口剔除**：屏幕外的东西不画。
- * 实测 96 条环里 **0 条跨界**（要么整条在块内、要么整条在块外），所以这个剔除是精确的、
- * 不是近似。真出现跨界的环时会整条画出来（多出的部分由调用方的 frame 裁掉，
- * 设备侧是容器的 `.clip(true)`）—— 那种情况下误差上界是一条描边宽度。
+ * 为什么需要：`china_outline.json` 的 `bounds` 与 `CHINA_REGION.bounds` 一致，
+ * 而它的 `minLat = 18` —— 南海诸岛在 8~11.4°N，投影后落在绘制框**下方**。
+ * 不裁的话它们会飘到挂照片的区域里，看着像脏点。数据里一条都没删（96 条环全在文件里），
+ * 这里只是**视口剔除**：屏幕外的东西不画。
+ * 放大到"几个邻近城市"那一档时，被剔除的环会明显变多（新疆/西藏/南海都在视野外）——
+ * 这是**预期后果**，取舍写在报告的"放大后国界可能整条在视野外"一节。
+ *
+ * 剔除的粒度是**整条环**：只要一条环有任何一点在块内就整条画出来。放大之后，
+ * 中国轮廓那条主环会横跨整个视野（环上大多数点在块外、但少数点在块内），
+ * 于是它的子路径被保留、由调用方按框裁剪（设备侧是容器的 `.clip(true)`）——
+ * 结果是"视野附近的海岸线会露出来"，这是好事，不是缺陷。
  */
-export function outlinePath(rings: number[][], frame: MapFrame, bounds: number[]): string {
+export function outlinePath(rings: number[][], frame: MapFrame): string {
   if (rings === undefined || rings === null || rings.length === 0) { return ''; }
-  const b: number[] = Array.isArray(bounds) && bounds.length === 4 ? bounds : CHINA_BOUNDS;
+  const b: number[] = frameBounds(frame);
   const boxW: number = frame.blockW;
   const boxH: number = frame.blockH;
   const parts: string[] = [];

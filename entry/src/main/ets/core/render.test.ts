@@ -15,10 +15,10 @@ import { parseAreaData } from './areaData.ts';
 import { CHINA_REGION, projectMercator } from './projection.ts';
 import { MAX_HANG, MIN_PIN_DIST_PT } from './placement.ts';
 import {
-  HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, HANG_OVERLAP_EPS, HANG_SWEEP_RAD, TRACK_WIDTH,
-  arcSpread, arcSpreadNeed, buildScene, clampRect, dateLabel, geoAspect, hangBottom, hangOffsets, hangRects,
-  mapBoxHeight, mapFrame, outlinePath, parseOutline, pinTime, rectOverlapArea, sceneToSvg,
-  trajectoryOrder, trajectoryPath
+  HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, HANG_OVERLAP_EPS, HANG_SWEEP_RAD, MIN_VIEW_SPAN_DEG, TRACK_WIDTH,
+  VIEW_PAD_RATIO, arcSpread, arcSpreadNeed, buildScene, clampRect, dateLabel, fitBounds, frameBounds,
+  geoAspect, hangBottom, hangOffsets, hangRects, mapBoxHeight, mapFrame, normalizeBounds, outlinePath,
+  parseOutline, pinTime, rectOverlapArea, sceneToSvg, trajectoryOrder, trajectoryPath, viewZoomOf
 } from './render.ts';
 import type { CardRect, MapFrame, ScenePin, WallPhoto } from './render.ts';
 
@@ -45,7 +45,7 @@ const FULL_FRAME: MapFrame = { blockW: W, blockH: H, x: 0, y: 0, w: W, h: H };
 
 /** 按某个框投影一个经纬度（结果已含框的平移），与 `buildScene` 内部的算法同源。 */
 function atFrame(lon: number, lat: number, frame: MapFrame): { x: number; y: number } {
-  const p = projectMercator(lon, lat, frame.w, frame.h, CHINA_REGION.bounds);
+  const p = projectMercator(lon, lat, frame.w, frame.h, frameBounds(frame));
   return { x: p.x + frame.x, y: p.y + frame.y };
 }
 
@@ -327,6 +327,226 @@ test('buildScene：境外坐标不丢，得到一个坐标标签的钉子（M2 �
   assert.ok(pins[0].name.indexOf('°N') > 0, `境外的钉子应带坐标标签：${pins[0].name}`);
 });
 
+// ── 视野框 fitBounds：地图缩放到用户的足迹范围（task-15 的核心） ─────────────
+//
+// 这一批修的是"地图永远画整个中国、而用户只去过 3 个城市"。下面每个测试都对着
+// **设备上的真值**（控制器核实：28 张上墙、7 张有坐标、上海+北京+天津）来写。
+
+/** 设备真值里的三座城（控制器核实的城市级坐标）。 */
+const SH_LAT = 31.25;
+const SH_LON = 121.48;
+const BJ_LAT = 39.93;
+const BJ_LON = 116.42;
+const TJ_LAT = 39.12;
+const TJ_LON = 117.21;
+
+/** 视野框的经度跨度。`fitBounds` 可能返回 undefined（调用方要处理），这里只给测试用。 */
+function lonSpanOf(b: number[] | undefined): number {
+  assert.ok(b !== undefined, '期望有一个视野框，实际是 undefined');
+  if (b === undefined) { return Number.NaN; }
+  return b[2] - b[0];
+}
+
+/** 读一份 tools/fixtures 下的预览数据（与 `render-preview.ts` 用的是**同一批文件**）。 */
+function loadFixture(rel: string): WallPhoto[] {
+  const url = new URL(`../../../../../tools/fixtures/${rel}`, import.meta.url);
+  const parsed = JSON.parse(fs.readFileSync(url, 'utf8')) as { photos: WallPhoto[] };
+  return parsed.photos;
+}
+
+test('fitBounds：多城市 → 框包含全部坐标、四周带内边距、落在国内', () => {
+  const photos = [ph('sh', SH_LAT, SH_LON, 0), ph('bj', BJ_LAT, BJ_LON, 0), ph('tj', TJ_LAT, TJ_LON, 0)];
+  const b = fitBounds(photos, VIEW_PAD_RATIO);
+  assert.ok(b !== undefined);
+  // ① "能看到它们全部"：每张照片都严格在框**内侧**（因为还加了边距）
+  for (let i = 0; i < photos.length; i++) {
+    const p: WallPhoto = photos[i];
+    assert.ok(b[0] < p.lon && p.lon < b[2], `经度没有被框住：${p.photoId} lon=${p.lon} 框=[${b[0]},${b[2]}]`);
+    assert.ok(b[1] < p.lat && p.lat < b[3], `纬度没有被框住：${p.photoId} lat=${p.lat} 框=[${b[1]},${b[3]}]`);
+  }
+  // ② 跨度 = 数据跨度 × (1 + 2×padRatio)：120.48~116.42 = 5.06° → 6.578
+  const wantLon = (SH_LON - BJ_LON) * (1 + 2 * VIEW_PAD_RATIO);
+  assert.ok(Math.abs(lonSpanOf(b) - wantLon) < 1e-9, `经度跨度 ${lonSpanOf(b)} != ${wantLon}`);
+  const wantLat = (BJ_LAT - SH_LAT) * (1 + 2 * VIEW_PAD_RATIO);
+  assert.ok(Math.abs((b[3] - b[1]) - wantLat) < 1e-9);
+  // ③ 落在国内（钳制是硬契约）
+  assert.ok(b[0] >= CHINA_REGION.bounds[0] && b[2] <= CHINA_REGION.bounds[2]);
+  assert.ok(b[1] >= CHINA_REGION.bounds[1] && b[3] <= CHINA_REGION.bounds[3]);
+  // ④ 真的放大了：跨度远小于全国（这就是"地图铺满屏幕"的来源）
+  const chinaLon = CHINA_REGION.bounds[2] - CHINA_REGION.bounds[0];
+  assert.ok(lonSpanOf(b) < chinaLon / 5, `视野没有被拉近：跨度 ${lonSpanOf(b)} vs 全国 ${chinaLon}`);
+  assert.ok(Math.abs(viewZoomOf(b) - chinaLon / wantLon) < 1e-9);
+  assert.equal(viewZoomOf(CHINA_REGION.bounds), 1);
+});
+
+test('fitBounds：近邻城市那一档在 360×720 上真的**填满高度**（地图铺满屏幕）', () => {
+  const b = fitBounds([ph('sh', SH_LAT, SH_LON, 0), ph('bj', BJ_LAT, BJ_LON, 0), ph('tj', TJ_LAT, TJ_LON, 0)], VIEW_PAD_RATIO);
+  assert.ok(b !== undefined);
+  const f: MapFrame = mapFrame(W, H, b);
+  // 地图框填满整块可用高度 —— 这是"地图铺满屏幕"的**几何**表述（task-14 只做到了"块铺满"，
+  // 框还是整个中国那条 267.7pt 的横带；拉近到足迹范围之后框才真的长得满屏高）。
+  assert.ok(Math.abs(f.h - H) < 1e-9, `地图框没有填满高度：${f.h} vs ${H}`);
+  assert.ok(f.w > 0 && f.w <= W + 1e-9, `框宽越界：${f.w}`);
+  assert.ok(f.x > 0, '框应当左右居中留一点白');
+  assert.ok(Math.abs(f.w / f.h - geoAspect(b)) < 1e-9, '框变形了');
+});
+
+test('fitBounds：只有一个点 → 撑到最小跨度，不是零跨度（零跨度会让整块画布变 NaN）', () => {
+  const b = fitBounds([ph('one', SH_LAT, SH_LON, 0)], VIEW_PAD_RATIO);
+  assert.ok(b !== undefined);
+  const want = MIN_VIEW_SPAN_DEG * (1 + 2 * VIEW_PAD_RATIO);
+  assert.ok(Math.abs(lonSpanOf(b) - want) < 1e-9, `经度跨度 ${lonSpanOf(b)} != ${want}`);
+  assert.ok(Math.abs((b[3] - b[1]) - want) < 1e-9, `纬度跨度 ${b[3] - b[1]} != ${want}`);
+  // 点还在正中（撑开是绕中心做的，不是往一侧长）
+  assert.ok(Math.abs((b[0] + b[2]) / 2 - SH_LON) < 1e-9);
+  assert.ok(Math.abs((b[1] + b[3]) / 2 - SH_LAT) < 1e-9);
+  // 真的能投影：钉子有限、在框内、且国界 path 不产 NaN
+  const f: MapFrame = mapFrame(W, H, b);
+  const pins = buildScene([ph('one', SH_LAT, SH_LON, 0)], f, 1);
+  assert.equal(pins.length, 1);
+  assert.ok(Number.isFinite(pins[0].x) && Number.isFinite(pins[0].y));
+  assert.ok(pins[0].x >= f.x && pins[0].x <= f.x + f.w && pins[0].y >= f.y && pins[0].y <= f.y + f.h);
+  assert.ok(!outlinePath([[SH_LON, SH_LAT, SH_LON + 0.01, SH_LAT, SH_LON, SH_LAT + 0.01]], f).includes('NaN'));
+});
+
+test('fitBounds：空数组 / 一张有坐标的都没有 → undefined（调用方退回全国视野）', () => {
+  assert.equal(fitBounds([], VIEW_PAD_RATIO), undefined);
+  // (0,0) 且没有 manual —— hasPlace 说是"没有地点"（0 不是几内亚湾）
+  assert.equal(fitBounds([ph('a', 0, 0, 0), ph('b', 0, 0, 1700000000000)], VIEW_PAD_RATIO), undefined);
+  // NaN 坐标是坏数据，不算
+  assert.equal(fitBounds([ph('nan', Number.NaN, Number.NaN, 0)], VIEW_PAD_RATIO), undefined);
+  assert.equal(fitBounds([ph('nanlon', SH_LAT, Number.NaN, 0)], VIEW_PAD_RATIO), undefined);
+});
+
+test('fitBounds：钳制 —— 境外坐标（东京）被夹进国内，且跨度**不许塌成 0**', () => {
+  const photos = [ph('tokyo', 35.6762, 139.6503, 0)];
+  const b = fitBounds(photos, VIEW_PAD_RATIO);
+  assert.ok(b !== undefined);
+  // 经度整条被推到中国的东边界上（maxLon = 135），跨度仍是 0.6×1.3 = 0.78
+  assert.equal(b[2], CHINA_REGION.bounds[2], 'maxLon 没有被夹到 135');
+  assert.ok(Math.abs(lonSpanOf(b) - MIN_VIEW_SPAN_DEG * (1 + 2 * VIEW_PAD_RATIO)) < 1e-9,
+    `夹完之后跨度变了：${lonSpanOf(b)} —— 夹两端而不是平移就会出现这种（甚至塌成 0）`);
+  assert.ok(b[0] >= CHINA_REGION.bounds[0] && b[2] <= CHINA_REGION.bounds[2]);
+  assert.ok(b[1] >= CHINA_REGION.bounds[1] && b[3] <= CHINA_REGION.bounds[3]);
+  assert.ok(b[2] > b[0] && b[3] > b[1], '跨度塌成 0 —— 投影会得到 NaN，整块画布消失');
+  // 投影不产 NaN；境外的钉子落在画布外（既有约定：境外照片不删、只是可能落在画布外）
+  const f: MapFrame = mapFrame(W, H, b);
+  const pins = buildScene(photos, f, 1);
+  assert.equal(pins.length, 1);
+  assert.ok(Number.isFinite(pins[0].x) && Number.isFinite(pins[0].y));
+  assert.ok(pins[0].x > f.x + f.w, `境外的钉子应当落在框右外侧：x=${pins[0].x} 框右=${f.x + f.w}`);
+  assert.ok(!outlinePath([[139.6503, 35.6762, 139.66, 35.6762, 139.66, 35.67]], f).includes('NaN'));
+});
+
+test('fitBounds：padRatio 按跨度比例放大（0 = 紧贴数据；非法值按 0）', () => {
+  const photos = [ph('sh', SH_LAT, SH_LON, 0), ph('bj', BJ_LAT, BJ_LON, 0)];
+  const raw = SH_LON - BJ_LON;
+  const s0 = lonSpanOf(fitBounds(photos, 0));
+  const s15 = lonSpanOf(fitBounds(photos, 0.15));
+  const s30 = lonSpanOf(fitBounds(photos, 0.3));
+  assert.ok(Math.abs(s0 - raw) < 1e-9, `pad=0 时应当紧贴数据：${s0} vs ${raw}`);
+  assert.ok(Math.abs(s15 - raw * 1.3) < 1e-9, `${s15} vs ${raw * 1.3}`);
+  assert.ok(Math.abs(s30 - raw * 1.6) < 1e-9, `${s30} vs ${raw * 1.6}`);
+  assert.ok(s0 < s15 && s15 < s30, 'padRatio 变大时视野应当单调变大');
+  // 非法 padRatio 按 0 处理（不是 NaN 传播）
+  assert.equal(lonSpanOf(fitBounds(photos, -1)), s0);
+  assert.equal(lonSpanOf(fitBounds(photos, Number.NaN)), s0);
+  // 设备与预览共用同一个常量，不是一个写死的数
+  assert.ok(VIEW_PAD_RATIO > 0 && VIEW_PAD_RATIO < 0.5);
+});
+
+test('frameBounds：手写的 MapFrame 字面量 / 非法 bounds → 全国视野（老行为不变）', () => {
+  assert.deepEqual(frameBounds(FULL_FRAME), CHINA_REGION.bounds);
+  const shortBounds: MapFrame = { blockW: W, blockH: H, x: 0, y: 0, w: W, h: H, bounds: [1, 2, 3] };
+  assert.deepEqual(frameBounds(shortBounds), CHINA_REGION.bounds);
+  const nanBounds: MapFrame = { blockW: W, blockH: H, x: 0, y: 0, w: W, h: H, bounds: [Number.NaN, 18, 135, 54] };
+  assert.deepEqual(frameBounds(nanBounds), CHINA_REGION.bounds);
+  // 零跨度是**最危险**的一种非法（会让 projectMercator 除零）→ 必须退
+  assert.deepEqual(frameBounds(mapFrame(W, H, [73, 54, 73, 54])), CHINA_REGION.bounds);
+  assert.deepEqual(normalizeBounds(undefined), CHINA_REGION.bounds);
+  // 合法值原样带出，且 mapFrame 会把它存进框里
+  assert.deepEqual(frameBounds(mapFrame(W, H, CHINA_REGION.bounds)), CHINA_REGION.bounds);
+});
+
+test('国界与照片用**同一个** bounds：同一经纬度在国界 path 与照片钉子上落在同一个画布点', () => {
+  // 这是本批最容易错的地方：照片用"数据求出的新视野"、国界还用全国 bounds
+  // → 照片整体飘到地图轮廓之外，而两边都不报错。
+  const photos = [ph('sh', SH_LAT, SH_LON, 0)];
+  const b = fitBounds(photos, VIEW_PAD_RATIO);
+  assert.ok(b !== undefined);
+  const frame: MapFrame = mapFrame(W, H, b);
+  // ① 框自己带着这份 bounds（不是全国）
+  assert.deepEqual(frameBounds(frame), b);
+  assert.notDeepEqual(frameBounds(frame), CHINA_REGION.bounds);
+  // ② 照片按它投影
+  const pins = buildScene(photos, frame, 1);
+  assert.equal(pins.length, 1);
+  const want = atFrame(SH_LON, SH_LAT, frame);
+  assert.ok(Math.abs(pins[0].x - want.x) < 0.02, `钉子没按 frame.bounds 投影：${pins[0].x} vs ${want.x}`);
+  assert.ok(Math.abs(pins[0].y - want.y) < 0.02);
+  // ③ 国界 path 里**同一个经纬度**的点必须落在同一个地方（outlinePath 现在不收 bounds 参数，
+  //    所以"两套 bounds"在类型上就写不出来 —— 这条测试是它的行为级证明）
+  const ring = [SH_LON, SH_LAT, SH_LON + 0.01, SH_LAT, SH_LON, SH_LAT + 0.01];
+  const d = outlinePath([ring], frame);
+  assert.ok(d.startsWith('M'), '国界 path 应当有内容（这个环就在视野正中）');
+  const nums = d.replace(/[MLZ]/g, ' ').trim().split(/\s+/).map((s: string) => Number(s));
+  assert.ok(Math.abs(nums[0] - pins[0].x) < 0.05,
+    `国界与照片不在同一个 bounds：国界 x=${nums[0]} 照片 x=${pins[0].x}`);
+  assert.ok(Math.abs(nums[1] - pins[0].y) < 0.05,
+    `国界与照片不在同一个 bounds：国界 y=${nums[1]} 照片 y=${pins[0].y}`);
+  // ④ 判别力：若照片还用**全国** bounds 投（老行为），同一个点会差 ~213pt —— 这条测试抓得住
+  const old = atFrame(SH_LON, SH_LAT, mapFrame(W, H, CHINA_REGION.bounds));
+  const dist = Math.sqrt((old.x - pins[0].x) * (old.x - pins[0].x) + (old.y - pins[0].y) * (old.y - pins[0].y));
+  assert.ok(dist > 100, `本条测试失去了判别力：新旧视野下这个点只差 ${dist}pt`);
+});
+
+// ── 两份 fixture：广域（退回接近全国）与近邻城市（真的放大） ──────────────────
+
+test('广域 fixture（wall-sample.json：乌鲁木齐/敦煌/拉萨/广州/北京/上海）→ 视野接近全国，不放大', () => {
+  const photos = loadFixture('wall-sample.json');
+  assert.ok(photos.length > 20, `fixture 读进来只有 ${photos.length} 条`);
+  const b = fitBounds(photos, VIEW_PAD_RATIO);
+  assert.ok(b !== undefined);
+  const chinaLon = CHINA_REGION.bounds[2] - CHINA_REGION.bounds[0];
+  // 跨度接近全国（实测 44.05° vs 62°），放大倍数是个小数字 —— "跨度大时不放大"
+  assert.ok(lonSpanOf(b) > chinaLon * 0.6, `广域数据被放大过头了：跨度 ${lonSpanOf(b)}`);
+  assert.ok(viewZoomOf(b) < 1.6, `放大倍数过大：${viewZoomOf(b)}`);
+  assert.ok(b[0] >= CHINA_REGION.bounds[0] && b[2] <= CHINA_REGION.bounds[2]);
+  assert.ok(b[1] >= CHINA_REGION.bounds[1] && b[3] <= CHINA_REGION.bounds[3]);
+  // "能看到它们全部"的**不变量**：凡是坐标本来就在中国范围内的照片，一定在框内。
+  // （三沙永兴岛 16.83°N 在中国 bounds 的 minLat=18 之外，是已知例外，见 render.ts 文件头第 3 条）
+  for (let i = 0; i < photos.length; i++) {
+    const p: WallPhoto = photos[i];
+    if (!(p.manual === true || p.lat !== 0 || p.lon !== 0)) { continue; }
+    if (p.lon < CHINA_REGION.bounds[0] || p.lon > CHINA_REGION.bounds[2]) { continue; }
+    if (p.lat < CHINA_REGION.bounds[1] || p.lat > CHINA_REGION.bounds[3]) { continue; }
+    assert.ok(p.lon >= b[0] && p.lon <= b[2] && p.lat >= b[1] && p.lat <= b[3],
+      `在中国范围内的照片跑到框外了：${p.photoId}`);
+  }
+});
+
+test('近邻城市 fixture（wall-sample-nearby.json：上海+北京+天津）→ 框跨度 = 设备真值，放大 ~9.4 倍', () => {
+  const photos = loadFixture('wall-sample-nearby.json');
+  // 数据盒必须**正好**是控制器在设备上核实的那个：经度 116.42~121.48、纬度 31.25~39.93
+  const raw = fitBounds(photos, 0);
+  assert.ok(raw !== undefined);
+  assert.ok(Math.abs(raw[0] - 116.42) < 1e-6, `minLon=${raw[0]}`);
+  assert.ok(Math.abs(raw[1] - 31.25) < 1e-6, `minLat=${raw[1]}`);
+  assert.ok(Math.abs(raw[2] - 121.48) < 1e-6, `maxLon=${raw[2]}`);
+  assert.ok(Math.abs(raw[3] - 39.93) < 1e-6, `maxLat=${raw[3]}`);
+  // 加边距之后：经度 6.578°、放大 62/6.578 ≈ 9.43 倍
+  const b = fitBounds(photos, VIEW_PAD_RATIO);
+  assert.ok(b !== undefined);
+  const zoom = viewZoomOf(b);
+  assert.ok(Math.abs(zoom - 9.43) < 0.05, `放大倍数 ${zoom}（期望 ≈9.43）`);
+  // 与广域 fixture 对比：这一档才是"地图铺满屏幕"
+  const wide = fitBounds(loadFixture('wall-sample.json'), VIEW_PAD_RATIO);
+  assert.ok(wide !== undefined);
+  assert.ok(zoom > 5 * viewZoomOf(wide), `近邻城市 ${zoom} 倍 vs 广域 ${viewZoomOf(wide)} 倍 —— 应当差一个量级`);
+  const f: MapFrame = mapFrame(W, H, b);
+  assert.ok(Math.abs(f.h - H) < 1e-9, '近邻城市那一档应当填满高度');
+});
+
 // ── 轮廓：解析与 path ───────────────────────────────────────────────────────
 
 const GOOD_OUTLINE = JSON.stringify({
@@ -360,7 +580,7 @@ test('parseOutline：坏输入返回 undefined，不抛错', () => {
 test('outlinePath：一条 ring 一条子路径，坐标落在画布内且保留 2 位小数', () => {
   const o = parseOutline(GOOD_OUTLINE);
   assert.ok(o !== undefined);
-  const d = outlinePath(o.rings, FRAME, o.bounds);
+  const d = outlinePath(o.rings, FRAME);
   assert.ok(d.startsWith('M'), 'path 未以 M 开头');
   assert.ok(d.endsWith('Z'));
   assert.equal(d.split('M').length - 1, 1, 'ring 数与子路径数不一致');
@@ -375,15 +595,22 @@ test('outlinePath：一条 ring 一条子路径，坐标落在画布内且保留
 
 test('outlinePath：多个 ring → 多个子路径；空输入返回空串', () => {
   const rings = [[73, 54, 74, 54, 74, 53], [80, 40, 81, 40, 81, 39]];
-  const d = outlinePath(rings, FRAME, CHINA_REGION.bounds);
+  const d = outlinePath(rings, FRAME);
   assert.equal(d.split('M').length - 1, 2);
-  assert.equal(outlinePath([], FRAME, CHINA_REGION.bounds), '');
+  assert.equal(outlinePath([], FRAME), '');
 });
 
-test('outlinePath：越界的 bounds 参数退回 CHINA_REGION.bounds（不产出 NaN）', () => {
-  const d = outlinePath([[100, 30, 101, 30, 101, 29]], FRAME, [1, 2, 3]);
+test('outlinePath：投影只用 frame.bounds —— 框上 bounds 非法时退回全国视野（不产出 NaN）', () => {
+  // 以前这个函数收一个 bounds 参数，越界时由它自己退回 CHINA_REGION.bounds。
+  // 现在没有这个参数了（"国界与照片同一个 bounds"在类型层面成立，见 render.ts 的说明），
+  // 归一化发生在**框**这一层：mapFrame / frameBounds 都过 normalizeBounds。
+  const broken: MapFrame = mapFrame(W, H, [1, 2, 3]);
+  assert.deepEqual(frameBounds(broken), CHINA_REGION.bounds, '非法 bounds 没有被退回全国视野');
+  const d = outlinePath([[100, 30, 101, 30, 101, 29]], broken);
   assert.ok(d.length > 0);
   assert.ok(!d.includes('NaN'));
+  // 与"显式给全国视野的框"逐字符相同 —— 证明退回是真的退回，不是另一种投影
+  assert.equal(d, outlinePath([[100, 30, 101, 30, 101, 29]], mapFrame(W, H, CHINA_REGION.bounds)));
 });
 
 test('outlinePath：整个落在地图块外的环被剔除（视口剔除，不是删数据）', () => {
@@ -391,12 +618,12 @@ test('outlinePath：整个落在地图块外的环被剔除（视口剔除，不
   const small: MapFrame = mapFrame(W, 100, CHINA_REGION.bounds);
   const inside = [73, 54, 74, 54, 74, 53];
   const below = [100, 5, 101, 5, 101, 4];
-  const d = outlinePath([inside, below], small, CHINA_REGION.bounds);
+  const d = outlinePath([inside, below], small);
   assert.equal(d.split('M').length - 1, 1, '视口外的环没有被剔除');
-  assert.equal(outlinePath([below], small, CHINA_REGION.bounds), '', '整屏都在视口外时应当返回空串');
+  assert.equal(outlinePath([below], small), '', '整屏都在视口外时应当返回空串');
   // 横向出界同理（经度 10°E 远在 bounds 的 minLon=73 之西）
   const left = [10, 40, 11, 40, 11, 39];
-  assert.equal(outlinePath([left], small, CHINA_REGION.bounds), '');
+  assert.equal(outlinePath([left], small), '');
 });
 
 test('outlinePath：坐标在**块坐标**里 —— 框居中时轮廓跟着偏移 frame.x / frame.y', () => {
@@ -404,7 +631,7 @@ test('outlinePath：坐标在**块坐标**里 —— 框居中时轮廓跟着偏
   const tall: MapFrame = mapFrame(200, 900, CHINA_REGION.bounds);
   assert.ok(tall.y > 0, `这个块应当让框纵向居中：y=${tall.y}`);
   const ring = [73, 54, 135, 54, 135, 18, 73, 18];
-  const d = outlinePath([ring], tall, CHINA_REGION.bounds);
+  const d = outlinePath([ring], tall);
   const nums = d.replace(/[MLZ]/g, ' ').trim().split(/\s+/).map((s: string) => Number(s));
   let minY = Number.POSITIVE_INFINITY;
   let maxY = Number.NEGATIVE_INFINITY;
@@ -420,13 +647,14 @@ test('outlinePath：坐标在**块坐标**里 —— 框居中时轮廓跟着偏
 
 const OUTLINE_URL = new URL('../../resources/rawfile/china_outline.json', import.meta.url);
 
-test('china_outline.json：真实文件能解析、bounds 与 CHINA_REGION 完全一致、环数不变', () => {
+test('china_outline.json：真实文件能解析、许可与出处齐、环数不变', () => {
   const text = fs.readFileSync(OUTLINE_URL, 'utf8');
   assert.ok(Buffer.byteLength(text, 'utf8') <= 200 * 1024, `轮廓文件超过 200KB：${Buffer.byteLength(text, 'utf8')}`);
   const od = parseOutline(text);
   assert.ok(od !== undefined, 'china_outline.json 过不了 parseOutline —— 设备上地图会整块消失（静默失败）');
-  // 这一条是「地图与钉子对齐」的全部保障：钉子用 CHINA_REGION.bounds 投影、
-  // 国界用文件里的 bounds 投影，两者一旦不同就会各画各的，而且谁都不报错。
+  // 这一条**不再**是"地图与钉子对齐"的保障（那是 frame.bounds 的事，见下面那条测试），
+  // 而是**数据完整性**的保障：这份轮廓数据本身是全国的 —— 它的 bounds 与 CHINA_REGION 一致，
+  // 才说明"96 条环覆盖整个中国"这句话成立，也才不会有人拿一份局部数据冒充全国轮廓。
   assert.deepEqual(od.bounds, CHINA_REGION.bounds);
   assert.ok(od.license.length > 0, '缺少许可字段');
   assert.ok(od.src.indexOf('Natural Earth') >= 0, `来源字段没写清出处：${od.src}`);
@@ -442,7 +670,7 @@ test('china_outline.json：投到地图框上的路径非空、无 NaN、且没�
   const mapH = mapBoxHeight(W, CHINA_REGION.bounds);
   const frame: MapFrame = mapFrame(W, mapH, CHINA_REGION.bounds);
   assert.ok(Math.abs(frame.x) < 1e-9 && Math.abs(frame.y) < 1e-9, '块的比例正好时平移量应当是 0');
-  const d = outlinePath(od.rings, frame, od.bounds);
+  const d = outlinePath(od.rings, frame);
   assert.ok(d.length > 0, '轮廓 path 是空的');
   assert.ok(!d.includes('NaN') && !d.includes('Infinity'));
   // 视口剔除之后，子路径的坐标必须全部落在 [0,W]×[0,mapH] 内（实测 0 条跨界环）
@@ -575,7 +803,7 @@ function demoPins(): ScenePin[] {
 
 test('sceneToSvg：产出结构完整的 SVG（含国界 path、钉子组、每个钉子的照片数）', () => {
   const pins = demoPins();
-  const d = outlinePath(parseOutline(GOOD_OUTLINE)!.rings, FRAME, CHINA_REGION.bounds);
+  const d = outlinePath(parseOutline(GOOD_OUTLINE)!.rings, FRAME);
   const svg = sceneToSvg(pins, W, H, d);
   assert.ok(svg.startsWith('<svg '));
   assert.ok(svg.endsWith('</svg>'));
@@ -1076,7 +1304,7 @@ test('sceneToSvg：轨迹画在图层的正确位置上（国界之上、照片�
   const pins = buildScene(trailScene(), FRAME, 1);
   const od = parseOutline(GOOD_OUTLINE);
   assert.ok(od !== undefined);
-  const svg = sceneToSvg(pins, W, H, outlinePath(od.rings, FRAME, od.bounds));
+  const svg = sceneToSvg(pins, W, H, outlinePath(od.rings, FRAME));
   assert.ok(svg.includes('<g id="trajectory">'), '缺少轨迹层');
   const mapAt = svg.indexOf('fill="#E8F0E4"');
   const trackAt = svg.indexOf('<g id="trajectory">');
