@@ -16,10 +16,11 @@ import { CHINA_REGION, projectMercator } from './projection.ts';
 import { MAX_HANG, MIN_PIN_DIST_PT } from './placement.ts';
 import {
   HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, HANG_OVERLAP_EPS, HANG_SWEEP_RAD, MIN_VIEW_SPAN_DEG, TRACK_WIDTH,
-  VIEW_PAD_RATIO, PROVINCE_STROKE, PROVINCE_WIDTH, arcSpread, arcSpreadNeed, buildScene, clampRect,
-  dateLabel, fitBounds, fitViewToCanvas, frameBounds, geoAspect, hangBottom, hangOffsets, hangRects,
-  mapBoxHeight, mapFrame, normalizeBounds, outlinePath, parseOutline, pinTime, rectOverlapArea, sceneToSvg,
-  trajectoryOrder, trajectoryPath, viewZoomOf
+  VIEW_PAD_RATIO, PROVINCE_STROKE, PROVINCE_WIDTH, MAX_VIEW_SPAN_DEG, MIN_ZOOMED_VIEW_SPAN_DEG,
+  arcSpread, arcSpreadNeed, buildScene, clampRect, dateLabel, fitBounds, fitViewToCanvas, frameBounds,
+  geoAspect, hangBottom, hangOffsets, hangRects, mapBoxHeight, mapFrame, normalizeBounds, outlinePath,
+  panViewBy, parseOutline, pinTime, rectOverlapArea, sceneToSvg, trajectoryOrder, trajectoryPath,
+  viewZoomOf, zoomViewAt
 } from './render.ts';
 import type { CardRect, MapFrame, ScenePin, WallPhoto } from './render.ts';
 
@@ -1104,6 +1105,171 @@ test('省界在**真机那一档视野**下确实还有线可画（放大 9.5 �
   const dc = outlinePath(od.rings, frame);
   assert.ok(dp.length > dc.length * 1.5,
     `真机视野下省界（${dp.length}）没有比国界（${dc.length}）密 —— 用户会再次看到"一片"`);
+});
+
+// ── 手势视野 zoomViewAt / panViewBy（task-16 的第 3 件事）────────────────────
+//
+// 用户原话：「还有地图应该支持缩放吧 默认铺满」。这两个函数是手势的**全部数学**，
+// 不带 ArkUI（WallPage 只负责把手势事件的 vp 除以画布宽高，然后调它们）。
+//
+// 这一节里"不动点""内容位移"这两类断言都用 `projectMercator` **独立复核**
+// （不用实现里的 mercY 公式再算一遍）—— 那样才能抓住"参考端搞反"这类错误。
+// 实测确实抓到过两个：偏心缩放的不动点参考端取成了南边、以及平移的纵向符号与横向同向。
+
+/** 归一化位置：把经纬度投影到某个视野框上，返回 (x/框宽, y/框高)。 */
+function normIn(b: number[], lon: number, lat: number, boxW: number, boxH: number): number[] {
+  const f: MapFrame = mapFrame(boxW, boxH, b);
+  const p = projectMercator(lon, lat, f.w, f.h, frameBounds(f));
+  return [p.x / f.w, p.y / f.h];
+}
+
+/** 某个归一化位置对应的经纬度（用 projectMercator 反解，与实现无关）。 */
+function geoAt(b: number[], fx: number, fy: number, boxW: number, boxH: number): number[] {
+  const f: MapFrame = mapFrame(boxW, boxH, b);
+  const bb: number[] = frameBounds(f);
+  // 经度线性
+  const lon = bb[0] + (bb[2] - bb[0]) * fx;
+  // 纵向：p.y 与 mercY 线性；用两次采样定出"mercY 从北往南"的插值。
+  // 画布顶端（p.y = 0）是**北**（mercY 最大），所以按 fy 从北往南取。
+  const pN = projectMercator(lon, bb[3], f.w, f.h, bb);
+  const pS = projectMercator(lon, bb[1], f.w, f.h, bb);
+  const target = pN.y + (pS.y - pN.y) * fy;
+  let a = bb[1];
+  let c = bb[3];
+  for (let i = 0; i < 80; i++) {
+    const m = (a + c) / 2;
+    // p.y 随纬度**递减**（北在上）
+    if (projectMercator(lon, m, f.w, f.h, bb).y > target) { a = m; } else { c = m; }
+  }
+  return [lon, (a + c) / 2];
+}
+
+test('zoomViewAt：以给出的归一化点为**不动点** —— 偏心缩放也精确不动', () => {
+  const b: number[] = [115.01, 29.95, 122.89, 41.23];
+  const cases: number[][] = [[0.25, 0.75], [0.5, 0.5], [0.9, 0.1], [0.02, 0.98]];
+  for (let k = 0; k < cases.length; k++) {
+    const fx: number = cases[k][0];
+    const fy: number = cases[k][1];
+    const g: number[] = geoAt(b, fx, fy, DEV_BOX_W, DEV_BOX_H);
+    const before: number[] = normIn(b, g[0], g[1], DEV_BOX_W, DEV_BOX_H);
+    const z: number[] = zoomViewAt(b, 2.5, fx, fy);
+    const after: number[] = normIn(z, g[0], g[1], DEV_BOX_W, DEV_BOX_H);
+    // 缩放前那个点就在 (fx, fy) 上（反解正确性的自检）
+    assert.ok(Math.abs(before[0] - fx) < 1e-9 && Math.abs(before[1] - fy) < 1e-9,
+      `反解失败：(${fx},${fy}) 得到 (${before[0]},${before[1]})`);
+    // 缩放后仍然在 (fx, fy) 上 —— 这才是"不动点"的机器可读含义
+    assert.ok(Math.abs(after[0] - fx) < 1e-6, `不动点横向跑掉：${after[0]} != ${fx}（fx=${fx} fy=${fy}）`);
+    assert.ok(Math.abs(after[1] - fy) < 1e-6, `不动点纵向跑掉：${after[1]} != ${fy}（fx=${fx} fy=${fy}）`);
+    // 跨度确实按 factor 缩了，比例不变
+    assert.ok(Math.abs((z[2] - z[0]) - (b[2] - b[0]) / 2.5) < 1e-9);
+    assert.ok(Math.abs(geoAspect(z) - geoAspect(b)) < 1e-9, '缩放改变了宽高比');
+  }
+});
+
+test('zoomViewAt：缩放界限 = [单城市级 0.6°，全国 62°]，且夹完仍以同一点为不动点', () => {
+  const b: number[] = [115.01, 29.95, 122.89, 41.23];
+  // 放大到极限：经度跨度收到 MIN_VIEW_SPAN_DEG（= 0.6°，"一个地级市加近郊"）
+  const zin: number[] = zoomViewAt(b, 1e6, 0.4, 0.6);
+  assert.ok(Math.abs((zin[2] - zin[0]) - MIN_ZOOMED_VIEW_SPAN_DEG) < 1e-9,
+    `放大上限不是单城市级：${zin[2] - zin[0]}`);
+  // 缩小到极限：经度跨度放到全国跨度（= 62°，再往外没有任何轮廓数据可画）
+  const zout: number[] = zoomViewAt(b, 1e-6, 0.5, 0.5);
+  assert.ok(Math.abs((zout[2] - zout[0]) - MAX_VIEW_SPAN_DEG) < 1e-9,
+    `缩小下限不是全国视野：${zout[2] - zout[0]}`);
+  assert.equal(MAX_VIEW_SPAN_DEG, CHINA_REGION.bounds[2] - CHINA_REGION.bounds[0],
+    'MAX_VIEW_SPAN_DEG 应当就是 CHINA_REGION 的经度跨度（不许另写 62）');
+  // factor = 1 是恒等（逐位相同）—— 手势里"没动"的那一帧不该引入任何漂移
+  assert.deepEqual(zoomViewAt(b, 1, 0.3, 0.7), b);
+  // **夹到边界时不动点仍然不变**（这是把 factor 反解成区间再夹、而不是"先缩放再夹框"的理由）
+  const g: number[] = geoAt(b, 0.4, 0.6, DEV_BOX_W, DEV_BOX_H);
+  const afterClamp: number[] = normIn(zin, g[0], g[1], DEV_BOX_W, DEV_BOX_H);
+  assert.ok(Math.abs(afterClamp[0] - 0.4) < 1e-6 && Math.abs(afterClamp[1] - 0.6) < 1e-6,
+    `夹到放大上限时不动点跑了：(${afterClamp[0]}, ${afterClamp[1]})`);
+  // 非法输入原样返回（不产 NaN）
+  assert.deepEqual(zoomViewAt(b, Number.NaN, 0.5, 0.5), b);
+  assert.deepEqual(zoomViewAt(b, 0, 0.5, 0.5), b);
+  assert.deepEqual(zoomViewAt(b, -2, 0.5, 0.5), b);
+  // bounds 非法 → 先退回全国视野，**然后照常缩放**（不是"整帧作废"）：
+  // 手势不该因为调用方传了个坏框就默默不动 —— 那一帧用户的手指是动了。
+  const badInput: number[] = zoomViewAt([1, 2, 3], 2, 0.5, 0.5);
+  assert.deepEqual(badInput, zoomViewAt(CHINA_REGION.bounds, 2, 0.5, 0.5));
+  for (let i = 0; i < 4; i++) { assert.ok(Number.isFinite(badInput[i])); }
+  assert.ok(badInput[2] > badInput[0] && badInput[3] > badInput[1]);
+  // fx/fy 非有限 → 按中心处理，仍是合法框
+  const zc: number[] = zoomViewAt(b, 2, Number.NaN, Number.NaN);
+  assert.ok(Math.abs((zc[0] + zc[2]) / 2 - (b[0] + b[2]) / 2) < 1e-9, 'fx 非有限时应当绕中心缩放');
+});
+
+test('panViewBy：画面内容的位移**精确等于**请求量（横向与纵向都是）', () => {
+  const b: number[] = [115.01, 29.95, 122.89, 41.23];
+  // 取框里任意一个点，量它在平移前后的归一化位置差
+  const g: number[] = geoAt(b, 0.5, 0.5, DEV_BOX_W, DEV_BOX_H);
+  const before: number[] = normIn(b, g[0], g[1], DEV_BOX_W, DEV_BOX_H);
+  const p: number[] = panViewBy(b, 0.1, 0.2);
+  const after: number[] = normIn(p, g[0], g[1], DEV_BOX_W, DEV_BOX_H);
+  assert.ok(Math.abs((after[0] - before[0]) - 0.1) < 1e-9,
+    `横向位移不等于请求量：${after[0] - before[0]}`);
+  // ⚠️ 纵向：fy > 0 是"手指向下拖"，内容也**向下**走（归一化 y 增大）。
+  //    这个符号与横向**相反**（因为归一化 y 从画布顶端量，而顶端是北）。
+  assert.ok(Math.abs((after[1] - before[1]) - 0.2) < 1e-9,
+    `纵向位移不等于请求量（符号反了？）：${after[1] - before[1]}`);
+  // 平移不改变跨度、不改变比例
+  assert.ok(Math.abs((p[2] - p[0]) - (b[2] - b[0])) < 1e-9, '平移改变了经度跨度');
+  assert.ok(Math.abs(geoAspect(p) - geoAspect(b)) < 1e-9, '平移改变了宽高比');
+  // 零位移是恒等
+  assert.deepEqual(panViewBy(b, 0, 0), b);
+  assert.deepEqual(panViewBy(b, Number.NaN, Number.NaN), b);
+});
+
+test('panViewBy：**极端拖动不产零跨度 / NaN**（真踩到的缺陷：mercY 的 ±85 夹断）', () => {
+  // 这一条守的是一个真实发生过的静默失败：把纬度拖到 -89.9999° 之后，
+  // `mercYOf` 内部的 ±85 夹断会让 mercY 跨度**变成 0**，而 `projectMercator` 的除数
+  // 就是那个跨度 → 整块画布 NaN → 地图和照片一起消失（而且不报错）。
+  const b: number[] = [115.01, 29.95, 122.89, 41.23];
+  const extremes: number[][] = [[50, 0], [-50, 0], [0, 50], [0, -50], [500, 500], [-500, -500], [1e6, 1e6]];
+  for (let k = 0; k < extremes.length; k++) {
+    const p: number[] = panViewBy(b, extremes[k][0], extremes[k][1]);
+    for (let i = 0; i < 4; i++) { assert.ok(Number.isFinite(p[i]), `非有限坐标：${p}（拖 ${extremes[k]}）`); }
+    assert.ok(p[2] > p[0], `经度跨度塌了：${p[2] - p[0]}（拖 ${extremes[k]}）`);
+    assert.ok(p[3] > p[1], `纬度跨度塌了：${p[3] - p[1]}（拖 ${extremes[k]}）`);
+    // 纬度必须留在墨卡托安全带内（±84），否则下一次 mercYOf 又会夹断
+    assert.ok(p[1] >= -84 - 1e-9 && p[3] <= 84 + 1e-9, `纬度跑出安全带：${p}（拖 ${extremes[k]}）`);
+    // 中心必须还在中国范围内 —— 否则用户会拖到一片底色里且不知道怎么回来
+    const cLon: number = (p[0] + p[2]) / 2;
+    assert.ok(cLon >= CHINA_REGION.bounds[0] - 1e-9 && cLon <= CHINA_REGION.bounds[2] + 1e-9,
+      `经度中心跑到中国之外：${cLon}（拖 ${extremes[k]}）`);
+    // 投影得出来（真正的不变量：没有 NaN）
+    const f: MapFrame = mapFrame(DEV_BOX_W, DEV_BOX_H, p);
+    assert.ok(!outlinePath([[p[0], p[1], p[2], p[1], p[2], p[3]]], f).includes('NaN'));
+    assert.ok(hangBottom(f, { canvasH: DEV_BOX_H }) > 0);
+  }
+});
+
+test('手势链路：连续"拖动 + 偏心缩放"之后，框仍然合法、比例不变、数据边界不破', () => {
+  let b: number[] = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_BOX_H);
+  const aspect0: number = geoAspect(b);
+  // 模拟 60 帧的手势：一边放大一边往东南拖（偏心在 (0.3, 0.7)）
+  for (let i = 0; i < 60; i++) {
+    b = zoomViewAt(b, 1.05, 0.3, 0.7);
+    b = panViewBy(b, 0.01, 0.012);
+    for (let j = 0; j < 4; j++) { assert.ok(Number.isFinite(b[j]), `第 ${i} 帧出现非有限坐标：${b}`); }
+    assert.ok(b[2] > b[0] && b[3] > b[1], `第 ${i} 帧跨度塌了：${b}`);
+    assert.ok(Math.abs(geoAspect(b) - aspect0) < 1e-6, `第 ${i} 帧比例漂了：${geoAspect(b)} vs ${aspect0}`);
+  }
+  // 60 帧之后仍然是合法的视野：能投影、能算场景
+  const f: MapFrame = mapFrame(DEV_BOX_W, DEV_BOX_H, b);
+  assert.ok(Math.abs(f.w - DEV_BOX_W) < 1e-6 && Math.abs(f.h - DEV_BOX_H) < 1e-6,
+    '手势之后框不再等于画布（铺满被破坏了）');
+  const pins = buildScene([ph('sh', SH_LAT, SH_LON, 0)], f, 1, { canvasH: DEV_BOX_H, footer: 26 });
+  assert.equal(pins.length, 1);
+  assert.ok(Number.isFinite(pins[0].x) && Number.isFinite(pins[0].y));
+  // 再来 200 帧（含往回缩，一直顶到下限）—— 断言仍然不塌
+  for (let i = 0; i < 200; i++) {
+    b = zoomViewAt(b, 0.9, 0.8, 0.2);
+    b = panViewBy(b, -0.02, -0.02);
+  }
+  assert.ok(b[2] > b[0] && b[3] > b[1] && Number.isFinite(b[0]) && Number.isFinite(b[3]), `最终框非法：${b}`);
+  assert.ok((b[2] - b[0]) <= MAX_VIEW_SPAN_DEG + 1e-9, `缩过头了：${b[2] - b[0]}`);
 });
 
 // ── 地图框：铺满主体区 + 不变形 + 居中（task-14 的形态改造） ─────────────────

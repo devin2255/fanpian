@@ -61,7 +61,8 @@ import { parseAreaData } from '../core/areaData';
 import {
   HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, TRACK_COLOR, TRACK_WIDTH, VIEW_PAD_RATIO,
   badgeRect, buildScene, dateLabel, fitBounds, fitViewToCanvas, geoAspect, hangBottom, hangOffsets, hangRects,
-  mapFrame, outlinePath, parseOutline, PROVINCE_STROKE, PROVINCE_WIDTH, trajectoryPath, viewZoomOf
+  mapFrame, MIN_ZOOMED_VIEW_SPAN_DEG, outlinePath, panViewBy, parseOutline,
+  PROVINCE_STROKE, PROVINCE_WIDTH, trajectoryPath, viewZoomOf, zoomViewAt
 } from '../core/render';
 import type { CardRect, HangOffset, MapFrame, OutlineData, ScenePin, WallPhoto } from '../core/render';
 // MAX_HANG 只在 core/placement.ts 里定义（设计 §6.2 的阈值那儿一份），render.ts 不转手导出。
@@ -159,6 +160,52 @@ struct WallPage {
   /** 省级边界数据。形状与国界**同一个** `OutlineData`，所以解析/绘制都能复用。 */
   private provinceData: OutlineData | undefined = undefined;
 
+  // ── 手势视野：双指缩放 + 拖动平移 + 重置（task-16 的第 3 件事）──────────────
+  //
+  // 用户原话：「还有地图应该支持缩放吧 默认铺满」。
+  //
+  // **手势的全部数学都在 `core/render` 的 `zoomViewAt` / `panViewBy` 里**（纯函数、有单测）。
+  // 本页只做三件事，每一件都不含几何公式：
+  //   ① 把手势事件给的 **vp 除以画布宽高** → 归一化位置（纯算术，不碰墨卡托）；
+  //   ② 手势进行中**只改两个视觉变换**（下面四个 @State），一个几何都不重算；
+  //   ③ 抬手时把视觉变换换算成新的视野框，**重算一次**几何。
+  //
+  // ── 为什么手势中不每帧重算几何（实测数据，见报告）────────────────────────────
+  //   一次 `rebuild()` 的几何部分实测（Node/V8，真机那一档 7 张照片）：**4.8ms**，
+  //   其中省界 path 3.8ms、国界 path 0.9ms、`buildScene` 0.1ms；239 张照片时 7.3ms。
+  //   省界那 3.8ms 与照片数**无关**（11840 个点全量投影），所以"照片少就便宜"不成立。
+  //   真机（ArkTS）只会更慢，而 60Hz 的预算是 16.7ms —— 每帧重算会占掉一大半，
+  //   而且 `rebuild()` 会改 `cards` 数组（ForEach 的 key 里带坐标）→ **每帧重建全部 Image
+  //   组件**，那是肉眼可见的闪。
+  //   所以：手势中只做视觉变换（照片、国界、省界、轨迹全在**同一层容器**里，
+  //   一起缩放平移 → 它们在手势中的相对关系**逐点精确**），抬手才重算。
+  //   ⚠️ 视觉与几何的**等价性**是"抬手不跳"的前提，推导见 `applyGestureVisual`。
+
+  /** 手势中的视觉缩放（只作用在"缩放层"这一个容器上，不改任何几何）。 */
+  @State gScale: number = 1;
+  /** 手势中的视觉平移（vp，作用在"平移层"容器上）。两个容器**嵌套**，合成顺序因此无歧义。 */
+  @State gTx: number = 0;
+  @State gTy: number = 0;
+  /** 当前是否就是"默认铺满"的视野（重置按钮的可用态 + 诊断行）。 */
+  @State viewIsDefault: boolean = true;
+
+  /** 默认铺满的视野（由数据 + 画布求出，见 `rebuild`）。**重置视野按钮**回到它。 */
+  private defaultBounds: number[] = CHINA_REGION.bounds;
+  /** 当前视野。`userMoved` 为假时每次 `rebuild` 都跟随数据/画布重算。 */
+  private viewBounds: number[] = CHINA_REGION.bounds;
+  /** 用户是否**动过**视野。动过之后，数据或画布变化不再把它拉回默认（那会打断用户）。 */
+  private userMoved: boolean = false;
+  /** 手势开始时的视野快照 —— 每一帧都从**它**算起，不叠加上一帧，所以不累积漂移。 */
+  private gestureStartBounds: number[] = CHINA_REGION.bounds;
+  /** 手势期间的累积量（只在抬手时才换算成视野）。 */
+  private gK: number = 1;
+  private gPx: number = 0;
+  private gPy: number = 0;
+  private gPanX: number = 0;
+  private gPanY: number = 0;
+  /** 同时在跑的手势个数：双指缩放与拖动可以并行，而**快照只能取一次**。 */
+  private gestureCount: number = 0;
+
   aboutToAppear(): void {
     hilog.info(DOMAIN, TAG, '%{public}s', `${DIAG} aboutToAppear：页面进入，开始 load()`);
     this.load();
@@ -247,20 +294,23 @@ struct WallPage {
   }
 
   /**
-   * 重算场景。**唯一**的几何入口 —— 只在「数据到了」或「画布尺寸变了」时调用。
+   * 重算场景。**唯一**的几何入口 —— 只在「数据到了」「画布尺寸变了」或「手势抬手」时调用。
    * 画布尺寸没拿到（首帧之前）时什么都不做，等 `onAreaChange` 再来一次。
    *
-   * ── 视野：由**照片数据**求出，不再是整个中国（本批的核心改动）────────────────
-   * `fitBounds(this.photos, VIEW_PAD_RATIO)` 给出"能看到全部照片"的那一块经纬度范围，
-   * 然后 `mapFrame` 把这块范围放进画布。设备真值（3 个城市、7 张有坐标）下这会把地图
-   * 从"整个中国（经度 62°）"拉近到"经度 6.578°"—— 放大 9.4 倍，地图第一次真的铺满屏幕。
+   * ── 视野：三层，**顺序不能换**（本批加了第 ②③ 层）────────────────────────────
+   *   ① `fitBounds(this.photos, VIEW_PAD_RATIO)` —— 由**照片数据**求出"能看到全部照片"
+   *      的经纬度范围（一张有坐标的都没有 → 全国视野）。
+   *   ② `fitViewToCanvas(...)` —— **默认铺满**：把它撑成与画布同比例，消掉 `mapFrame`
+   *      的信箱空白（真机真值：376×663.71 的画布上框只有 309.1 宽、左右各空 33.45pt）。
+   *   ③ **用户视野** `this.viewBounds` —— 手势缩放/平移的结果。`userMoved` 为假时
+   *      它就等于 ② 的产物（每次重算都跟随数据）；为真时以它为准，
+   *      但**仍然过一遍 `fitViewToCanvas`**：画布尺寸变了（旋转/分屏）时把手势留下的框
+   *      重新对齐到新的画布比例。它对手势产物是**恒等**的（手势只做等比缩放与平移，
+   *      比例一直等于画布比例），所以这一步不会在正常路径上动用户的视野。
    *
-   * `vb === undefined`（一张有坐标的都没有）→ 退回 `CHINA_REGION.bounds`，
-   * 与改动前逐点一致（空墙 / 全无 GPS 的那两种退化路径不能变）。
-   *
-   * ⚠️ `bounds` **只算一次、只传一处**：国界（`outlinePath`）与照片（`buildScene`）
+   * ⚠️ `bounds` **只算一次、只传一处**：国界、省界（`outlinePath`）与照片（`buildScene`）
    * 都从这**同一个** `MapFrame` 上读 `frame.bounds` —— 各传一套参数就会出现
-   * "照片用新视野、国界还是全国视野"，照片整体飘到地图轮廓外面，而且两边都不报错。
+   * "照片用新视野、地图还是旧视野"，照片整体飘到轮廓外面，而且两边都不报错。
    */
   private rebuild(): void {
     if (this.boxW <= 0 || this.boxH <= 0) {
@@ -268,16 +318,18 @@ struct WallPage {
         `${DIAG} rebuild 跳过：画布还没量到（boxW=${this.boxW} boxH=${this.boxH}）`);
       return;
     }
-    // 视野框：① 由照片坐标求出"装得下全部照片"的范围（没有有效坐标 → 全国视野）
+    // ① 数据视野（没有有效坐标 → 全国视野，与改动前一致）
     const vb: number[] | undefined = fitBounds(this.photos, VIEW_PAD_RATIO);
     const dataBounds: number[] = vb !== undefined ? vb : CHINA_REGION.bounds;
-    // ② **默认铺满**：把数据框撑成**与画布同比例**，消掉 mapFrame 的信箱空白。
-    //    为什么必须有第 ② 步（真机真值）：box 376×663.71 而数据框的墨卡托比只有 0.4661，
-    //    相除之后 mapFrame 只能 contain → 图框 309.1×663.71@(33.45,0)，**左右各空 33.45pt**。
-    //    撑开只作用在"没被限制"的那根轴上，所以框 ⊇ 数据（照片一张都不会跑出去），
-    //    而且 pt/度 不变、框是**绕数据**长出去的 → 照片在屏幕上**一动都不动**（单测钉住 Δ=0）。
-    const bounds: number[] = fitViewToCanvas(dataBounds, this.boxW, this.boxH);
-    // 地图块 = 整个主体区（地图是这整块区域的底色）；框 = 块里那个不变形的视野（居中）。
+    // ② 默认铺满：撑成与画布同比例（框 ⊇ 数据；pt/度 不变、框绕数据长出去 → 照片不动）
+    this.defaultBounds = fitViewToCanvas(dataBounds, this.boxW, this.boxH);
+    // ③ 用户视野
+    if (!this.userMoved) { this.viewBounds = this.defaultBounds; }
+    const bounds: number[] = fitViewToCanvas(this.viewBounds, this.boxW, this.boxH);
+    this.viewBounds = bounds;
+    this.viewIsDefault = !this.userMoved;
+    // 地图块 = 整个主体区（地图是这整块区域的底色）；框 = 块里那个不变形的视野。
+    // 有了 ②③ 之后**框恒等于块**（信箱空白 0）—— 这是"默认铺满"最直接的机器可读形态。
     const frame: MapFrame = mapFrame(this.boxW, this.boxH, bounds);
     this.mapX = r2(frame.x);
     this.mapY = r2(frame.y);
@@ -359,7 +411,7 @@ struct WallPage {
     // `图框 W×H@(x,y)` 是块里那个不变形的绘制框，`pathLen` 是国界 path 的字符数
     //（=0 就说明国界根本没画出来，那是另一类缺陷），`track` 是轨迹折线的字符数。
     //
-    // 本批新增三样，都是为了**真机一眼核对**：
+    // 本批新增四样，都是为了**真机一眼核对**：
     //   · `视野 数据[…]→铺满[…]`：**撑开前后两个框**。左边是 `fitBounds` 的产物，
     //     右边是 `fitViewToCanvas` 撑到与画布同比例之后的产物。两者若相同 = 比例本来就匹配
     //     （或铺满没生效）；右边若比左边宽 = 本批第 ② 件事生效了。
@@ -368,14 +420,21 @@ struct WallPage {
     //     照片大小没变（pt/度恒定），变的是原来空着的那两条带现在归地图自己。
     //   · `图框` 里的 `@(x,y)`：铺满生效后**必然是 (0,0)**，宽度必然等于 `boxW`
     //     —— 这就是"默认铺满"最直接的一个数字。
+    //   · `国界 N 省界 N`：两条 path 的字符数。省界那个数**必须明显大于国界**
+    //     （省界是内陆的线网、国界只是海岸线）；`省界 0` = 那一层根本没画出来。
+    //   · `视野态`：默认铺满 / 已改，以及可缩放的倍数区间。**手势中的 k/T 也印出来**
+    //     —— 手势进行中诊断行会实时变，抬手后回到 `k=1 T=(0,0)`。
     const diagBounds: string = `数据[${r2(dataBounds[0])},${r2(dataBounds[1])},${r2(dataBounds[2])},${r2(dataBounds[3])}]`
       + `→铺满[${r2(bounds[0])},${r2(bounds[1])},${r2(bounds[2])},${r2(bounds[3])}]`;
+    // 缩放界限换算成"放大倍数"口径：最小 1×（= 全国跨度）、最大 = 62/0.6 ≈ 103×（= 单城市级）
+    const zoomMax: number = (CHINA_REGION.bounds[2] - CHINA_REGION.bounds[0]) / MIN_ZOOMED_VIEW_SPAN_DEG;
     this.diag = `box ${r2(this.boxW)}×${r2(this.boxH)} ｜ 图框 ${this.mapW}×${this.mapH}@(${this.mapX},${this.mapY})`
       + ` ｜ 视野 ${diagBounds}${vb !== undefined ? '(数据)' : '(全国)'}`
       + ` ｜ 放大 ${r2(viewZoomOf(dataBounds))}×→${r2(viewZoomOf(bounds))}×`
       + ` ｜ pins ${pins.length} ｜ cards ${cards.length}`
-      + ` ｜ 国界 ${chinaPath.length} 省界 ${provincePath.length}`
-      + ` ｜ track ${this.trackPath.length}`
+      + ` ｜ 国界 ${chinaPath.length} 省界 ${provincePath.length} ｜ track ${this.trackPath.length}`
+      + ` ｜ 视野态 ${this.viewIsDefault ? '默认铺满' : '已改'}（可缩 1×~${r2(zoomMax)}×）`
+      + ` ｜ 手势 k=${r2(this.gScale)} T=(${r2(this.gTx)},${r2(this.gTy)})`
       + ` ｜ 上墙 ${this.walledTotal} 命中 ${located} 实挂 ${shownTotal}`;
     hilog.info(DOMAIN, TAG, '%{public}s',
       `${DIAG} rebuild：boxW=${this.boxW} boxH=${this.boxH}`
@@ -395,6 +454,126 @@ struct WallPage {
     // 画布尺寸变化都会调它（页面刚进来时布局还没稳定 → 会连着跑好几次）。
     // 于是「点钉子 → selIndex=i → 紧接着一次 rebuild() 清成 -1」= 详情面板出现又消失
     // = 用户看到的"闪一下"。清选中项是**数据换了**才该做的事，已经挪到 `load()` 开头。
+  }
+
+  /**
+   * 手势开始：取一次视野**快照**。之后的每一帧都从这份快照算起（不叠加上一帧），
+   * 所以几百帧的手势也不会累积浮点漂移。
+   *
+   * 为什么用计数器而不是布尔：双指缩放与拖动可以在 `GestureGroup(Parallel)` 里**同时**跑
+   * （用户在缩放的同时移动两指中点是很常见的），而快照只能在**第一个**手势开始时取一次 ——
+   * 否则第二个手势一开始就把"用户已经缩放出来的视野"重新当成起点，画面会跳回去。
+   */
+  private gestureBegin(): void {
+    if (this.gestureCount === 0) {
+      this.gestureStartBounds = this.viewBounds.slice(0, this.viewBounds.length);
+      this.gK = 1;
+      this.gPx = this.boxW / 2;
+      this.gPy = this.boxH / 2;
+      this.gPanX = 0;
+      this.gPanY = 0;
+    }
+    this.gestureCount++;
+  }
+
+  /**
+   * 把"手势累积量"画成两个视觉变换。**这里一个几何公式都没有**，只有一次合成推导：
+   *
+   *   两个容器是**嵌套**的（平移层在外、缩放层在内），所以合成顺序无歧义：
+   *     屏幕坐标' = T + ( C + k·(屏幕坐标 − C) ) = k·屏幕坐标 + (1−k)·C + T
+   *   而我们要的手感是"绕**两指中点 P** 缩放 k 倍，再整体平移 D"：
+   *     屏幕坐标' = P + k·(屏幕坐标 − P) + D = k·屏幕坐标 + (1−k)·P + D
+   *   两式相减得到本函数写的那一行：
+   *     **T = (1−k)·(P − C) + D**
+   *
+   * 这一步的等价性是**抬手不跳**的唯一前提：`gestureFinish` 用
+   * `zoomViewAt(快照, k, P/画布) → panViewBy(..., D/画布)` 重算几何，而那正是上面第二条式子
+   * 在经纬度空间里的同一件事（`projectMercator` 对经度线性、对纬度按 mercY 线性，
+   * 所以"屏幕上绕 P 等比缩放" ≡ "视野框绕 P 对应的地理点等比缩放"）。
+   */
+  private applyGestureVisual(): void {
+    const cx: number = this.boxW / 2;
+    const cy: number = this.boxH / 2;
+    this.gScale = this.gK;
+    this.gTx = (1 - this.gK) * (this.gPx - cx) + this.gPanX;
+    this.gTy = (1 - this.gK) * (this.gPy - cy) + this.gPanY;
+  }
+
+  /** 双指缩放的一帧。`event.scale` 是**相对手势开始**的累积倍数，正好就是快照的倍数。 */
+  private pinchUpdate(e: GestureEvent): void {
+    if (!(this.boxW > 0) || !(this.boxH > 0)) { return; }
+    const k: number = Number(e.scale);
+    if (!Number.isFinite(k) || !(k > 0)) { return; }
+    const px: number = Number(e.pinchCenterX);
+    const py: number = Number(e.pinchCenterY);
+    // 两指中点变了说明用户在缩放的同时也在移动（或换了捏的位置）—— 跟着它走才对
+    if (Number.isFinite(px)) { this.gPx = px; }
+    if (Number.isFinite(py)) { this.gPy = py; }
+    this.gK = k;
+    this.applyGestureVisual();
+  }
+
+  /** 拖动的一帧。`event.offsetX/offsetY` 是**相对手势开始**的累积位移（vp）。 */
+  private panUpdate(e: GestureEvent): void {
+    const dx: number = Number(e.offsetX);
+    const dy: number = Number(e.offsetY);
+    if (Number.isFinite(dx)) { this.gPanX = dx; }
+    if (Number.isFinite(dy)) { this.gPanY = dy; }
+    this.applyGestureVisual();
+  }
+
+  /**
+   * 手势结束（或取消）：把视觉变换**换算成新的视野框**，然后重算一次几何。
+   *
+   * 取消也照样提交（不是丢弃）：用户的手指确实移动过，画面已经跟着变了 ——
+   * 这一刻把它弹回原样才是"跳"。取消与结束在这里的唯一区别是取消时最后一帧的位置
+   * 可能不准，但那比"画面自己弹回去"轻得多。
+   *
+   * `moved` 为假（手指按下又抬起、没动）时**什么都不做**：不重算、不标记 `userMoved`。
+   * 这一条直接决定了"点钉子"不会触发一次多余的几何重算。
+   */
+  private gestureFinish(): void {
+    if (this.gestureCount > 0) { this.gestureCount--; }
+    if (this.gestureCount > 0) { return; }
+    const moved: boolean = this.gK !== 1 || this.gPanX !== 0 || this.gPanY !== 0;
+    const ok: boolean = this.boxW > 0 && this.boxH > 0;
+    let nb: number[] = this.gestureStartBounds;
+    if (moved && ok) {
+      if (this.gK !== 1) {
+        nb = zoomViewAt(nb, this.gK, this.gPx / this.boxW, this.gPy / this.boxH);
+      }
+      if (this.gPanX !== 0 || this.gPanY !== 0) {
+        nb = panViewBy(nb, this.gPanX / this.boxW, this.gPanY / this.boxH);
+      }
+    }
+    // 视觉变换先归位，再重算 —— 两者在**同一次**状态更新里，所以看不到中间态
+    this.gK = 1;
+    this.gPanX = 0;
+    this.gPanY = 0;
+    this.gScale = 1;
+    this.gTx = 0;
+    this.gTy = 0;
+    if (!moved || !ok) { return; }
+    this.viewBounds = nb;
+    this.userMoved = true;
+    this.rebuild();
+    hilog.info(DOMAIN, TAG, '%{public}s',
+      `${DIAG} 手势结束：k=${this.gK} pan=(${this.gPanX},${this.gPanY})`
+      + ` → 视野=[${r2(nb[0])},${r2(nb[1])},${r2(nb[2])},${r2(nb[3])}]`
+      + ` 放大=${r2(viewZoomOf(nb))}× pins=${this.pins.length}`);
+  }
+
+  /** **重置视野**：一键回到"默认铺满"（`rebuild` 会重新由数据求出它，不存旧值）。 */
+  private resetView(): void {
+    this.userMoved = false;
+    this.gK = 1;
+    this.gPanX = 0;
+    this.gPanY = 0;
+    this.gScale = 1;
+    this.gTx = 0;
+    this.gTy = 0;
+    this.rebuild();
+    hilog.info(DOMAIN, TAG, '%{public}s', `${DIAG} 重置视野：回到默认铺满`);
   }
 
   /**
@@ -430,100 +609,132 @@ struct WallPage {
           .onClick(() => { router.back(); })
         Text(`地图墙 ｜ 挂出 ${this.shownTotal} / 上墙 ${this.walledTotal} 张`)
           .fontSize(15).fontWeight(FontWeight.Medium).layoutWeight(1)
+        // ── 重置视野：一键回到"默认铺满"──────────────────────────────────
+        // 放在**手势容器之外**（这一行在 Stack 外面），所以它不会被自己的手势缩放/平移，
+        // 也不会与地图的拖动冲突 —— 一个"永远在原位"的按钮才找得到。
+        // 已经在默认视野时变灰：不是禁用（点了也无害），而是告诉用户"你现在就是默认状态"。
+        Text(this.viewIsDefault ? '已铺满' : '重置视野')
+          .fontSize(13)
+          .fontColor(this.viewIsDefault ? '#AAAAAA' : '#1F6FEB')
+          .padding({ left: 10 })
+          .onClick(() => { this.resetView(); })
       }
       .width('100%').padding({ left: 12, right: 12, top: 10, bottom: 8 })
 
       // ── 主体：整块都是地图（地图块 = 这个 Stack 的全部）─────────────────
+      // 手势挂在这一层（最外），里面是**两层嵌套的变换容器**：
+      //   Stack(平移层) → Stack(缩放层) → 底/国界/省界/轨迹/挂线/卡片/钉点
+      // 为什么嵌套而不是把两个变换写在同一层：嵌套让"先缩放再平移"这个合成顺序
+      // 在结构上就定死了，不依赖 ArkUI 对同层 translate+scale 的复合顺序 ——
+      // 而那个顺序正是"抬手时画面跳不跳"的判据（推导见 `applyGestureVisual`）。
       Stack({ alignContent: Alignment.TopStart }) {
-        // 地图块的底色 = 整个主体区。这一层就是"地图铺满主体区"最直接的体现：
-        // 它替代了旧版那条只占上方 37% 的 `height(this.mapH)` 色带。
-        Column().width('100%').height('100%').backgroundColor('#F2F7EF')
+        Stack({ alignContent: Alignment.TopStart }) {
+          Stack({ alignContent: Alignment.TopStart }) {
+            // 地图块的底色 = 整个主体区。这一层就是"地图铺满主体区"最直接的体现：
+            // 它替代了旧版那条只占上方 37% 的 `height(this.mapH)` 色带。
+            Column().width('100%').height('100%').backgroundColor('#F2F7EF')
 
-        // 国界：一条 path 装下 96 个环（不放 96 个组件）。
-        // 坐标已经在 core/render.outlinePath 里按地图框平移过 —— 与钉子、卡片同一个坐标系。
-        if (this.chinaPath.length > 0) {
-          Shape() {
-            Path().width(this.boxW).height(this.boxH).commands(this.chinaPath)
+            // 国界：一条 path 装下 96 个环（不放 96 个组件）。
+            // 坐标已经在 core/render.outlinePath 里按地图框平移过 —— 与钉子、卡片同一个坐标系。
+            if (this.chinaPath.length > 0) {
+              Shape() {
+                Path().width(this.boxW).height(this.boxH).commands(this.chinaPath)
+              }
+              .width(this.boxW).height(this.boxH)
+              .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
+              .fill('#E8F0E4').stroke('#BFD3B8').strokeWidth(0.8)
+            }
+
+            // 省界：与国界**同一套机制**的第二条 path。
+            // ⚠️ 顺序不能反：国界那一层是**填充面**（陆地 `#E8F0E4`），省界是陆地内部的线 ——
+            // 画在填充之前会被整块盖掉（症状："数据里 107 条环，图上一条都看不见"）。
+            // 也不能放到轨迹/照片之后：省界是底图信息，不是内容。
+            if (this.provincePath.length > 0) {
+              Shape() {
+                Path().width(this.boxW).height(this.boxH).commands(this.provincePath)
+              }
+              .width(this.boxW).height(this.boxH)
+              .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
+              .fill(Color.Transparent).stroke(PROVINCE_STROKE).strokeWidth(PROVINCE_WIDTH)
+              .strokeLineJoin(LineJoinStyle.Round)
+            }
+
+            // 旅行轨迹：按拍摄时间把钉子连成一条折线。画在国界**之上**、照片**之下** ——
+            // 它是"我走过哪里"的背景叙事，压住照片就成了噪声。
+            if (this.trackPath.length > 0) {
+              Shape() {
+                Path().width(this.boxW).height(this.boxH).commands(this.trackPath)
+              }
+              .width(this.boxW).height(this.boxH)
+              .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
+              .fill(Color.Transparent).stroke(TRACK_COLOR).strokeWidth(TRACK_WIDTH)
+              .strokeOpacity(0.85)
+              .strokeLineCap(LineCapStyle.Round).strokeLineJoin(LineJoinStyle.Round)
+            }
+
+            // 钉子的线：同样一条 path 装下全部（M…L…M…L…）
+            if (this.linkPath.length > 0) {
+              Shape() {
+                Path().width(this.boxW).height(this.boxH).commands(this.linkPath)
+              }
+              .width(this.boxW).height(this.boxH)
+              .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
+              .fill(Color.Transparent).stroke('#C3B49B').strokeWidth(0.6)
+            }
+
+            // 照片卡片：真的照片，不是占位卡片。
+            // ⚠️ ForEach 的 key 里**带坐标**（`${uri}@${x},${y}`）—— 位置变了就得重建组件，
+            // 所以一次几何重算会重建全部卡片。这正是"手势中不重算几何"的第二个理由
+            // （第一个是重算本身 ~4.8ms）：手势中只改外层容器的变换，
+            // 这些 key 一个都不变 → 卡片组件**一个都不重建**，只是被整体缩放/平移。
+            ForEach(this.cards, (c: WallCard) => {
+              Image(c.uri)
+                .width(HANG_PHOTO_W).height(HANG_PHOTO_H)
+                .objectFit(ImageFit.Cover).borderRadius(2)
+                .border({ width: 0.5, color: '#8FA8C0' })
+                .backgroundColor('#DCE8F5')
+                .position({ x: c.x, y: c.y })
+            }, (c: WallCard) => `${c.uri}@${c.x},${c.y}`)
+
+            // 钉点 + 地名标签 + 命中区（命中区是透明的，钉点太小手指点不到）
+            ForEach(this.anchors, (a: WallAnchor) => {
+              Column()
+                .width(HIT_SIZE).height(HIT_SIZE)
+                .backgroundColor(Color.Transparent)
+                .position({ x: a.hitX, y: a.hitY })
+                .onClick(() => { this.open(a.idx); })
+              Circle()
+                .width(a.dotD).height(a.dotD).fill('#C0392B')
+                .position({ x: a.cx - a.dotD / 2, y: a.cy - a.dotD / 2 })
+              Text(a.label)
+                .fontSize(LABEL_FP).fontColor('#3F4A3C')
+                .width(a.labelW).textAlign(TextAlign.Center)
+                .position({ x: a.cx - a.labelW / 2, y: a.labelY })
+            }, (a: WallAnchor) => `${a.idx}@${a.cx},${a.cy}`)
+
+            // 「+N」：挂不全时出现，点它等于点钉子。
+            // 位置来自 core/render.badgeRect（它参与 planPin 的避让，不能自己再算一遍）。
+            ForEach(this.badges, (b: WallBadge) => {
+              Text(b.text)
+                .fontSize(8).fontColor('#8A8A8A')
+                .width(b.w + 8).textAlign(TextAlign.Center)
+                .position({ x: b.x - 4, y: b.y })
+                .onClick(() => { this.open(b.idx); })
+            }, (b: WallBadge) => `${b.idx}@${b.x},${b.y}`)
           }
-          .width(this.boxW).height(this.boxH)
-          .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
-          .fill('#E8F0E4').stroke('#BFD3B8').strokeWidth(0.8)
+          // ── 缩放层（内）：绕自身中心缩放。手势中的**不动点**修正由 `gTx/gTy` 承担
+          //    （见 applyGestureVisual 的推导：T = (1−k)·(P − C) + D）。
+          .width('100%').height('100%')
+          .scale({ x: this.gScale, y: this.gScale, centerX: '50%', centerY: '50%' })
         }
+        // ── 平移层（外）：只做整体平移。两层嵌套 → 合成顺序在结构上定死。
+        .width('100%').height('100%')
+        .translate({ x: this.gTx, y: this.gTy })
 
-        // 省界：与国界**同一套机制**的第二条 path。
-        // ⚠️ 顺序不能反：国界那一层是**填充面**（陆地 `#E8F0E4`），省界是陆地内部的线 ——
-        // 画在填充之前会被整块盖掉（症状："数据里 107 条环，图上一条都看不见"）。
-        // 也不能放到轨迹/照片之后：省界是底图信息，不是内容。
-        if (this.provincePath.length > 0) {
-          Shape() {
-            Path().width(this.boxW).height(this.boxH).commands(this.provincePath)
-          }
-          .width(this.boxW).height(this.boxH)
-          .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
-          .fill(Color.Transparent).stroke(PROVINCE_STROKE).strokeWidth(PROVINCE_WIDTH)
-          .strokeLineJoin(LineJoinStyle.Round)
-        }
-
-        // 旅行轨迹：按拍摄时间把钉子连成一条折线。画在国界**之上**、照片**之下** ——
-        // 它是"我走过哪里"的背景叙事，压住照片就成了噪声。
-        if (this.trackPath.length > 0) {
-          Shape() {
-            Path().width(this.boxW).height(this.boxH).commands(this.trackPath)
-          }
-          .width(this.boxW).height(this.boxH)
-          .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
-          .fill(Color.Transparent).stroke(TRACK_COLOR).strokeWidth(TRACK_WIDTH)
-          .strokeOpacity(0.85)
-          .strokeLineCap(LineCapStyle.Round).strokeLineJoin(LineJoinStyle.Round)
-        }
-
-        // 钉子的线：同样一条 path 装下全部（M…L…M…L…）
-        if (this.linkPath.length > 0) {
-          Shape() {
-            Path().width(this.boxW).height(this.boxH).commands(this.linkPath)
-          }
-          .width(this.boxW).height(this.boxH)
-          .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
-          .fill(Color.Transparent).stroke('#C3B49B').strokeWidth(0.6)
-        }
-
-        // 照片卡片：真的照片，不是占位卡片
-        ForEach(this.cards, (c: WallCard) => {
-          Image(c.uri)
-            .width(HANG_PHOTO_W).height(HANG_PHOTO_H)
-            .objectFit(ImageFit.Cover).borderRadius(2)
-            .border({ width: 0.5, color: '#8FA8C0' })
-            .backgroundColor('#DCE8F5')
-            .position({ x: c.x, y: c.y })
-        }, (c: WallCard) => `${c.uri}@${c.x},${c.y}`)
-
-        // 钉点 + 地名标签 + 命中区（命中区是透明的，钉点太小手指点不到）
-        ForEach(this.anchors, (a: WallAnchor) => {
-          Column()
-            .width(HIT_SIZE).height(HIT_SIZE)
-            .backgroundColor(Color.Transparent)
-            .position({ x: a.hitX, y: a.hitY })
-            .onClick(() => { this.open(a.idx); })
-          Circle()
-            .width(a.dotD).height(a.dotD).fill('#C0392B')
-            .position({ x: a.cx - a.dotD / 2, y: a.cy - a.dotD / 2 })
-          Text(a.label)
-            .fontSize(LABEL_FP).fontColor('#3F4A3C')
-            .width(a.labelW).textAlign(TextAlign.Center)
-            .position({ x: a.cx - a.labelW / 2, y: a.labelY })
-        }, (a: WallAnchor) => `${a.idx}@${a.cx},${a.cy}`)
-
-        // 「+N」：挂不全时出现，点它等于点钉子。
-        // 位置来自 core/render.badgeRect（它参与 planPin 的避让，不能自己再算一遍）。
-        ForEach(this.badges, (b: WallBadge) => {
-          Text(b.text)
-            .fontSize(8).fontColor('#8A8A8A')
-            .width(b.w + 8).textAlign(TextAlign.Center)
-            .position({ x: b.x - 4, y: b.y })
-            .onClick(() => { this.open(b.idx); })
-        }, (b: WallBadge) => `${b.idx}@${b.x},${b.y}`)
-
-        // ── 空态 / 读取中 / 退化说明 ──────────────────────────────────────
+        // ── 空态 / 读取中：**在手势容器之外** ──────────────────────────────
+        // 它们是提示文字，不是地图内容：跟着缩放平移会变成"提示也一起放大"，
+        // 而且空态时用户 pinch 一下就会看到字被拉花。设备侧本来就与预览不同
+        // （提示在 Stack 外面、不占画布），这里是同一类"绘制上的差异"。
         if (this.phase === 0) {
           Text('正在读取地点…').fontSize(13).fontColor('#999')
             .width('100%').textAlign(TextAlign.Center).position({ x: 0, y: this.mapY + 60 })
@@ -538,6 +749,31 @@ struct WallPage {
         }
       }
       .width('100%').layoutWeight(1).clip(true)
+      // ── 手势：双指缩放 + 单指拖动 ────────────────────────────────────────
+      // `GestureGroup(Parallel)`：两个手势**可以同时**跑（一边缩放一边移动两指中点是常见操作），
+      // 快照只在第一个开始时取一次（见 `gestureBegin` 的计数器）。
+      //
+      // ⚠️ **与「点钉子」的冲突是怎么处理的**（工单点名要说明）：
+      //   `PanGesture({ distance: 8 })` —— 平移要在手指移动 **8vp** 之后才激活。
+      //   一次点按的移动通常 < 3vp，所以它**根本不会**激活平移，`.onClick` 照常触发。
+      //   而"手指移动超过 8vp"本来就是**拖动**而不是点按 —— 那时不该打开钉子详情，
+      //   让平移赢是对的（这也是地图类应用的通用手感）。
+      //   换句话说：冲突不是"被吞掉了"，而是**用 8vp 的阈值把两种意图分开**。
+      //   `HIT_SIZE = 32vp` 的命中区仍然是 32vp，没有因为手势而缩小。
+      .gesture(
+        GestureGroup(GestureMode.Parallel,
+          PinchGesture({ fingers: 2 })
+            .onActionStart(() => { this.gestureBegin(); })
+            .onActionUpdate((e: GestureEvent) => { this.pinchUpdate(e); })
+            .onActionEnd(() => { this.gestureFinish(); })
+            .onActionCancel(() => { this.gestureFinish(); }),
+          PanGesture({ fingers: 1, distance: 8 })
+            .onActionStart(() => { this.gestureBegin(); })
+            .onActionUpdate((e: GestureEvent) => { this.panUpdate(e); })
+            .onActionEnd(() => { this.gestureFinish(); })
+            .onActionCancel(() => { this.gestureFinish(); })
+        )
+      )
       .onAreaChange((_oldArea: Area, newArea: Area) => {
         // 拿到的宽高是 vp（与 pt 同数值），正是 core/render 需要的画布尺寸
         const w: number = Number(newArea.width);
@@ -567,7 +803,7 @@ struct WallPage {
         Text(`诊断 ${this.diag}`).fontSize(9).fontColor('#B08A5A')
           .width('100%').padding({ left: 12, right: 12, bottom: 2 })
       }
-      Text('点钉子或「+N」看它挂着的全部照片').fontSize(10).fontColor('#AAA')
+      Text('双指缩放 · 拖动平移 · 点钉子或「+N」看它挂着的全部照片').fontSize(10).fontColor('#AAA')
         .width('100%').padding({ left: 12, right: 12, bottom: 8 })
 
       // ── 点开钉子的详情：全部照片（含没挂出来的那几张）──────────────────

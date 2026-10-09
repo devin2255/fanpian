@@ -594,6 +594,201 @@ export function fitViewToCanvas(dataBounds: number[], canvasW: number, canvasH: 
   return [minLon, invMercYOf(lo2), maxLon, invMercYOf(hi2)];
 }
 
+// ── 手势视野：双指缩放 / 拖动平移（task-16 的第 3 件事）────────────────────────
+//
+// 用户原话：「还有地图应该支持缩放吧 默认铺满」。
+//
+// 这两个函数是**纯函数**（不碰 ArkUI），因为它们是这一批里最容易算错的东西：
+// 归一化坐标 ↔ 墨卡托 ↔ 经纬度的来回换算、以及"哪根轴对哪个方向"的符号。
+// 放在 core 里就能在 Node 单测里逐条钉住（`render.test.ts` 的"手势视野"那一节），
+// 而放在 WallPage.ets 里就只能靠真机肉眼 —— 那是最贵的验证方式，也最容易漏。
+//
+// ── 为什么参数是"画布上的**归一化**位置（0~1）"而不是经纬度或像素 ────────────────
+//   · 手势事件给的是**像素/vp**（`pinchCenterX`、`offsetX`），调用方除以画布宽高就得到
+//     归一化值 —— 那是纯算术，不需要知道墨卡托；把 `mercY` 关在 core 里，
+//     WallPage 就不必再抄一遍投影公式（`geoAspect` 的注释里已经记过一次这种漂移风险）。
+//   · 归一化值同时是**与画布尺寸无关**的：同一个手势在 360×720 与 376×663.71 上
+//     表达的是同一件事，单测因此不必模拟设备尺寸。
+//
+// ── 为什么缩放的不动点按"归一化位置"给，而不是"绕中心" ──────────────────────────
+//   双指缩放的不动点是**两指中点**（地图 App 的通用手感），它一般不在画布中心。
+//   绕中心缩放在手指偏一侧时会"地图自己往中间跑"，手感是错的。
+
+/**
+ * 视野缩放的**下限**（经度跨度，度）= 全国跨度。再往外缩就没有地图可看了：
+ * `CHINA_REGION.bounds` 之外没有任何轮廓数据，画出来只有底色。
+ * 这个数直接由 `CHINA_BOUNDS` 算出，**不另写 62**（那迟早与 projection.ts 漂移）。
+ */
+export const MAX_VIEW_SPAN_DEG: number = CHINA_BOUNDS[2] - CHINA_BOUNDS[0];
+
+/**
+ * 视野缩放的**上限**（经度跨度，度）= 单个城市级，复用既有的 `MIN_VIEW_SPAN_DEG = 0.6°`。
+ *
+ * 为什么复用它而不是另取一个数：`fitBounds` 的注释里已经把 0.6° 论证过一遍
+ * （"0.6° 纬度 = 66.7km，一个地级市加近郊的尺度"），而且"只有一张照片时视野多大"
+ * 与"用户最多能放大到多近"必须一致 —— 否则会出现"默认视野比用户能手动放大的极限还近"
+ * 这种自相矛盾的状态。**一处定义，两处使用**。
+ *
+ * 代价（写进报告，不藏）：0.6° 视野下省界往往只剩几条近乎直线的段，看不到更多细节 ——
+ * 因为我们没有路网/建筑级数据。所以"能放多大"的上限不是性能问题，是**数据边界**问题。
+ */
+export const MIN_ZOOMED_VIEW_SPAN_DEG: number = MIN_VIEW_SPAN_DEG;
+
+/**
+ * 把一个刚算出来的方框落成**合法**的视野框；**已经合法时原样返回**（逐位不变）。
+ *
+ * ── 为什么需要它（这是本批真踩到的一个坑）────────────────────────────────────
+ *   手势可以把手指数到任意远：`panViewBy(b, 0, 50)` 表示"往下拖 50 个画布高"。
+ *   第一版没做这一步，于是画出纬度 **-89.9999°** 的框 —— 而 `mercYOf` 内部把纬度
+ *   夹在 ±85°，两条边界夹完之后 mercY 跨度**变成 0**：
+ *   `projectMercator` 的除数就是那个跨度 → 整块画布 NaN → 地图与照片一起**静默消失**。
+ *   这正是本模块最怕的一类失败（同 `parseBounds` / `fitAxis` 的注释）。
+ *   所以约束必须在**算出方框的这一层**就强加，而不是指望调用方不去算极端的数。
+ *
+ * ── 三条约束（顺序不能换：先保跨度，再挪中心）────────────────────────────────
+ *   1. **经度跨度** ≤ 360°（环球）。再大就没有地图的语义了。
+ *   2. **mercY 跨度** ≤ 墨卡托安全带（`±LAT_EXPAND_LIMIT` = ±84°）。
+ *      跨度超了就收到整条带（这是"装不下"的唯一情形）；
+ *      跨度本身没超、只是位置越界时**平移**回来 —— **平移不改变跨度**，
+ *      与 `fitAxis` 第 ③ 步"平移而不是夹两端"是同一条规矩（夹两端会把跨度压小甚至压成 0）。
+ *   3. **中心**同时被两个区间夹：中国范围 `[73,135]×[18,54]`（手势特有：不许拖到
+ *      视野里完全没有中国 —— 那是一片底色，用户也不知道怎么回来），以及
+ *      "整条框都不越出墨卡托安全带"给中心留下的那一段。
+ *      两个区间不相交时（跨度太大、两者都要占满）取 `mercY = 0`。
+ *
+ * **合法性判据 = 一个布尔函数**（`viewBoxIsSettled`），"原样返回"的承诺靠它，
+ * 而不是靠"再算一遍看等不等" —— 后者对浮点是不成立的。
+ */
+function settleViewBox(minLon: number, minY: number, maxLon: number, maxY: number): number[] {
+  const yLimit: number = mercYOf(LAT_EXPAND_LIMIT);
+  const lonSpanRaw: number = maxLon - minLon;
+  const ySpanRaw: number = maxY - minY;
+  // 连数字都不是 → 退回全国视野（不产 NaN 是硬契约）
+  if (!Number.isFinite(minLon) || !Number.isFinite(maxLon)
+    || !Number.isFinite(minY) || !Number.isFinite(maxY)) {
+    return CHINA_BOUNDS;
+  }
+  if (!(lonSpanRaw > 0) || !(ySpanRaw > 0)) { return CHINA_BOUNDS; }
+
+  const cLoY: number = mercYOf(CHINA_BOUNDS[1]);
+  const cHiY: number = mercYOf(CHINA_BOUNDS[3]);
+  let cLon: number = (minLon + maxLon) / 2;
+  let cY: number = (minY + maxY) / 2;
+  const lonOk: boolean = lonSpanRaw <= 360 && cLon >= CHINA_BOUNDS[0] && cLon <= CHINA_BOUNDS[2];
+  const yOk: boolean = ySpanRaw <= 2 * yLimit && cY >= cLoY && cY <= cHiY
+    && minY >= -yLimit && maxY <= yLimit;
+  // 快路径：已经合法 → 逐位原样返回。手势的每一步因此都是**精确**变换（不做无谓的重新居中）。
+  if (lonOk && yOk) {
+    return [minLon, invMercYOf(minY), maxLon, invMercYOf(maxY)];
+  }
+
+  let lonSpan: number = lonSpanRaw > 360 ? 360 : lonSpanRaw;
+  let ySpan: number = ySpanRaw > 2 * yLimit ? 2 * yLimit : ySpanRaw;
+  if (cLon < CHINA_BOUNDS[0]) { cLon = CHINA_BOUNDS[0]; }
+  if (cLon > CHINA_BOUNDS[2]) { cLon = CHINA_BOUNDS[2]; }
+  // 中心的 y：两个允许区间的**交集**；不相交（跨度把带占满了）时退到 0（赤道）
+  const loLimit: number = Math.max(-(yLimit - ySpan / 2), cLoY);
+  const hiLimit: number = Math.min(yLimit - ySpan / 2, cHiY);
+  if (loLimit <= hiLimit) {
+    if (cY < loLimit) { cY = loLimit; }
+    if (cY > hiLimit) { cY = hiLimit; }
+  } else {
+    cY = 0;
+  }
+  const minY2: number = cY - ySpan / 2;
+  const maxY2: number = cY + ySpan / 2;
+  return [cLon - lonSpan / 2, invMercYOf(minY2), cLon + lonSpan / 2, invMercYOf(maxY2)];
+}
+
+/**
+ * 以画布上的归一化点 `(fx, fy)` 为**不动点**缩放视野。`factor > 1` = 放大（视野变小）。
+ *
+ * "不动点"的含义：那个归一化位置对应的**地理点**缩放前后仍落在同一个归一化位置上
+ * （手指按住哪儿，哪儿就不动）。归一化位置 ↔ 地理点的换算里，纬度那一半走 `mercY`
+ * ——因为 `projectMercator` 的纵向就是按 mercY 线性拉伸的，只有这样"不动"才真的是不动。
+ *
+ * ── 两条界限（都在这里强制，调用方不必自己判）────────────────────────────────
+ *   · 经度跨度被夹在 `[MIN_ZOOMED_VIEW_SPAN_DEG, MAX_VIEW_SPAN_DEG]` = `[0.6°, 62°]`。
+ *     实现方式是**反解出允许的 factor 范围** `[跨度/62, 跨度/0.6]` 再夹 ——
+ *     这样"夹完之后仍然以同一点为不动点"，不会出现"夹到边界时地图突然横移一下"。
+ *   · 中心被 `clampViewCenter` 夹进中国范围（见它的说明）。
+ *
+ * 非法输入（`factor` 非有限或 ≤ 0、`bounds` 非法）一律原样返回归一化后的框 ——
+ * 与 `fitViewToCanvas` 的退化口径一致：**不产 NaN、不抛错**。
+ */
+export function zoomViewAt(bounds: number[], factor: number, fx: number, fy: number): number[] {
+  const b: number[] = normalizeBounds(bounds);
+  if (!Number.isFinite(factor) || !(factor > 0)) { return b; }
+  const px: number = Number.isFinite(fx) ? fx : 0.5;
+  const py: number = Number.isFinite(fy) ? fy : 0.5;
+  const lonSpan: number = b[2] - b[0];
+  const y0: number = mercYOf(b[1]);
+  const y1: number = mercYOf(b[3]);
+  const ySpan: number = y1 - y0;
+  if (!(lonSpan > 0) || !(ySpan > 0)) { return b; }
+  // 反解允许的 factor：lonSpan / f 必须落在 [0.6, 62]
+  const fLo: number = lonSpan / MAX_VIEW_SPAN_DEG;
+  const fHi: number = lonSpan / MIN_ZOOMED_VIEW_SPAN_DEG;
+  let f: number = factor;
+  if (f < fLo) { f = fLo; }
+  if (f > fHi) { f = fHi; }
+  // `f === 1` 是**恒等**（不动点那一步在 f=1 时逐项退化成原值），所以直接逐位返回。
+  // 为什么要专门写这一条：下面要过一趟 mercY → 反 mercY 的往返，那会丢掉一两个 ulp
+  // （29.95 → 29.949999999999996）。手势每一帧都调这个函数，而"手指没动"的那一帧
+  // **必须是真正的没动** —— 否则"恒等"这件事就没法用逐位相等来钉住。
+  if (f === 1) { return b; }
+  // 不动点（经度线性、纬度按 mercY 线性）。
+  // ⚠️ 纵向的参考端是**北**（`y1 = mercY(maxLat)`），不是南：归一化 y 是从**画布顶端**量的，
+  // 而画布顶端是**北**（`projectMercator` 让 maxLat 落在 y=0）。写成 `y0 + ySpan*py` 时
+  // 中心那一档（py=0.5）恰好也对 —— 因为中点两边一样 —— 所以**只有偏心的缩放才会露馅**：
+  // 实测 (0.25,0.75) 处的不动点会跑掉 0.75 个画布高。这个坑真踩到了。
+  const lon: number = b[0] + lonSpan * px;
+  const y: number = y1 - ySpan * py;
+  const minLon: number = lon - (lon - b[0]) / f;
+  const maxLon: number = lon + (b[2] - lon) / f;
+  const minY: number = y - (y - y0) / f;
+  const maxY: number = y + (y1 - y) / f;
+  return settleViewBox(minLon, minY, maxLon, maxY);
+}
+
+/**
+ * 拖动平移：把**画面内容**移动 `(fx × 画布宽, fy × 画布高)`（归一化），
+ * 视野框相应地向**反方向**移动同样的地理距离。
+ *
+ * 符号约定（这是最容易写反的一处，所以写成契约）：**`fx > 0` = 手指向右拖 = 内容向右走
+ * = 视野往西看**，于是 `minLon` **减小**；**`fy > 0` = 手指向下拖 = 内容向下走 = 视野往北看**，
+ * 于是 mercY 区间**增大**。
+ *
+ * ⚠️ 纵向的符号与横向**不是**同一个方向（`-` 与 `+`）—— 因为归一化 y 是从**画布顶端**量的，
+ * 而顶端是**北**（`mercY` 最大的一侧）。写成与横向对称的 `y0 - dy*ySpan` 是错的，
+ * 症状是"内容跟着手指走反了"，而**横向完全正常**，所以很容易漏掉。实测抓到了：
+ * `panViewBy(dev, 0.1, 0.2)` 让画面里的点位移 `(0.1, -0.2)` —— y 反了。
+ *
+ * 纵向**必须**在 mercY 空间里平移（不是纬度空间）：屏幕上等距的拖动对应等量的 mercY，
+ * 而不是等量的纬度 —— 在北纬 50° 用纬度平移会比手指走得快约 1.5 倍。
+ *
+ * 平移不改变跨度（也就不会改变比例），所以它不会干扰 `fitViewToCanvas` 的不变量。
+ * 中心与墨卡托安全带由 `settleViewBox` 统一夹住。
+ */
+export function panViewBy(bounds: number[], fx: number, fy: number): number[] {
+  const b: number[] = normalizeBounds(bounds);
+  const dx: number = Number.isFinite(fx) ? fx : 0;
+  const dy: number = Number.isFinite(fy) ? fy : 0;
+  // 零位移 = **逐位恒等**（理由同 `zoomViewAt` 的 `f === 1`：不要为"没动"的那一帧
+  // 引入一次 mercY 往返的 ulp 误差）
+  if (dx === 0 && dy === 0) { return b; }
+  const lonSpan: number = b[2] - b[0];
+  const y0: number = mercYOf(b[1]);
+  const y1: number = mercYOf(b[3]);
+  const ySpan: number = y1 - y0;
+  if (!(lonSpan > 0) || !(ySpan > 0)) { return b; }
+  const minLon: number = b[0] - dx * lonSpan;
+  const maxLon: number = b[2] - dx * lonSpan;
+  const minY: number = y0 + dy * ySpan;
+  const maxY: number = y1 + dy * ySpan;
+  return settleViewBox(minLon, minY, maxLon, maxY);
+}
+
 // ── 排布常数（钉子的视觉尺寸只有这里一份，设备与预览共用） ──────────────────
 
 /**
