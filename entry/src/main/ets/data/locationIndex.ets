@@ -38,6 +38,24 @@ export interface LocationEntry {
   lat: number;       // 十进制度；与 lon 同时为 0 = 没有 GPS（读不到或照片本来没记录）
   lon: number;
   takenAt: number;   // epoch ms；0 = 时间未知（截图/无 EXIF 是常态，不是错误）
+  /**
+   * 这个地点是**用户自己在「上墙」时手选的**（省 → 市 → 县三级下拉），不是 EXIF 读出来的。
+   *
+   * 语义（三条，写清楚是为了不让这个字段的含义发散）：
+   *   1) `true` = 手选。坐标是内嵌区划数据里的**县级中心点**，坐标系是 **GCJ-02**
+   *      （与 areaData.ts 一致，那里明确不做转换）。
+   *   2) 缺省 / `false` / 非布尔值 = **来自 EXIF 的 GPS**，坐标系是 **WGS-84**。
+   *      两者的偏差约 300~500 米 —— 所以这个标记同时也是"这条坐标是哪个坐标系"的唯一线索，
+   *      将来若要把手选地点精确落点，必须按它选转换方向。
+   *   3) **优先级：手动 > EXIF**。用户亲手选的地点是他对这个记忆的定性
+   *      （"这张是在老家拍的"），不是坐标精度问题；所以：
+   *        · 判"有没有地点"以它为准（core/placePick.ts 的 hasPlace，规则只在那里定义）；
+   *        · **重建索引时不得覆盖它**（见 doBuild 的两道防线）。
+   *
+   * 为什么是可选字段而不是另开一份「手动地点表」：手动与 EXIF 是**同一条记录的两个来源**，
+   * 一个 photoId 只有一个地点。分两份存会让"这张到底在哪"有两个答案，而两份答案迟早打架。
+   */
+  manual?: boolean;
 }
 
 export function locationIndexPath(filesDir: string): string {
@@ -111,6 +129,10 @@ export class LocationIndex {
       // 跳过有两种成因，分开计数：真机上"有 12 条非法"没法下手，得知道是整条为 null
       // 还是 photoId 缺失（后者通常意味着写入方改了字段名）。
       let skippedNoId = 0;
+      // manual 字段**存在但不是布尔值**的条数。它与上面两种"整条丢掉"**分级不同**：
+      // 这一种只丢标记、保留条目（坐标与时间仍然是有效信息）。分开计数是为了让告警
+      // 能说清"丢了什么"——把"丢了一个标记"和"丢了一条记录"混成一句，真机上无法定位。
+      let badManual = 0;
       for (let i = 0; i < parsed.length; i++) {
         const e = parsed[i];
         if (e === null || e === undefined) { skipped = skipped + 1; continue; }
@@ -123,11 +145,21 @@ export class LocationIndex {
         // 坐标与时间是**可选**信息：非有限数一律置 0，**不跳过整条** ——
         // 没有 GPS 是照片的常态（截图、关闭定位时拍的），不是数据损坏。
         // 置 0 而不是保留 NaN，是因为 NaN 经 JSON.stringify 会写成 null，读回来又是 0，两轮不一致。
+        //
+        // manual 只认**严格等于 true**：`"yes"` / `1` / `"true"` 一律当成"来自 EXIF"。
+        // 反过来（宽松真值转换）会让一条 EXIF 记录凭空变成不可覆盖的"手选地点"——
+        // 那是**不可逆**的走样：用户没选过，而以后再也不会用 EXIF 更新它。
+        // 宁可在这一侧保守：丢一个标记的代价是"下次重建时可能被 EXIF 覆盖"，
+        // 而乱认一个标记的代价是"这条地点永远错了且无人知道"。
+        if (e.manual !== undefined && typeof e.manual !== 'boolean') { badManual = badManual + 1; }
         out.push({
           photoId: e.photoId,
           lat: typeof e.lat === 'number' && Number.isFinite(e.lat) ? e.lat : 0,
           lon: typeof e.lon === 'number' && Number.isFinite(e.lon) ? e.lon : 0,
-          takenAt: typeof e.takenAt === 'number' && Number.isFinite(e.takenAt) ? e.takenAt : 0
+          takenAt: typeof e.takenAt === 'number' && Number.isFinite(e.takenAt) ? e.takenAt : 0,
+          // undefined 不会被 JSON.stringify 写出去，所以"来自 EXIF"的条目在盘上**没有这个键**，
+          // 文件不会被一堆 `"manual":false` 撑大（3210 条索引里绝大多数是 EXIF 条目）。
+          manual: e.manual === true ? true : undefined
         });
       }
       if (skipped > 0) {
@@ -135,6 +167,11 @@ export class LocationIndex {
         hilog.warn(DOMAIN, TAG, '%{public}s',
           `地点索引中有 ${skipped} 条非法记录，已跳过（其中 ${skippedNoId} 条 photoId 缺失/非字符串，` +
           `${skipped - skippedNoId} 条整条为 null/undefined）`);
+      }
+      if (badManual > 0) {
+        // 与上面分级不同：条目保留、只丢标记。所以单独一条告警，不混进"已跳过"里。
+        hilog.warn(DOMAIN, TAG, '%{public}s',
+          `地点索引中有 ${badManual} 条的 manual 字段不是布尔值，已按"来自 EXIF"处理（条目保留、标记丢弃）`);
       }
       return out;
     } catch (e) {
@@ -285,6 +322,17 @@ export class LocationIndex {
   }
 
   /**
+   * 此刻是否有一次构建在跑。**只读查询**，给 UI 用：上墙流程在等待索引之前先用它决定
+   * 要不要提示用户"正在读取照片地点信息"（等待只在这一支里可能长达数秒）。
+   *
+   * **不要**用它代替 `awaitIdle()`：它只是某一瞬间的快照，读到它到用它之间就可能过期
+   *（构建刚启动/刚结束）。判"索引稳定了没有"的唯一正确做法仍然是 `await awaitIdle()`。
+   */
+  isBuilding(): boolean {
+    return building;
+  }
+
+  /**
    * 真正的构建逻辑：原 buildFrom 的方法体**整体挪到这里、内容一字未改**
    *（只是不再自带 try/finally —— 闸门的置位与复位留在 buildFrom，见那里的注释）。
    */
@@ -320,8 +368,40 @@ export class LocationIndex {
       // readExif 内部吞掉所有异常（读不到 → 全 0），所以这里不会再抛：
       // 一张坏照片不该让整批索引构建失败。
       const info: ExifInfo = await readExif(uri);
-      byId.set(uri, { photoId: uri, lat: info.lat, lon: info.lon, takenAt: info.takenAt });
+      // ── 手选地点的**第二道**防线：EXIF 绝不覆盖它 ──────────────────────────
+      // 第一道防线在 todo 的构造处（手选条目本来就在索引里 → 不进 todo，见上面的占位循环）。
+      // 两道都留着，因为这一条的代价是**不可逆的用户数据丢失**：手选地点被 EXIF 坐标盖掉之后，
+      // 用户没有任何入口知道这件事发生过（他只会发现"老家"变成了别的地方，或者地图上跑偏），
+      // 而"手动 > EXIF"正是本功能的全部意义（见 LocationEntry.manual 的注释）。
+      // 这一支在今天不可达（todo 已排除索引里有的 URI）；它挡的是将来有人改 todo 的构造方式
+      //（例如为了"让 EXIF 更准"而改成"每轮全量重读"）——那时这里会接住，而不是静默丢数据。
+      const prev: LocationEntry | undefined = byId.get(uri);
+      if (prev !== undefined && prev.manual === true) {
+        byId.set(uri, prev);   // 原样保留（坐标、时间、manual 一个都不动）
+      } else {
+        byId.set(uri, { photoId: uri, lat: info.lat, lon: info.lon, takenAt: info.takenAt });
+      }
       if (onProgress !== undefined) { onProgress(i + 1, total); }
+    }
+
+    // ── 收尾前重新读盘：把「构建期间用户手选的地点」并回来 ─────────────────────
+    // 为什么必需：本方法开头 load() 拿到一份快照，随后**逐张 await readExif**（几百张 =
+    // 秒级到十几秒，见 buildFrom 的说明）。这段时间里用户在刷卡页点「上墙」并选好了地点，
+    // PlaceStore 会把那条 manual 写进**同一个文件**；而下面这次 save(list) 是**全量写**，
+    // 写的正是"本方法开头那份快照 + 本批读到的 EXIF" —— 用户刚选的地点会被静默抹掉。
+    // 这不是理论风险：buildFrom 刻意不被 await（见 pages/ClaimPage.ets），索引构建与用户刷卡
+    // 是**并发**的，这正是 awaitIdle 存在的理由。
+    // 只并回 manual 条目：非 manual 条目以本次构建的结果为准（它读的就是最新的 EXIF）。
+    // 顺序无关性（为什么不必担心"反过来被覆盖"）：PlaceStore.setManual 内部 load → upsert
+    // → save 三步之间**没有 await**，所以它在事件循环里是原子的、不可能被本方法的 save 插进来；
+    // 而本方法这次 save 一定在它之后或之前**整体**发生，两种次序的最终结果都由这段合并收敛。
+    const onDisk: LocationEntry[] = this.load();
+    for (let i = 0; i < onDisk.length; i++) {
+      const d: LocationEntry = onDisk[i];
+      if (d.manual !== true) { continue; }
+      const cur: LocationEntry | undefined = byId.get(d.photoId);
+      if (cur !== undefined && cur.manual === true) { continue; }   // 同一份手选地点，不必覆盖
+      byId.set(d.photoId, d);
     }
 
     const list: LocationEntry[] = [];

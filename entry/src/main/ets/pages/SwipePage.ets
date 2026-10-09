@@ -1,9 +1,14 @@
 import { common } from '@kit.AbilityKit';
 import { router } from '@kit.ArkUI';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { DecisionStore } from '../data/decisionStore';
 import { SessionStore, takeSession } from '../data/sessionStore';
+import { LocationEntry } from '../data/locationIndex';
+import { PlaceStore } from '../data/placeStore';
 import { CardStack, QueueItem, CardEvent, SwipeRollback } from '../ui/CardStack';
+import { PlaceOutcome, pickPlace, toastReading } from '../ui/PlacePicker';
 import { Decision, emptyDecision, applyDecision } from '../core/queue';
+import { hasPlace } from '../core/placePick';
 import { MetricsState, emptyMetrics, recordSwipe, medianDecisionMs, rollbackRate } from '../core/metrics';
 // 会话模型（product：没有认领动作，改为"指定张数 → 抽样 → 刷完问是否继续"）。
 // 本页**消费**上一页存下的会话：cursor 是位置的唯一真相，advance 是唯一的"刷过一张"操作，
@@ -15,6 +20,15 @@ import { SwipeSession, isSessionDone, currentPhotoId, advance } from '../core/se
 // 卡高比例），而 onAreaChange 量到的是整个 Stack 的高（页面高减去顶部行），所以这里要乘回该比例。
 // 横向模型取消后不再有宽度换算：宽度只影响布局，不参与任何阈值。
 const CARD_HEIGHT_RATIO = 0.62;
+
+const DOMAIN = 0x0000;
+const TAG = 'PhotoWall';
+
+/** 把 catch 到的值转成一行可打印文本（与 data/locationIndex.ets 的 errText 同款口径）。 */
+function errText(e: Object): string {
+  if (e instanceof Error) { return e.message; }
+  return JSON.stringify(e);
+}
 
 @Entry
 @Component
@@ -37,6 +51,17 @@ struct SwipePage {
   private dStore: DecisionStore = new DecisionStore(this.ctx);
   // 「看过」的存取（同一层规矩：内存为权威、落盘防抖）。它必须声明在 ctx 之后，理由同上。
   private sStore: SessionStore = new SessionStore(this.ctx);
+  // 手动选地点（本批新增）：上墙时若这张照片没有地点，问用户省→市→县并记下来。
+  // 同样声明在 ctx 之后 —— 它内部也会 new LocationIndex(ctx)。
+  private pStore: PlaceStore = new PlaceStore(this.ctx);
+  // ── 进行中的上墙请求（见 beginWall）─────────────────────────────────────────
+  // 上墙流程是**异步**的（要先 awaitIdle 确认这张到底有没有 GPS），而卡片按钮在等待期间
+  // 仍可点。若不管，同一张被点两次「上墙」就会弹两个选择器（第二个叠在第一个上），
+  // 用户取消一个、确认一个，最终状态取决于两个回调谁后到 —— 不可预测。
+  // 用一个**递增序号**当凭据：只有"最后一次请求"（wallLiveSeq）的回调与后续步骤才有效，
+  // 旧请求在恢复执行时发现凭据已换，静默退出（不弹、不写、不推进）。
+  private wallSeq: number = 0;
+  private wallLiveSeq: number = 0;
   // 落盘防抖：内存 Map 是权威副本，落盘合并成 1 秒窗口内最多一次。
   // 每滑一张就 loadAll() + saveAll() 是「全量读 + 全量写」的同步 I/O，且跑在 UI 线程上；
   // Task 7 的「手感挺好」是在无落盘时测的，加落盘后必须把 I/O 从每决策 2 次压到每秒至多 1 次。
@@ -341,22 +366,147 @@ struct SwipePage {
       return;
     }
 
-    const d = already === undefined ? emptyDecision(photoId) : already;
-    // 三个合法动作各自映射：'wall' 必须显式映射为 'wall'，否则会落到 else 的
-    // 'archive' 上——照片会被当场上墙，却在盘上被记成归档（决策丢失）。
-    // 标注不能写成 `: string`：applyDecision 的第二参是 core/queue.ts 的 Action 联合，
-    // 传 string 会编译失败（实测报错 "Argument of type 'string' is not assignable to
-    // parameter of type 'Action'"）。这里收窄成实际可达的三值，既过编译又让
-    // 「本函数只产出这三种」成为类型事实（将来加分支会被编译器要求显式处理）。
-    let nextAction: 'fav' | 'archive' | 'wall' = 'archive';
+    // 「上墙」在本批**不走下面那条同步路径**：它要先确认这张有没有地点，没有就问用户
+    //（省→市→县三级下拉），整段是异步的，所以决策由流程终点 applyWall() 落（见 beginWall）。
+    // 分支点必须在这道去重守卫**之后**：对同一张的重复 wall 上报要先被上面自愈掉，
+    // 否则会给同一张弹两次选择器（第二次叠在第一次上）。
+    // 于是到达下面的 action 只可能是 'fav' / 'archive'，类型也据此收窄 ——
+    // 传 string 会编译失败（applyDecision 的第二参是 core/queue.ts 的 Action 联合），
+    // 收窄成实际可达的两值既过编译，又让"wall 不从这条路径落决策"成为类型事实。
+    if (action === 'wall') { this.beginWall(photoId); return; }
+
+    let nextAction: 'fav' | 'archive' = 'archive';
     if (action === 'fav') { nextAction = 'fav'; }
-    else if (action === 'wall') { nextAction = 'wall'; }
-    const next = applyDecision(d, nextAction, now);
-    this.decisions.set(photoId, next);
-    // 落盘改防抖合并：内存 Map 已是权威副本，崩溃/被杀最多丢 1 秒内的决策
-    this.scheduleSave();
+    this.putDecision(photoId, nextAction, now);
 
     this.goTo(this.session.cursor + 1);
+  }
+
+  /**
+   * 决策的唯一落盘点：写进内存 Map **并**排程落盘（两件事必须成对，理由见 scheduleSave）。
+   *
+   * 单独抽出来，是因为本批多了**第二条决策路径**（上墙：先问地点再落决策，见 beginWall）。
+   * 两条路径若各抄一份"emptyDecision → applyDecision → set → scheduleSave"，
+   * 将来给 Decision 加字段（例如"决策来源"）时必然只改一处 —— 那类偏差不会报错，
+   * 只会让一半数据的字段是默认值。所以落盘点只有一个。
+   */
+  private putDecision(photoId: string, action: 'fav' | 'archive' | 'wall', now: number): void {
+    const already: Decision | undefined = this.decisions.get(photoId);
+    const d: Decision = already === undefined ? emptyDecision(photoId) : already;
+    this.decisions.set(photoId, applyDecision(d, action, now));
+    this.scheduleSave();
+  }
+
+  /**
+   * 「上墙」的第 0 步：确认这张照片**有地点可用**，没有就问用户（省 → 市 → 县）。
+   *
+   * 为什么要异步、为什么必须 `awaitIdle()`：
+   *   地点索引（data/locationIndex.ets）是**后台增量构建**的 —— ClaimPage 开一局时
+   *   刻意不 await 就启动它（"它是后台性质的工作，不该阻塞跳转"）。所以用户点「上墙」的
+   *   那一刻，这张照片的 EXIF 很可能**还没读**。此刻同步 load() 得到的是半成品索引，
+   *   会把"还没读到"误判成"没有 GPS" → 给一张本来有 GPS 的照片弹选择器；而用户一旦选了，
+   *   那条 manual 会**永久**压住 EXIF（本批的核心规则，且没有任何入口能撤销）。
+   *   所以要等索引稳定（awaitIdle：返回时没有构建在跑）再判。
+   *
+   * 已知取舍（写进报告）：索引还在构建时点「上墙」会有可感知的等待（首局可能要数秒，
+   * 索引要读几百张 EXIF）。用 toast 把"在等什么"说出来，而不是让按钮看起来失灵。
+   */
+  private beginWall(photoId: string): void {
+    this.wallSeq = this.wallSeq + 1;
+    const token: number = this.wallSeq;
+    this.wallLiveSeq = token;
+    // 只有**真的在等**才提示：索引构建没在跑时，awaitIdle() 只花一次 load()，
+    // 弹 toast 反而会闪一下。isBuilding() 是"要不要提示"的判据，不是"稳不稳定"的判据
+    //（后者只能用 awaitIdle，见它的注释）。
+    if (this.pStore.isBuilding()) { toastReading(this.getUIContext()); }
+    this.resolveWallPlace(photoId, token);
+  }
+
+  /**
+   * 上墙流程的中间段（等索引 → 三条守卫 → 有地点就直接上墙，没有就问用户）。
+   *
+   * 三条守卫缺一不可，每一条都对应"等待期间用户还能操作"这一事实：
+   *   ① 凭据：用户可能对**另一张**又点了上墙 —— 旧请求必须作废，否则会给一张已经离开
+   *      屏幕的照片弹选择器，用户还以为是给当前这张选的；
+   *   ② 已有决策：用户可能已经点了归档/收藏（按钮在等待期间可用）—— 那张已经有结局了，
+   *      不该被这次上墙改写（用户后来的明确决定优先于先前的上墙意图）；
+   *   ③ 已离开槽位：用户可能上滑翻了页 —— 不能当着**别的**照片弹选择器。
+   * 三条都是"放弃本次上墙"，且都**不写盘、不推进**（放弃 = 什么都没发生）。
+   */
+  private async resolveWallPlace(photoId: string, token: number): Promise<void> {
+    // awaitIdle 内部吞掉构建失败的异常（返回盘上现状），所以这里不会抛；
+    // 仍然包一层 try：上墙是用户按出来的动作，任何意外都不该让这张卡进入"点了没反应"
+    // 且没有任何日志的状态。
+    let entry: LocationEntry | undefined = undefined;
+    try {
+      entry = await this.pStore.entryAfterIdle(photoId);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, '%{public}s', `上墙前读地点索引失败（按"没有地点"处理）: ${errText(e)}`);
+      entry = undefined;
+    }
+    if (token !== this.wallLiveSeq) { return; }                    // ① 已被更新的一次上墙请求取代
+    if (this.decisions.get(photoId) !== undefined) { return; }     // ② 等待期间这张已有别的结局
+    if (hasPlace(entry)) {
+      // 有地点（EXIF GPS，或此前手选过）→ 直接上墙，与改版前完全一致。
+      // 打一行来源日志：真机上这是"手动有没有真的压住 EXIF"最直接的证据。
+      hilog.info(DOMAIN, TAG, '%{public}s',
+        `上墙：${photoId} 使用${this.pStore.sourceOf(entry) === 'manual' ? '手选' : 'EXIF'}地点`);
+      this.applyWall(photoId);
+      return;
+    }
+    if (currentPhotoId(this.session) !== photoId) { return; }      // ③ 已离开这张
+    // 没有地点：交给用户选（省→市→县三级下拉）。
+    pickPlace(this.getUIContext(), this.ctx, (o: PlaceOutcome) => {
+      this.onPlaceResolved(photoId, token, o);
+    });
+  }
+
+  /**
+   * 选择器的结局。**取消必须干净**：不落决策、不推进、不写盘 —— 用户不该因为改主意
+   * 而被记上一笔，也不该被推着往前走（卡片留在原位，四个按钮和滑动手势都照常可用：
+   * CardStack 的 commit() 只作废"按钮按下时正在途中的那次手势"，不是把这 张卡锁死）。
+   */
+  private onPlaceResolved(photoId: string, token: number, o: PlaceOutcome): void {
+    if (token !== this.wallLiveSeq) { return; }
+    if (o.kind === 'cancelled') {
+      hilog.info(DOMAIN, TAG, '%{public}s', '上墙已取消（未选地点）：未产生决策、未推进队列、未写盘');
+      return;
+    }
+    if (this.decisions.get(photoId) !== undefined) {
+      // 结构上到不了（选择器是模态的，弹着的时候点不到别的按钮）；留着是为了万一平台把它
+      // 做成非模态：那时用户后来的决定（归档/收藏）不该被他更早的一次上墙覆盖。
+      hilog.warn(DOMAIN, TAG, '%{public}s',
+        `地点已选（${o.hit.province}/${o.hit.city}/${o.hit.county}），但这张已有别的决策，放弃上墙`);
+      return;
+    }
+    const ok: boolean = this.pStore.setManual(photoId, o.hit, Date.now());
+    if (!ok) {
+      // 地点没写进去（photoId 空 / 坐标非法 —— 正常情况下结构上不可达，见 setManual）。
+      // 仍然继续上墙：用户点的是「上墙」，那是他的主要意图；地点写失败由上面那行 warn 记录。
+      hilog.warn(DOMAIN, TAG, '%{public}s', `手选地点未能写入，本次上墙将没有地点: ${photoId}`);
+    }
+    this.applyWall(photoId);
+  }
+
+  /**
+   * 上墙的终点：落决策 + （必要时）推进。**wall 决策只在这里落**。
+   *
+   * 与 handle() 的滑动决策共用 putDecision()，所以"写内存 + 排程落盘"仍然只有一处；
+   * 这里额外管的是**推进条件**：只有这张**仍在当前槽位**时才 goTo(cursor + 1)。
+   * 理由：等索引、等用户选地点这段时间里用户可能已经上滑翻页，那时 items[cursor]
+   * 已经是另一张照片了，再推进就会**静默跳过一张没被决策的照片** ——
+   * 正是 handle() 里那道 atSlot 守卫要防的事，这里必须防同一件事。
+   * 不在槽位上时照样落决策（那张照片确实被上墙了）但不推进（新卡的位置已经对了）。
+   */
+  private applyWall(photoId: string): void {
+    const now: number = Date.now();
+    this.putDecision(photoId, 'wall', now);
+    if (currentPhotoId(this.session) === photoId) {
+      this.goTo(this.session.cursor + 1);
+    } else {
+      hilog.info(DOMAIN, TAG, '%{public}s',
+        `上墙已记录但不推进：这张已不在当前槽位（用户在这期间翻过页）: ${photoId}`);
+    }
   }
 
   /**
