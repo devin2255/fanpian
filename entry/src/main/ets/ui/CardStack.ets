@@ -96,6 +96,10 @@ export struct CardStack {
   // **新** photoId 上报 → 用户没打算决定的那张被静默消耗（批 15 修的缺陷）。
   // 这张记录是否让某个手势作废，由 isGestureVoided() 按「手势起点」判定（见该方法的说明）。
   private decidedId: string = '';
+  // 定案是否发生在**当前这一次手势**期间：onActionStart 清、commit() 置真。
+  // 判据 1 的时限。光看 photoId 恒等分不清「窗口」与「陈旧」—— 「点击 → 换卡」那一帧内
+  // item 就是这张，而「← 返回上一张」回到同一张之后 item 又是这张（见 isGestureVoided）。
+  private decidedDuringGesture: boolean = false;
   // 本次手势「是在哪张卡上开始的」：onActionStart 里无条件记录，每次新手势刷新。
   // 作废判据必须依据它，而不是 this.item.photoId —— 定案/翻页后父组件重渲染会在约一帧内
   // 把 @Prop item 换成另一张，此后 item.photoId 已经不是那张卡了，而在途手势仍属于它：
@@ -138,9 +142,25 @@ export struct CardStack {
   /**
    * 这个手势是否已作废（不得再写 dy，也不得在 settle() 里上报）。
    * 两条互补判据，缺一不可：
-   *   1) 手势起点卡就是刚定案的那张（decidedId 只由三个动作按钮写，翻页不写）—— 按钮路径必须
+   *   1) 手势起点卡就是刚定案的那张，**且定案就发生在这一次手势期间** —— 按钮路径必须
    *      **当场**作废：从按钮点击到 @Prop item 换卡之间还隔着约一帧，在途手指能在这段窗口里
    *      把 dy 写歪，而按钮刚显式归过零（见 commit() 里「归零」那段）。
+   *      三个条件各自的作用与不可省性：
+   *        - `decidedId !== '' && gestureId === decidedId` 只说「这个手势的起点卡被定过案」，
+   *          **不能**单独作判据（原缺陷）：定案后父组件若把 idx 退回同一张 ——「← 返回上一张」
+   *          正是如此，且该路径**不重建组件实例**（idx 从 1 回到 0 时 `idx < items.length`
+   *          分支没有切换，@Prop item 只是换回了同一张照片）—— decidedId 会陈旧成「当前这张」，
+   *          而 onActionStart 每次把手势起点刷成同一张，于是恒真且不自愈：
+   *          这张卡不可滑、不可决策、连「← 返回」也失效，只能杀 App。
+   *        - `item.photoId === decidedId`（「还没换卡」）**不改变任何判定**：判据 2 为假时必有
+   *          gestureId === item.photoId，故在「判据 2 为假」这个唯一需要判据 1 说话的状态下，
+   *          它是恒真的推论；判据 2 为真时本就已作废。保留它只是把「还没换卡」写进代码，
+   *          别指望它解开上面那个锁（那要靠下一条）。
+   *        - `decidedDuringGesture` 才是真正区分「窗口」与「陈旧」的信息：窗口期那根在途手指
+   *          **早在定案之前**就已经开始（onActionStart 已跑过），而定案之后才开始的手势是
+   *          新的一次操作（onActionStart 会把它清掉）—— 两条路径的 photoId 完全相同，
+   *          时间先后是唯一可用的判据。它只在「点击 → 换卡」约一帧的窗口内为真；
+   *          换卡之后由判据 2 接管（跨卡作废，且随 @Prop item 变化自动解除）。
    *   2) 手势起点卡已不是当前显示的那张 —— 换卡本身即作废。它让作废跨过换卡继续有效，
    *      并覆盖「decidedId 被下一次定案覆盖」的情形（两指连点两次按钮：第二次把
    *      decidedId 写成新卡后，判据 1 就认不出第一根手指的在途手势了）；而且不可逆 ——
@@ -152,7 +172,8 @@ export struct CardStack {
    * 误作废会让这一页的手势整段失灵。
    */
   private isGestureVoided(): boolean {
-    if (this.decidedId !== '' && this.gestureId === this.decidedId) { return true; }
+    if (this.decidedId !== '' && this.gestureId === this.decidedId
+        && this.item.photoId === this.decidedId && this.decidedDuringGesture) { return true; }
     if (this.gestureId !== '' && this.gestureId !== this.item.photoId) { return true; }
     return false;
   }
@@ -197,6 +218,11 @@ export struct CardStack {
             //       → 整页手势永久死锁（与 navOut 的 try/finally 要避免的死锁同类）。
             // 作废只在 update/settle 两道出口上按 isGestureVoided() 判定，基线照常刷新即可。
             this.gestureId = this.item.photoId;   // 手势归属：本手势是在这张卡上开始的
+            // 新手势开始 = 上一次定案的保护窗口到此为止（判据 1 的时限，见 isGestureVoided）。
+            // 定案之后才开始的手势是新的一次操作，不该被上一次定案作废：否则
+            //「按钮定案 → 返回同一张」会让判据 1 恒真且不自愈，那张卡彻底锁死
+            //（photoId 上两条路径完全一样，先后关系是唯一区分得开的信息）。
+            this.decidedDuringGesture = false;
             this.lastY = e.offsetY;
             this.lastT = Date.now();
             this.velocity = 0;
@@ -315,6 +341,8 @@ export struct CardStack {
    *   3) **在 onDecide 之前**记下 decidedId —— onDecide 会同步换卡，之后 this.item
    *      已经不是这张卡了，而在途手势（另一根手指）仍以它为起点。判据 1 靠这条记录
    *      当场作废那个手势，否则它会以换卡后的**新** photoId 上报，静默消耗一张照片。
+   *      同一步把 decidedDuringGesture 置真：判据 1 的时限 = 「定案发生在这一次手势期间」，
+   *      少了它就会连「返回同一张之后的新手势」一起作废（那个锁的成因，见 isGestureVoided）。
    */
   private commit(ev: CardEvent): void {
     // 与 onActionUpdate / settle() 同口径的闸门：翻出动画期间卡片视觉上已经飞走
@@ -337,6 +365,7 @@ export struct CardStack {
     // 但「另一根手指还在拖这张卡」不同：idx 前进后它会以**新** photoId 上报，
     // 同 photoId 去重拦不住。所以定案必须当场记下，与上报同一个同步块。
     this.decidedId = this.item.photoId;
+    this.decidedDuringGesture = true;
     this.onDecide(this.item.photoId, ev);
   }
 
