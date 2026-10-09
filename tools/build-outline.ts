@@ -3,10 +3,11 @@
  * `entry/src/main/resources/rawfile/china_outline.json`。
  *
  * 用法：
- *   node --experimental-strip-types tools/build-outline.ts                 # 默认 10m / 容差 0.35pt
- *   node --experimental-strip-types tools/build-outline.ts --src=50m
+ *   node --experimental-strip-types tools/build-outline.ts                 # 默认 10m / 容差 0.15pt（= 入库口径）
+ *   node --experimental-strip-types tools/build-outline.ts --src=50m       # 换数据源：环数会变，要配 --expect-rings
  *   node --experimental-strip-types tools/build-outline.ts --tol=0.5 --report
  *   node --experimental-strip-types tools/build-outline.ts --compare        # 两份源 × 若干容差 的对照表
+ *   node --experimental-strip-types tools/build-outline.ts --expect-rings=N # 显式承认"数据源换了、环数变了"
  *
  * ── 选哪些要素（**规则由数据自己的字段决定，不是我挑的**） ──────────────────────
  *   · `properties.SOVEREIGNT === 'China'`  → 中国本土 + 香港 + 澳门
@@ -21,8 +22,18 @@
  *   Douglas–Peucker，**在投影后的画布空间里**做（不是经纬度空间）。
  *   为什么：经纬度空间里"1° 经度"和"1° 纬度"的屏幕长度差 1/cos(lat) 倍（墨卡托），
  *   同一个经纬度容差在南方和北方代表的像素误差能差一倍；而画地图时唯一重要的是
- *   **屏幕上的偏差**。容差默认 0.35pt ≈ 1 倍图上 1/3 个像素（360pt 宽的中国地图），
- *   所以简化后的轮廓与原数据**在屏幕上看不出差别**，点数却少一个数量级。
+ *   **屏幕上的偏差**。容差默认 0.15pt = 360pt 宽的中国地图上 1 倍图的 0.15px（约 1/7 像素），
+ *   所以简化后的轮廓与原数据**在屏幕上看不出差别**，点数却掉到源数据的 19.4%。
+ *
+ *   ── **为什么默认必须是 0.15：默认值就是入库口径**（这条踩过坑，别改大） ─────────
+ *   0.15 是入库数据使用的容差（见 `china_outline.json` 的 `v` 字段 `ne10m-dp0.15-2dec`
+ *   —— 那个字段就是"这份数据是用哪个容差产出来的"的机器可读记录）。
+ *   改成更大会静默降精度（2959→2131 点、37637→27367 字节）而所有自检仍然通过 ——
+ *   那正是这个默认值必须与入库口径一致的原因：下一个人照着 usage 敲一条默认命令，
+ *   就会在**没有任何提示**的情况下把入库轮廓的精度降掉 28%（自检只问"能不能解析、
+ *   bounds 是否一致、有没有 NaN"，这些在降精度后照样通过）。
+ *   注意容差是**保真度**参数、不是**完整性**参数：0.15 和 0.35 产出的环数都是 96，
+ *   改它不会丢任何地理要素（见 main() 里"数据环数"那一条自检）。
  *
  * ── 坐标系/边界（**最容易搞错、也最容易让地图和钉子错位的地方**） ─────────────
  *   输出的 `bounds` 必须与 `core/projection.ts` 的 `CHINA_REGION.bounds` **完全一致**：
@@ -48,16 +59,37 @@ const OUT = path.join(REPO, 'entry/src/main/resources/rawfile/china_outline.json
 const REF_W = 360;
 const REF_H = mapBoxHeight(REF_W, CHINA_REGION.bounds);
 
+/**
+ * 入库数据里的**环数**（实测 `china_outline.json` 的 `rings.length` = 96：
+ * China 70 + Hong Kong 4 + Macao 2 + Taiwan 8 + Spratly 12）。
+ * 同一个数字也被 `render.test.ts` 的「china_outline.json：…环数不变」钉着 ——
+ * 那条测试守的是**已入库的文件**，这条断言守的是**本脚本刚产出的文件**，两者互为补充。
+ *
+ * 这是**完整性**判据，与容差、与视野都无关：
+ *   · 与容差无关：0.15 与 0.35 产出的环数都是 96（容差只决定每条环留下几个点）；
+ *   · 与视野无关：即便放大到"视野里只剩 1 个省"，`rings.length` 也还是 96 ——
+ *     "看得见几条"是绘制层的**视口剔除**，不是数据少了环。
+ * 所以断言这个数字，才能真的抓住"抽取规则写错、丢了台湾/南海诸岛"这类事故。
+ *
+ * 换数据源（`--src=50m`）或升级 Natural Earth 版本会**合法地**改变这个数字，
+ * 那时必须用 `--expect-rings=N` 显式承认新口径 —— 默认值故意是**精确相等**而不是
+ * ">= 下限"：多出环同样意味着抽取规则变了（例如某条规则被放宽、要素被选重），
+ * 而"无声地换一份数据和入库版本不同"正是本脚本要防的事。**失败即非零退出**。
+ */
+const EXPECTED_RINGS = 96;
+
 type Ring = number[];   // 扁平 [lon,lat,lon,lat,…]
 interface Pt { x: number; y: number }
 
-interface Opts { src: string; tol: number; write: boolean; compare: boolean }
+interface Opts { src: string; tol: number; write: boolean; compare: boolean; rings: number }
 interface Picked { label: string; rings: Ring[]; pts: number }
 
 // ── 参数 ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv: string[]): Opts {
-  const o: Opts = { src: '10m', tol: 0.35, write: true, compare: false };
+  // `tol` 的默认值 = **入库数据用的容差**（0.15，见文件头"为什么默认必须是 0.15"）。
+  // 不要为了"文件小一点"把它调大：那会静默降精度（2959→2131 点）而自检照样通过。
+  const o: Opts = { src: '10m', tol: 0.15, write: true, compare: false, rings: EXPECTED_RINGS };
   for (const a of argv) {
     if (a === '--report') { o.write = false; continue; }
     if (a === '--compare') { o.compare = true; continue; }
@@ -66,7 +98,11 @@ function parseArgs(argv: string[]): Opts {
     const val = eq < 0 ? '' : a.substring(eq + 1);
     if (key === '--src') { o.src = val; continue; }
     if (key === '--tol') { o.tol = Number(val); continue; }
+    if (key === '--expect-rings') { o.rings = Number(val); continue; }
     throw new Error(`未知参数：${a}`);
+  }
+  if (!Number.isInteger(o.rings) || o.rings <= 0) {
+    throw new Error(`--expect-rings 需要正整数，收到 "${o.rings}"`);
   }
   return o;
 }
@@ -404,12 +440,41 @@ function main(): number {
     console.error('✗ outlinePath 产出的 d 为空或含 NaN —— 拒绝收工');
     return 1;
   }
-  console.log(`  自检：parseOutline ✓  bounds 与 CHINA_REGION 一致 ✓  outlinePath ${d.length} 字符`
-    + ` / ${d.split('M').length - 1} 条子路径`);
 
-  // 视口核对：96 条环里有几条落在地图块外（→ outlinePath 会跳过它们的子路径）。
+  // ── 自检的两个数字：**它们不是一回事，谁也不能顶替谁** ────────────────────────
+  //   · dataRings = 落盘文件里**真实存在**的环数（`od.rings.length`）
+  //       = **完整性**判据。与视野无关：放大到视野里只剩一个省，它照样是 96；
+  //         与容差也无关：0.15 和 0.35 产出的都是 96（容差只决定每条环留几个点）。
+  //   · subpaths  = 拿"整块参考画布"当视野时**画得出来**的子路径数
+  //       = 视口剔除的**结果**。视野一变它就变 → 它**不能**当完整性判据。
+  // 上一版只报 subpaths（96 条环 → 77 条），于是自检**没有校验它声称校验的东西**：
+  //   96→77 明明是视口剔除的功劳，看上去却像"数据里只有 77 条"；反过来，若抽取规则
+  //   写错、真丢了台湾(8 环)和南海诸岛(12 环)这 20 条环，只要剩下的环恰好都落在视野内，
+  //   这个数字**一模一样**，自检照样绿着通过 —— 丢掉的环永远不会被发现。
+  // 所以完整性必须断言 dataRings，而且断言失败就**非零退出**（自检的全部意义）。
+  const dataRings = od.rings.length;
+  const subpaths = d.split('M').length - 1;
+  console.log(`  自检：parseOutline ✓  bounds 与 CHINA_REGION 一致 ✓  outlinePath ${d.length} 字符`);
+  console.log(`  数据环数 ${dataRings}（落盘文件的 od.rings.length ← **完整性判据**，期望 ${o.rings}）`);
+  console.log(`  视野内子路径数 ${subpaths}（${REF_W}×${REF_H.toFixed(2)}pt 整块画布、视口剔除**之后**，只作参考）`);
+  if (dataRings !== o.rings) {
+    console.error(`✗ 数据环数 ${dataRings} ≠ 期望 ${o.rings}（差 ${dataRings - o.rings} 条）—— 落盘数据丢了或多了环，拒绝收工`);
+    console.error('  按要素数一遍，看是哪一组出的问题（台湾 8 环、南海诸岛 12 环是必须有的）：');
+    for (const g of picked) { console.error(`    ${g.label}  源环 ${g.rings.length}`); }
+    console.error('  有意换了数据源/升级了 Natural Earth 版本 → 确认无误后用 --expect-rings=N 显式承认新口径；');
+    console.error('  否则就是抽取规则（SOVEREIGNT / ADMIN）写错了。');
+    return 1;
+  }
+  if (subpaths < 1 || subpaths > dataRings) {
+    console.error(`✗ 视野内子路径数 ${subpaths} 不合理（应为 1..${dataRings}）—— outlinePath 有问题，拒绝收工`);
+    return 1;
+  }
+
+  // 视口核对：**上面那个 subpaths 是怎么来的**（= 哪些环被剔除掉了）。
   // 为什么必须数出来：bounds 的 minLat = 18，而南海诸岛在 8~11.4°N，
-  // 它们投影后在地图块**下方**（y > mapH）。数据按要求完整保留，绘制层做视口裁剪。
+  // 它们投影后在地图块**下方**（y > mapH）。数据按要求完整保留（dataRings 里一条不少），
+  // 绘制层只是**不画**视野外的东西 —— 这也是"完整性"与"看得见"必须分开报的原因。
+  // 判定条件与 `outlinePath` 里的剔除条件完全一致（整条环的包围盒落在块外 → 跳过）。
   let inside = 0;
   let outside = 0;
   let straddle = 0;
@@ -432,6 +497,8 @@ function main(): number {
   console.log(`  视口：${inside} 条环完整落在地图块 ${REF_W}×${REF_H.toFixed(2)}pt 内`
     + ` ｜ ${outside} 条整体在块外（8~11.4°N 的南海诸岛，数据保留、绘制时跳过）`
     + ` ｜ ${straddle} 条跨界`);
+  console.log(`  ${inside} + ${straddle} = ${inside + straddle} 条可见（跨界的也算画出来）`
+    + `，${dataRings} − ${outside} = ${dataRings - outside} 条 —— 与上面的 ${subpaths} 条子路径对应`);
   return 0;
 }
 
