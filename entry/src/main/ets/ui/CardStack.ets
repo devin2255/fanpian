@@ -260,19 +260,43 @@ export struct CardStack {
             // 它的生命周期由 onActionStart（清）与 commit（置真）划定，不再加第三个写入点。
           })
           .onActionCancel(() => {
-            // 手势被取消（系统中断 / 被其他手势抢占）时不会走 onActionEnd。
-            // 不在这里收尾的后果与批 19 修的缺陷同形态：gestureId 留着手势起点，
-            // 判据 2 恒真 → 四个动作按钮全部失效，直到用户再拖一次。
+            // 手势被取消时走这里而**不**走 onActionEnd（SDK：取消 = PanGesture 识别成功之后
+            // 收到触摸取消事件；结束 = 所有手指抬起）。所以本回调也必须收尾：不清 gestureId，
+            // 它就留着手势起点，而按钮点击不产生手势 —— 起点卡不是当前显示的那张时，
+            // 判据 2（gestureId !== '' && gestureId !== item.photoId）对这张卡上的任何按钮恒真
+            // → 四个按钮全部失效，直到用户再拖一次。
+            //
+            // 判据 2 需要「起点卡**已经**不是当前显示的那张」，取消本身并不制造这个状态：
+            //   - 取消时若没换过卡（单指取消、且没点过按钮）→ gestureId === item.photoId，
+            //     判据 2 为假；判据 1 也要求 item.photoId === decidedId，同样为假
+            //     → 这次取消本来就不会让按钮失效。
+            //   - 真正会死锁的是「手势还在途时起点卡被换走」：此后 item 已是 B 而 gestureId
+            //     停在 A，判据 2 为真，且要等用户再拖一次（onActionStart 刷新起点）才自愈；
+            //     判据 1 也救不了（它额外要求 item.photoId === decidedId，而这里 item 已是 B）。
+            //     起点卡在途时被换走的两条路径都可达：
+            //       (a) 拖动中点了动作按钮 —— commit 会当场换卡，且**不**设 animating，在途手势
+            //           不会被闸门挡住（两指：一指拖 A、另一指点按钮；单指同理）。
+            //       (b) 拖动中完成了一次上滑 —— navOut 播完 200ms 动画后、在 210ms 回调里换卡，
+            //           这 210ms 内发生的取消都早于换卡（取消后手势即结束，不会再走 settle）。
             //
             // 语义：取消**不是**一次滑动尝试，所以**不上报回弹**（与「队首下滑静默弹回」同一口径）；
             // 但卡片必须归位（否则它停在拖到一半的位置），故用 springBack(false)。
             //
-            // 顺序不可颠倒：springBack(false) 在前（它内部会 endSpringWindow() 并起归位动画），
-            // gestureId = '' 在后 —— 与 onActionEnd 的顺序同理（清空要先让收尾动作读完状态）。
+            // 已换走时跳过归位：那张已经定案、正在被新卡取代（情形 (a) item 已被换走，情形 (b)
+            // 换卡回调已经在跑），两个换卡出口都已处理过它 —— commit 先归零 dx/dy 再上报，
+            // navOut 在 210ms 回调的 finally 里平赋值归零，所以归位在此是多余的；
+            // 更要紧的是**不要**给它开防抖窗口：窗口会落在新卡头上，吞掉新卡在 150ms 内的
+            // 首个真实回弹，让 rollbackRate 偏低（偏好看方向，理由同 endSpringWindow 的说明）。
+            // 没换走时必须照常归位，否则那张卡会停在拖到一半的位置。
+            //
+            // 归位与收尾的顺序不可颠倒：springBack(false)（它内部会 endSpringWindow() 并起
+            // 归位动画）在前、gestureId = '' 在后 —— 与 onActionEnd 的顺序同理
+            //（清空要先让收尾动作读完状态）。
             // 用 springBack(false) 而**不是** settle()：settle() 会按位移/速度替用户判定翻页或回弹，
-            // 而「手势被取消」不是一次翻页意图（SDK：取消 = PanGesture 识别成功之后收到触摸
-            // 取消事件），按位移/速度决定会凭空翻掉一张、或记一次伪回弹。
-            this.springBack(false);
+            // 而「手势被取消」不是一次翻页意图，按位移/速度决定会凭空翻掉一张、或记一次伪回弹。
+            if (!this.isGestureVoided()) {
+              this.springBack(false);
+            }
             this.gestureId = '';
             // **不**在此清 decidedDuringGesture：与 onActionEnd 的既定处置一致 —— 上面清空
             // gestureId 之后判据 1 不再成立，它已无读取者（见 onActionEnd 的说明）。
