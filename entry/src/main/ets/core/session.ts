@@ -3,7 +3,8 @@
 // 为什么是"放回抽样"（产品负责人原话：「前面刷过的照片可以继续放到整个照片池子里被抽中」）：
 //   抽样范围是**整个已授权池**，与"是否已决策"无关 —— 已归档/已收藏/已上墙的照片
 //   仍会被抽中并在新会话里再次出现。用户不需要记得"哪些认领过了"，也不会为了找旧照片一直下滑。
-//   seenIds 只影响**优先级**（没见过的优先，让回忆有新鲜感），**不做排除**。
+//   seenIds / prevQueue 只影响**优先级**（顺序），**不做排除** —— 任何照片都不会因为
+//   "看过"或"上一批抽过"而失去被抽中的资格，这正是"放回"的含义。
 //
 // 平台约束（已实测，别绕）：第三方应用无法枚举相册（READ_IMAGEVIDEO 是 system_basic，
 // 声明它会导致安装失败），唯一入口是系统选图器，选中的 URI 有永久授权。
@@ -91,21 +92,36 @@ function dedupe(pool: string[]): string[] {
  *   - **同一会话内不重复**（否则一次会话里同一张会出现两次，体验是 bug）。
  *   - 抽不满 size 时返回能抽到的全部（不报错）。
  *
- * 优先级（在"不重复"的前提下尽量让回忆有新鲜感）：
- *   优先抽**未被 anySession 见过的**照片；不足时才用已见过的补足。
+ * 优先级（在"不重复"的前提下尽量让回忆有新鲜感）—— **三层**，按序取用、缺多少从下一层补：
+ *   1) **没见过的**（不在 seenIds 里）：回忆有新鲜感，永远优先。
+ *   2) **见过、但不在上一批里的**（不在 prevQueue 里）：这就是"循环回来"该先轮到的那批。
+ *   3) **上一批里的**（在 prevQueue 里）：最后才用它们补足。
  *   "见过"由 seenIds 提供（调用方从持久化状态读出）。
+ *
+ * 为什么要有第 2 层（它修的是一个确定性缺陷，不是口味问题）：
+ *   池子 100 张、会话要 100 张、这 100 张都已看过时，第 1 层**恒为空**，两层实现退化成
+ *   「每轮从同一个已见过的集合里抽满」—— 用户点「继续刷」看到的每一批都来自同一批照片，
+ *   抽样看起来像坏了。加了第 2 层后，池子 200 张 / 每批 100 张的场景能连着给出 200 张不重复的，
+ *   之后才开始循环。**第 3 层仍然保留**：池子 ≈ 张数时重叠不可避免，此时必须能抽满。
+ *
+ * 向后兼容：**prevQueue 传空数组时本函数与"两层版本"逐位一致**（含队列顺序与每个位置的取值），
+ *   因为 prev 为空集 ⟹ 第 3 层恒空 ⟹ 第 2 层恰好就是原来的 known 桶，且分桶顺序、
+ *   每层 pickRandom 的调用顺序与消耗的随机数个数都未变。core/session.test.ts 里有
+ *   「旧实现差分」用例守着这条（不是靠肉眼论证）。
  *
  * size 字段：抽不满时保留**请求值**（同"池子空了"的口径），实际可刷张数以 queue.length 为准。
  *
- * @param pool     已授权池（photoId 列表）
- * @param size     本次要抽的张数
- * @param seenIds  历史上曾被展示过的 photoId（用于优先级，不用于排除）
- * @param seed     随机种子（**必须可注入**：纯逻辑要可测、可复现）
+ * @param pool      已授权池（photoId 列表）
+ * @param size      本次要抽的张数
+ * @param seenIds   历史上曾被展示过的 photoId（**只用于分桶，绝不排除**）
+ * @param prevQueue 上一会话抽中的队列（用于"优先避开上一批"；空数组 = 退化为旧两层行为）
+ * @param seed      随机种子（**必须可注入**：纯逻辑要可测、可复现）
  */
 export function sampleSession(
   pool: string[],
   size: number,
   seenIds: string[],
+  prevQueue: string[],
   seed: number
 ): SwipeSession {
   // NaN 也走这里（!(NaN > 0) === true）；口径同 claim.ts sortByTakenDesc 的 NaN 处理
@@ -119,18 +135,29 @@ export function sampleSession(
   }
   const seen: Set<string> = new Set();
   for (let i = 0; i < seenIds.length; i++) { seen.add(seenIds[i]); }
-  const fresh: string[] = [];
-  const known: string[] = [];
+  const prev: Set<string> = new Set();
+  for (let i = 0; i < prevQueue.length; i++) { prev.add(prevQueue[i]); }
+  // 分桶。**遍历 uniq 的顺序必须保持**：每一层内部保留池子里的相对顺序，再由 pickRandom
+  // 按种子打散 —— 既保证"层内仍随机"，也让 prevQueue 为空时的结果与旧实现逐位相同。
+  const fresh: string[] = [];   // 第 1 层：没见过
+  const rest: string[] = [];    // 第 2 层：见过、但不在上一批里
+  const last: string[] = [];    // 第 3 层：上一批里的
   for (let i = 0; i < uniq.length; i++) {
     const id = uniq[i];
-    if (seen.has(id)) { known.push(id); } else { fresh.push(id); }
+    if (!seen.has(id)) { fresh.push(id); }
+    else if (!prev.has(id)) { rest.push(id); }
+    else { last.push(id); }
   }
   // 小数 size 只按整数张抽（张数是离散的；floor 后自然落在 [0, uniq.length]）
   const want = Math.min(Math.floor(size), uniq.length);
   const rnd = makeRng(seed);
+  // 逐层取用：每层各自独立打散，上一层不够才动下一层；取用量恒为 [0, 该层长度]，
+  // 所以层内随机性完整保留（同一层的不同取用顺序由 seed 决定，不是固定顺序）。
   const fromFresh = pickRandom(fresh, want, rnd);
-  // 未见过的抽完还有缺口，才用已见过的补足（补足的排在新照片之后）
-  const queue = fromFresh.concat(pickRandom(known, want - fromFresh.length, rnd));
+  const fromRest = pickRandom(rest, want - fromFresh.length, rnd);
+  const fromLast = pickRandom(last, want - fromFresh.length - fromRest.length, rnd);
+  // 顺序即刷的顺序：新鲜的在前，其次是上一批之外的旧照片，最后才是上一批的（补足用）
+  const queue = fromFresh.concat(fromRest).concat(fromLast);
   return { size: size, queue: queue, cursor: 0 };
 }
 

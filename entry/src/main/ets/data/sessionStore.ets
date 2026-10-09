@@ -14,6 +14,14 @@ const TAG = 'PhotoWall';
 //    不做排除）。不落盘的话每次冷启动都当「全都没看过」，优先级就退化成纯随机，
 //    用户会反复看到刚刷过的照片 —— 而这正是「放回抽样」最容易被感知为 bug 的地方。
 //
+// 1b) 「上一批抽中的队列」（prevQueue）—— **与 seenIds 同文件持久化**。
+//     它是 sampleSession 第 2 层优先级的输入（"见过但不在上一批里"的先抽，见 core/session.ts）。
+//     不落盘的话，冷启动后"继续刷"永远拿不到上一批 → 池子 ≈ 张数时又退化成"每次同一批"
+//     （这正是本次要修的缺陷）。所以它必须和 seenIds 一样活过进程重启。
+//     为什么不另开一个文件：两者是**同一次抽样**的输入与输出（seenIds 进、prevQueue 出），
+//     分两个文件就要面对"写成功一个、失败一个"的撕裂状态，且多一套路径/校验/原子写代码。
+//     形状见下面的 SeenFile；旧文件（裸数组）仍能读，prevQueue 视为空。
+//
 // 2) 「当前会话」（SwipeSession）—— **只在内存**。
 //    会话的语义是「这一次要刷的这批」。App 重启后从池子里重抽一批是合理行为
 //    （产品口径：没有认领动作，随时可以再开一局），落盘反而会把「上次刷到一半的进度」
@@ -25,6 +33,28 @@ const TAG = 'PhotoWall';
 export interface SeenEntry {
   photoId: string;
   lastSeenAt: number;
+}
+
+/**
+ * seen.json 的落盘形状（v2）。
+ *
+ * v1 是**裸数组**（`SeenEntry[]`），v2 起是下面这个对象 —— 因为 prevQueue 必须和 seenIds
+ * 住在同一个文件里（理由见文件头的 1b）。读取端两种形状都认：
+ *   - 裸数组 → 老文件，entries = 数组内容，prevQueue = []（**不判损坏**，这是正常的升级路径）；
+ *   - 对象   → entries 取 .entries；.prevQueue 缺失或不是数组 → []（同样**不判损坏**，
+ *              只有"整个文件读不出来/不是对象也不是数组"才走"全都没看过"的告警路径）。
+ * 降级提示（已接受）：旧版本 App 读 v2 文件时会因为顶层不是数组而按"全都没看过"处理，
+ * 优先级暂时退化 —— 不丢照片，只是那一轮少一点新鲜感。
+ */
+interface SeenFile {
+  entries: SeenEntry[];
+  prevQueue: string[];
+}
+
+/** 读盘结果：两种状态必须**一起**读出（同一次抽样的输入与输出） */
+interface SeenState {
+  entries: Map<string, SeenEntry>;
+  prevQueue: string[];
 }
 
 /**
@@ -62,6 +92,9 @@ function seenTmpPath(filesDir: string): string {
 // ── 模块级缓存（不是实例字段，理由见 SessionStore 的类注释）────────────────────
 let seenLoaded: boolean = false;
 let seenEntries: Map<string, SeenEntry> = new Map();
+// 「上一批抽中的队列」。顺序有意义（它是刷照片的顺序），但抽样端只把它装进 Set 用，
+// 所以这里如实保留顺序只是为了落盘可读、以及将来若要"重放上一局"时信息不丢。
+let seenPrevQueue: string[] = [];
 let seenDirty: boolean = false;
 
 /** 按 lastSeenAt 淘汰最旧的，直到低水位。只在超上限时调用。 */
@@ -85,15 +118,62 @@ function evictOldest(): void {
 }
 
 /**
+ * 逐条校验 entries 数组（形状校验规矩的第 2 条）。
+ *   - photoId 非字符串或空 → 跳过并计数告警；
+ *   - lastSeenAt 非有限数 → 0（**不跳过**：这条记录仍然表达了"这张看过"，只是失去了时间信息）。
+ */
+function parseEntries(parsed: SeenEntry[]): Map<string, SeenEntry> {
+  const m = new Map<string, SeenEntry>();
+  let skipped = 0;
+  for (let i = 0; i < parsed.length; i++) {
+    const e = parsed[i];
+    if (e === null || e === undefined) { skipped = skipped + 1; continue; }
+    if (typeof e.photoId !== 'string' || e.photoId === '') { skipped = skipped + 1; continue; }
+    const at: number = typeof e.lastSeenAt === 'number' && Number.isFinite(e.lastSeenAt) ? e.lastSeenAt : 0;
+    // 重复 photoId 以文件中最后一条为准（正常路径不会产生重复：写盘前它就是一张 Map）。
+    m.set(e.photoId, { photoId: e.photoId, lastSeenAt: at });
+  }
+  if (skipped > 0) {
+    hilog.warn(DOMAIN, TAG, '%{public}s', `seen.json 中有 ${skipped} 条非法记录，已跳过`);
+  }
+  return m;
+}
+
+/**
+ * 逐条校验 prevQueue。**字段缺失或不是数组 → 空数组**。
+ *
+ * 这是刻意与 entries 分开处理的兼容点：prevQueue 是 v2 才有的字段，
+ * 旧 seen.json（裸数组）以及"只写进去过 seenIds"的文件都不会有它 —— 那是**正常**的，
+ * 绝不能因此把整个文件判成损坏（那样会把用户的「看过」一起丢掉，优先级退化得更彻底：
+ * 从"少一点新鲜感"变成"每张都当没见过"）。只有"字段在、里面却有条目非法"才告警。
+ */
+function parsePrevQueue(raw: string[]): string[] {
+  const out: string[] = [];
+  if (!Array.isArray(raw)) { return out; }
+  let skipped = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const id = raw[i];
+    if (typeof id !== 'string' || id === '') { skipped = skipped + 1; continue; }
+    out.push(id);
+  }
+  if (skipped > 0) {
+    hilog.warn(DOMAIN, TAG, '%{public}s', `seen.json 的 prevQueue 中有 ${skipped} 条非法记录，已跳过`);
+  }
+  return out;
+}
+
+/**
  * 读 seen.json。**三条存储层规矩**（与 data/decisionStore.ets 逐条对齐）：
  *   1) UTF-8 解码：写盘走 JSON.stringify（UTF-8 字节），必须用 buffer.from(bytes).toString('utf-8')；
  *      按字节拼串等价于 Latin-1，会把非 ASCII 的 photoId 解成 mojibake。
- *   2) 形状校验：非数组 → 空；photoId 非字符串或空 → 跳过并计数告警；
- *      lastSeenAt 非有限数 → 0（**不跳过**：这条记录仍然表达了"这张看过"，只是失去了时间信息）。
+ *   2) 形状校验：两种形状都认 ——
+ *      v1 裸数组（老文件）→ entries = 数组内容，prevQueue = []；
+ *      v2 对象（本版本写的）→ entries 取 .entries（非数组则按"全都没看过"告警），
+ *                            prevQueue 取 .prevQueue（缺失/非数组 → []，**不判损坏**）。
+ *      两种形状下 entries 内部都走 parseEntries 逐条校验。
  *   3) 原子写（在 writeEntries 里）：先写 .tmp 再 rename。
  */
-function readEntries(path: string): Map<string, SeenEntry> {
-  const m = new Map<string, SeenEntry>();
+function readState(path: string): SeenState {
   // 两次 statSync 是刻意的（同 decisionStore）：第一次只回答「文件在不在」。
   // 文件不存在 = 首次运行的正常路径，静默返回空；「文件在但读/解析失败」才告警。
   let exists = false;
@@ -103,7 +183,7 @@ function readEntries(path: string): Map<string, SeenEntry> {
   } catch (e) {
     exists = false;
   }
-  if (!exists) { return m; }
+  if (!exists) { return { entries: new Map<string, SeenEntry>(), prevQueue: [] }; }
 
   try {
     const st = fileIo.statSync(path);
@@ -121,40 +201,43 @@ function readEntries(path: string): Map<string, SeenEntry> {
     // 整段解码会让 JSON.parse 失败并静默退化为「全都没看过」，伪装成「没保存」。
     const bytes: Uint8Array = new Uint8Array(buf, 0, n);
     const text: string = buffer.from(bytes).toString('utf-8');
-    const parsed = JSON.parse(text) as SeenEntry[];
-    if (!Array.isArray(parsed)) {
-      hilog.warn(DOMAIN, TAG, '%{public}s', 'seen.json 不是数组，已按「全都没看过」处理');
-      return m;
+    // 先当 Object 接住，再按形状下行转型：v1 与 v2 的顶层类型互不相关，
+    // 直接 as 会被 ArkTS 拒绝（"Conversion of type ... may be a mistake"），
+    // 经 Object 中转是本项目已有的写法（见 pages/SwipePage.ets 的注释）。
+    const raw: Object = JSON.parse(text) as Object;
+    if (Array.isArray(raw)) {
+      // v1（裸数组）：正常的升级路径，不是损坏 —— 只是没有"上一批"可用
+      return { entries: parseEntries(raw as SeenEntry[]), prevQueue: [] };
     }
-    let skipped = 0;
-    for (let i = 0; i < parsed.length; i++) {
-      const e = parsed[i];
-      if (e === null || e === undefined) { skipped = skipped + 1; continue; }
-      if (typeof e.photoId !== 'string' || e.photoId === '') { skipped = skipped + 1; continue; }
-      const at: number = typeof e.lastSeenAt === 'number' && Number.isFinite(e.lastSeenAt) ? e.lastSeenAt : 0;
-      // 重复 photoId 以文件中最后一条为准（正常路径不会产生重复：写盘前它就是一张 Map）。
-      m.set(e.photoId, { photoId: e.photoId, lastSeenAt: at });
+    const asFile: SeenFile = raw as SeenFile;
+    if (!Array.isArray(asFile.entries)) {
+      // entries 是抽样优先级的唯一输入：读不出来就不能假装有。
+      // prevQueue 仍尽量保留 —— 能读出来的部分不该被丢掉。
+      hilog.warn(DOMAIN, TAG, '%{public}s', 'seen.json 的 entries 不是数组，已按「全都没看过」处理');
+      return { entries: new Map<string, SeenEntry>(), prevQueue: parsePrevQueue(asFile.prevQueue) };
     }
-    if (skipped > 0) {
-      hilog.warn(DOMAIN, TAG, '%{public}s', `seen.json 中有 ${skipped} 条非法记录，已跳过`);
-    }
+    return { entries: parseEntries(asFile.entries), prevQueue: parsePrevQueue(asFile.prevQueue) };
   } catch (e) {
     hilog.warn(DOMAIN, TAG, '%{public}s', 'seen.json 存在但读取/解析失败，已按「全都没看过」处理');
   }
-  return m;
+  return { entries: new Map<string, SeenEntry>(), prevQueue: [] };
 }
 
-/** 全量原子落盘。失败只告警（不抛：调用点在页面退出的收尾路径上）。 */
-function writeEntries(filesDir: string, entries: Map<string, SeenEntry>): void {
+/**
+ * 全量原子落盘（v2 形状：entries + prevQueue 写进**同一个**文件）。失败只告警
+ * （不抛：调用点在页面退出的收尾路径上）。
+ */
+function writeEntries(filesDir: string, entries: Map<string, SeenEntry>, prevQueue: string[]): void {
   const arr: SeenEntry[] = [];
   entries.forEach((e: SeenEntry) => { arr.push(e); });
+  const payload: SeenFile = { entries: arr, prevQueue: prevQueue };
   const tmp = seenTmpPath(filesDir);
   try {
     // 原子写：先写临时文件，再 rename 覆盖，避免写到一半失败留下半个文件
     const file = fileIo.openSync(tmp,
       fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
     try {
-      fileIo.writeSync(file.fd, JSON.stringify(arr));
+      fileIo.writeSync(file.fd, JSON.stringify(payload));
     } finally {
       fileIo.closeSync(file);
     }
@@ -168,7 +251,10 @@ function writeEntries(filesDir: string, entries: Map<string, SeenEntry>): void {
 function ensureLoaded(ctx: common.UIAbilityContext): void {
   if (seenLoaded) { return; }
   seenLoaded = true;
-  seenEntries = readEntries(seenStorePath(ctx.filesDir));
+  // 两种状态必须一起读出：它们是同一次抽样的输入（seenIds）与输出（prevQueue）
+  const st: SeenState = readState(seenStorePath(ctx.filesDir));
+  seenEntries = st.entries;
+  seenPrevQueue = st.prevQueue;
 }
 
 /**
@@ -222,11 +308,48 @@ export class SessionStore {
     evictOldest();
   }
 
-  /** 把内存里的「看过」全量落盘。未加载过（没读过也没标过）时什么也不做 —— 绝不写空覆盖真身。 */
+  /** 把内存里的「看过」与「上一批」全量落盘。未加载过（没读过也没标过）时什么也不做 —— 绝不写空覆盖真身。 */
   flush(): void {
     if (!seenLoaded || !seenDirty) { return; }
     seenDirty = false;
-    writeEntries(this.ctx.filesDir, seenEntries);
+    writeEntries(this.ctx.filesDir, seenEntries, seenPrevQueue);
+  }
+
+  /**
+   * 记下**刚抽中的这一批**，供下一轮抽样避开（core/session.ts 的 sampleSession 第 2 层优先级）。
+   * 由首页在 sampleSession 之后、离开首页之前调用（见 pages/ClaimPage.ets 的 startSession）。
+   *
+   * 为什么这里**立刻落盘**（而不是像 markSeen 那样只置脏等 flush）：
+   *   首页**没有**收尾落盘时机 —— 它不像刷照片页那样有 onPageHide / aboutToDisappear 的
+   *   flushSave() 链，离开首页只有一次 router.pushUrl。若只置脏，"上一批"就得靠刷照片页的
+   *   1 秒窗口顺手写下去；用户在开局后一张都没滑就杀掉 App 时它会丢，下一轮静默退化回
+   *   「每次同一批」—— 正是本次要修的缺陷。代价可控：一局一次全量写（点击「开始刷照片」时），
+   *   不落在任何滑动热路径上，与刷照片页退出时本来就要做的那次 flush 同量级。
+   *   顺带的好处：上一局标记的「看过」也在这一刻变得耐久。
+   *
+   * 存的是**副本**且过滤空串（同 markSeen 的防御）：调用方随后对会话队列做的任何事
+   * 都不会改到这里的缓存（不入参的别名）。
+   */
+  setPrevQueue(ids: string[]): void {
+    ensureLoaded(this.ctx);
+    const copy: string[] = [];
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      if (id === '') { continue; }
+      copy.push(id);
+    }
+    seenPrevQueue = copy;
+    seenDirty = true;
+    this.flush();
+  }
+
+  /**
+   * 取出「上一批抽中的队列」（副本，调用方改了不影响缓存）。没有记录过（首次运行、
+   * 旧文件、或只装过 v1）时返回空数组 —— 空数组正是 sampleSession 的"退化为旧两层行为"信号。
+   */
+  getPrevQueue(): string[] {
+    ensureLoaded(this.ctx);
+    return seenPrevQueue.slice();
   }
 }
 

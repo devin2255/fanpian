@@ -132,16 +132,27 @@ struct ClaimPage {
       this.msg = '还没有可刷的照片：在系统相册里选一批就能开始。';
       return;
     }
-    // 「看过」与决策一起构成抽样的输入：决策不再影响入池（放回抽样：已归档/已收藏/已上墙
+    // 「看过」与「上一批」一起构成抽样的输入：决策不再影响入池（放回抽样：已归档/已收藏/已上墙
     // 的照片仍会被抽中，见 core/session.ts 的文件头），但「看过」影响优先级。
-    const seen: string[] = new SessionStore(this.ctx).loadSeenIds();
+    const sessionStore = new SessionStore(this.ctx);
+    const seen: string[] = sessionStore.loadSeenIds();
+    // 上一批（prevQueue）= 上一次开局抽中的那批照片，用于"优先避开上一批"。
+    // 池子 ≈ 张数时（例如池 100、选 100、且这 100 张都看过），"没见过的优先"这一层恒为空，
+    // 只按 seenIds 分桶会让每一轮都从同一个集合里抽 —— 用户点「继续刷」看到的是**完全相同的一批**。
+    // 传进上一批后，池 200 / 每批 100 的场景能连着给出 200 张不同的，之后才循环回来。
+    const prevQueue: string[] = sessionStore.getPrevQueue();
     // 种子 = Date.now()：每一局都必须是**不同**的抽样，否则「继续刷 N 张」会给出与上一局
     // 一模一样的队列和顺序（用户会以为按钮没生效）。可复现性由 core 层保证 ——
     // sampleSession 的 seed 是可注入的，单测传固定种子即可精确断言。
     // 附注：即便两次开局撞进同一毫秒（要用户在这一毫秒内连点两次，实际不可能），
-    // 队列也不会相同 —— 上一局结束时 seenIds 变大了，fresh/known 的划分已经变了。
-    const session: SwipeSession = sampleSession(pool, size, seen, Date.now());
+    // 队列也不会相同 —— 分桶的输入一定变了：要么上一局刷过照片（seenIds 变大），
+    // 要么"上一批"已经换成别的了（下面的 setPrevQueue 每次都重写它）。
+    const session: SwipeSession = sampleSession(pool, size, seen, prevQueue, Date.now());
     setSession(session);
+    // 记下"刚抽的这一批"，供下一轮避开。时机刻意在 sampleSession **之后**（记的是抽出来的
+    // 队列，不是池子）、离开首页**之前**（下一轮开局时它一定已经在盘上了）。
+    // 它内部会立刻原子落盘（首页没有别的收尾时机，见 data/sessionStore.ets 的 setPrevQueue）。
+    sessionStore.setPrevQueue(session.queue);
     try {
       await router.pushUrl({ url: 'pages/SwipePage' });
     } catch (e) {
