@@ -36,6 +36,9 @@ function tmpPathOf(filesDir: string): string {
 // LocationIndex，实例级标记挡不住这两个实例并发写同一个 locations.json.tmp。
 // 同一时刻只允许一次构建，并发的调用直接拿到当前盘上的索引（见 buildFrom 的取舍说明）。
 let building: boolean = false;
+// 当前正在进行的构建。供 awaitIdle() 等待 —— 没有它，调用方无法区分
+// 「索引已完整」与「另一处正在构建、我拿到的是快照」。
+let pending: Promise<LocationEntry[]> | undefined = undefined;
 
 export class LocationIndex {
   private ctx: common.UIAbilityContext;
@@ -146,13 +149,13 @@ export class LocationIndex {
    *   而且**只发生一次** —— 之后每张都在索引里，`todo` 为空，直接返回。
    * - `todo` 为空时（重进刷卡页的常态）**不重写文件**，省掉一次全量写。
    *
-   * **调用方注意**：构建是后台进行的（不阻塞 UI）。若地图页需要"完整索引"，
-   * 应自行 `await buildFrom(pool)` 一次 —— 已索引的 URI 不会重读，pending 为空时立即返回，
-   * 代价极小。
-   * ⚠️ 但下面的 `building` 闸门会让"并发时的那一次"**立即返回当前盘上的快照**，所以
-   * `await buildFrom(pool)` 的语义是"构建一次并返回当前索引"，**不是**"返回时索引一定覆盖 pool"。
-   * 需要后者这个强保证的调用方（Task 10）必须自己校验：返回的列表若没覆盖自己的 uris，
-   * 就说明这次撞上了正在跑的构建，要稍后重试（或由控制器决定补一个 isBuilding() 访问器）。
+   * **契约（两条，务必看清）**：
+   * 1. **并发时返回快照**：若已有一次构建在跑（`building` 闸门），本次调用**不等待、不抛错**，
+   *    直接返回"此刻盘上有什么"。因此**返回值不承诺覆盖你传进来的 `uris`** ——
+   *    它只保证"这是一份形状合法的索引"，**不保证**"这是一份完整的索引"。
+   * 2. **需要完整索引的调用方必须用 `awaitIdle()`**：先 `await buildFrom(pool)` 触发补读，
+   *    再 `await awaitIdle()` 拿稳定结果。**不要**拿本方法的返回值当"等到了"的证据：
+   *    并发时它秒回局部数据，而且**不会有任何报错**，症状只会是"地图上少照片"。
    *
    * 已知取舍（都记在报告里）：
    * - 读不到 EXIF 的照片**也会入索引**（时间/坐标全 0）。这是"缓存"的语义：不记录就等于每次
@@ -165,59 +168,103 @@ export class LocationIndex {
    */
   async buildFrom(uris: string[], onProgress?: (done: number, total: number) => void): Promise<LocationEntry[]> {
     if (building) {
-      // 已有一次构建在进行：直接返回现有索引，不并发写同一个 .tmp
-      //（并发写会让后一次 rename 覆盖前一次，甚至最坏退化成空）
+      // 已有一次构建在进行：返回当前快照，不并发写同一个 .tmp。
+      // 需要"完整索引"的调用方应改用 awaitIdle()，而不是依赖本方法的返回值 ——
+      // 这里的返回值只是"此刻盘上有什么"，不承诺覆盖 uris。
       hilog.info(DOMAIN, TAG, '%{public}s', '地点索引正在构建中，本次调用跳过（返回当前盘上的索引）');
       return this.load();
     }
     // 上面的「检查」与这里的「置位」之间**没有 await**：单线程事件循环下这一段是原子的，
     // 两次并发调用不可能同时通过检查 —— 这正是这个标记成立的全部依据，不要在其中插入异步。
     building = true;
+    // 从调用 doBuild 到 `pending = run` 之间**同样没有 await**：所以"看得见 building 为真"
+    // 的观察者一定也看得见 pending 非空（awaitIdle 的循环依赖这一点，它另有防御条件）。
+    const run: Promise<LocationEntry[]> = this.doBuild(uris, onProgress);
+    pending = run;
     try {
-      const existing: LocationEntry[] = this.load();
-      const byId: Map<string, LocationEntry> = new Map();
-      for (let i = 0; i < existing.length; i++) {
-        byId.set(existing[i].photoId, existing[i]);
-      }
-      // 待办 = 索引里还没有的 URI，顺带去重（入参可能含重复 URI）。
-      // 这里先往 byId 放一条全 0 的**占位**，有两个作用：
-      //   ① 后面重复出现的同一个 URI 会被上面的 byId.has 挡掉（不必再引入一个 Set 去重）；
-      //   ② 新条目在 Map 里的**位置**此刻就定下来（Map.set 覆盖已有键不改变顺序），
-      //      于是最终列表恒为「原有条目在前、本批新读的在后」，与读取顺序一致。
-      // 占位在下面读完 EXIF 后会被真实值覆盖；若 readExif 意外抛错，占位也不会落盘
-      //（异常会直接冲出本方法，save 不会执行 —— readExif 的契约是不抛，这里只是兜底推理）。
-      const pending: string[] = [];
-      for (let i = 0; i < uris.length; i++) {
-        const u = uris[i];
-        if (u === undefined || u === null || u === '') { continue; }
-        if (byId.has(u)) { continue; }
-        byId.set(u, { photoId: u, lat: 0, lon: 0, takenAt: 0 });
-        pending.push(u);
-      }
-      if (pending.length === 0) {
-        // 全都在索引里了：不写盘、不回调（没有进度可言）
-        return existing;
-      }
-
-      const total: number = pending.length;
-      for (let i = 0; i < pending.length; i++) {
-        const uri: string = pending[i];
-        // readExif 内部吞掉所有异常（读不到 → 全 0），所以这里不会再抛：
-        // 一张坏照片不该让整批索引构建失败。
-        const info: ExifInfo = await readExif(uri);
-        byId.set(uri, { photoId: uri, lat: info.lat, lon: info.lon, takenAt: info.takenAt });
-        if (onProgress !== undefined) { onProgress(i + 1, total); }
-      }
-
-      const list: LocationEntry[] = [];
-      byId.forEach((e: LocationEntry) => { list.push(e); });
-      this.save(list);
-      return list;
+      return await run;
     } finally {
       // **必须**放 finally：一旦某次构建抛错而标记没复位，索引就永远无法再构建了
       //（那比"并发写坏一次、下次重建"严重得多 —— 它是永久性的）。
       // 注意此处只复位标记，不做任何等待：finally 在 return 之前同步执行。
+      // 复位 building 与 pending 是同一个同步块里的两行、中间没有 await，因此不存在
+      //「building 已假、pending 还留着旧 promise」这种会被 awaitIdle 观察到的中间态。
       building = false;
+      pending = undefined;
     }
+  }
+
+  /**
+   * 等到「当前没有构建在进行」，然后返回盘上的索引。
+   *
+   * 与 buildFrom 的区别（**这是本方法存在的唯一理由**）：
+   *   - `buildFrom` 在并发时**返回快照**（不阻塞、不抛错），其返回值**不承诺覆盖你传的 uris**；
+   *   - `awaitIdle` 承诺「返回时没有别的构建在跑」，因此结果**涵盖此前所有已提交的构建**。
+   *
+   * 调用方（地图页）应：先 `await buildFrom(pool)` 触发补读，再 `await awaitIdle()` 拿稳定结果。
+   * 若本来就没有构建在进行，`awaitIdle()` 立即返回（一次 `load()` 的开销）。
+   */
+  async awaitIdle(): Promise<LocationEntry[]> {
+    // 用 while 而不是 if：等待期间可能**又**有新的构建开始，那就必须接着等 ——
+    // 用 if 只等一轮，会在"另一个构建还在跑"的时候返回，正是本方法要消灭的"看起来等过了"。
+    while (building && pending !== undefined) {
+      try {
+        await pending;
+      } catch (e) {
+        // 别人构建失败**不该**让 awaitIdle 抛错：否则地图页会因为一次与它无关的失败而白屏。
+        // 吞掉即可 —— finally 已经把 building 复位，下一轮循环条件必为假、正常退出，
+        // 调用方拿到的是"此刻盘上有什么"（与并发时 buildFrom 的返回值同一语义，不是错误）。
+        hilog.warn(DOMAIN, TAG, '%{public}s', '等待地点索引构建时，正在进行的构建失败（已忽略，返回盘上索引）');
+      }
+    }
+    // 从"循环条件为假"到这里**没有 await**：单线程事件循环下，「确认没人构建」与「读盘」
+    // 之间插不进一个新的构建 —— 这就是"返回时没有别的构建在跑"这个承诺的依据。
+    return this.load();
+  }
+
+  /**
+   * 真正的构建逻辑：原 buildFrom 的方法体**整体挪到这里、内容一字未改**
+   *（只是不再自带 try/finally —— 闸门的置位与复位留在 buildFrom，见那里的注释）。
+   */
+  private async doBuild(uris: string[], onProgress?: (done: number, total: number) => void): Promise<LocationEntry[]> {
+    const existing: LocationEntry[] = this.load();
+    const byId: Map<string, LocationEntry> = new Map();
+    for (let i = 0; i < existing.length; i++) {
+      byId.set(existing[i].photoId, existing[i]);
+    }
+    // 待办 = 索引里还没有的 URI，顺带去重（入参可能含重复 URI）。
+    // 这里先往 byId 放一条全 0 的**占位**，有两个作用：
+    //   ① 后面重复出现的同一个 URI 会被上面的 byId.has 挡掉（不必再引入一个 Set 去重）；
+    //   ② 新条目在 Map 里的**位置**此刻就定下来（Map.set 覆盖已有键不改变顺序），
+    //      于是最终列表恒为「原有条目在前、本批新读的在后」，与读取顺序一致。
+    // 占位在下面读完 EXIF 后会被真实值覆盖；若 readExif 意外抛错，占位也不会落盘
+    //（异常会直接冲出本方法，save 不会执行 —— readExif 的契约是不抛，这里只是兜底推理）。
+    const pending: string[] = [];
+    for (let i = 0; i < uris.length; i++) {
+      const u = uris[i];
+      if (u === undefined || u === null || u === '') { continue; }
+      if (byId.has(u)) { continue; }
+      byId.set(u, { photoId: u, lat: 0, lon: 0, takenAt: 0 });
+      pending.push(u);
+    }
+    if (pending.length === 0) {
+      // 全都在索引里了：不写盘、不回调（没有进度可言）
+      return existing;
+    }
+
+    const total: number = pending.length;
+    for (let i = 0; i < pending.length; i++) {
+      const uri: string = pending[i];
+      // readExif 内部吞掉所有异常（读不到 → 全 0），所以这里不会再抛：
+      // 一张坏照片不该让整批索引构建失败。
+      const info: ExifInfo = await readExif(uri);
+      byId.set(uri, { photoId: uri, lat: info.lat, lon: info.lon, takenAt: info.takenAt });
+      if (onProgress !== undefined) { onProgress(i + 1, total); }
+    }
+
+    const list: LocationEntry[] = [];
+    byId.forEach((e: LocationEntry) => { list.push(e); });
+    this.save(list);
+    return list;
   }
 }
