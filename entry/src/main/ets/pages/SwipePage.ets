@@ -464,7 +464,7 @@ struct SwipePage {
   /**
    * 选择器的结局。**取消必须干净**：不落决策、不推进、不写盘 —— 用户不该因为改主意
    * 而被记上一笔，也不该被推着往前走（卡片留在原位，四个按钮和滑动手势都照常可用：
-   * CardStack 的 commit() 只作废"按钮按下时正在途中的那次手势"，不是把这 张卡锁死）。
+   * CardStack 的 commit() 只作废"按钮按下时正在途中的那次手势"，不是把这张卡锁死）。
    */
   private onPlaceResolved(photoId: string, token: number, o: PlaceOutcome): void {
     if (token !== this.wallLiveSeq) { return; }
