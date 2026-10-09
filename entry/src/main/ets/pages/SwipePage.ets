@@ -170,8 +170,23 @@ struct SwipePage {
 
     if (rolledBack) { return; }   // 回弹不消耗队列
 
-    const prev = this.decisions.get(photoId);
-    const d = prev === undefined ? emptyDecision(photoId) : prev;
+    // 第二道防线：同一张照片在一次队列里只应被决策一次。
+    // 重复上报会让 idx 连跳、静默跳过照片（按钮与手势两条路径并发时可达：
+    // 右滑的 230ms 飞出窗口由 CardStack 的 animating 闸门挡住；按钮在同一帧内被点两次
+    // ——例如两指同点——则 @Prop item 要到下一帧才更新，第二次仍带着旧 photoId 进来）。
+    // 判据用 state !== 'unseen' 而不是「是否出现过」：core/queue.ts 的 defer 会把照片
+    // 重置回 'unseen'（applyDecision 的 skip 分支）——那是有意的重新决策，不能被挡住。
+    // 本批只做 fav/archive/wall，SwipePage 不产生 skip/unfav（nextAction 的取值被
+    // 收窄成三值、promoteToWall 只传 'wall'），所以今天没有任何路径会把已决策的照片
+    // 重新放回队列；将来接上 defer 入队时这条去重会自动放行重决策。
+    // 位置在 recordSwipe 之后、applyDecision 之前：重复事件仍会进 metrics，但 'wall'
+    // 已不参与滑动口径（见 core/metrics.ts），故不会污染回弹率与中位数。
+    const already = this.decisions.get(photoId);
+    if (already !== undefined && already.state !== 'unseen') {
+      return;
+    }
+
+    const d = already === undefined ? emptyDecision(photoId) : already;
     // 三个合法动作各自映射：'wall' 必须显式映射为 'wall'，否则会落到 else 的
     // 'archive' 上——照片会被当场上墙，却在盘上被记成归档（决策丢失）。
     // 标注不能写成 `: string`：applyDecision 的第二参是 core/queue.ts 的 Action 联合，

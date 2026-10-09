@@ -102,6 +102,25 @@ export struct CardStack {
           .backgroundColor('#CC1F6FEB')
           .margin({ bottom: 12 })
           .onClick(() => {
+            // 与 onActionUpdate / settle() 同口径的闸门：右滑提交后卡片视觉上已经飞走
+            // （用户看到的是下一张的位置），但 idx 要等 flyOut 的 230ms 回调才推进 ——
+            // 这段窗口里 @Prop item 仍是**已经飞走的那张**。此刻再点一下（或另一只手指）
+            // 会让同一张被上报两次 → SwipePage.handle() 跑两次 → idx 连跳两格
+            // → 静默跳过一张照片。所以飞出动画期间一律不接受按钮点击。
+            if (this.animating) { return; }
+            // 卡片拖到一半时点按钮：先把位移归零，否则下一张会带着旧偏移（dx ≠ 0）出现。
+            // 归零必须显式做：@State 不随 @Prop item 变化而自动重置 —— 组件实例是复用的
+            // （见 flyOut() 里「实例复用」的两处注释），新卡不会自己回到 dx = 0。
+            if (this.dx !== 0 || this.dy !== 0) {
+              animateTo({ duration: SPRING_BACK_MS, curve: Curve.Friction }, () => {
+                this.dx = 0;
+                this.dy = 0;
+              });
+            }
+            // 注意：上墙**不**走 flyOut() —— 那条路会设 animating 并延迟 230ms 才上报，
+            // 而这里要立即上报。所以上面这段只是把拖到一半的偏移弹回去，不涉及 animating；
+            // 按钮在同一帧内被点两次（两指同点）时 @Prop item 尚未更新、第二次仍带着旧
+            // photoId，这种重复由 SwipePage.handle() 的同 photoId 去重兜住。
             const out: SwipeWall = { kind: 'wall' };
             this.onDecide(this.item.photoId, out);
           })
