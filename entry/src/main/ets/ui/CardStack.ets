@@ -78,7 +78,21 @@ export struct CardStack {
   // 组件卸载（用户 230ms 内返回上一页）后不能再回调 onDecide。
   aboutToDisappear(): void {
     if (this.flyTimer !== -1) { clearTimeout(this.flyTimer); this.flyTimer = -1; }
-    if (this.springTimer !== -1) { clearTimeout(this.springTimer); this.springTimer = -1; }
+    // 卸载也是「这张卡的回弹窗口到此为止」：不结束的话，残留 timer 的回调会晚于卸载触发。
+    this.endSpringWindow();
+  }
+
+  /**
+   * 结束当前这张卡的回弹上报窗口。任何「这张卡已经定案」的出口都必须调用：
+   * 否则残留窗口会让下一张卡在窗口内的首次回弹被误判为「已上报」而静默丢弃
+   * → rollbackRate 偏低（指标向"好看"方向失真）。
+   * 现有出口：flyOut()、卡片的「上墙」按钮。
+   */
+  private endSpringWindow(): void {
+    if (this.springTimer !== -1) {
+      clearTimeout(this.springTimer);
+      this.springTimer = -1;
+    }
   }
 
   build() {
@@ -108,6 +122,8 @@ export struct CardStack {
             // 会让同一张被上报两次 → SwipePage.handle() 跑两次 → idx 连跳两格
             // → 静默跳过一张照片。所以飞出动画期间一律不接受按钮点击。
             if (this.animating) { return; }
+            // 上墙也是「这张卡已定案」：必须结束回弹窗口，否则残留窗口会吞掉下一张的首个回弹
+            this.endSpringWindow();
             // 卡片拖到一半时点按钮：先把位移归零，否则下一张会带着旧偏移（dx ≠ 0）出现。
             // 归零必须显式做：@State 不随 @Prop item 变化而自动重置 —— 组件实例是复用的
             // （见 flyOut() 里「实例复用」的两处注释），新卡不会自己回到 dx = 0。
@@ -177,9 +193,8 @@ export struct CardStack {
 
   private flyOut(dir: number): void {
     this.animating = true;
-    // 决策已生效、这张卡的回弹窗口就此结束：残留窗口属于「上一张卡」，
-    // 不能让下一张卡（实例复用）的首次回弹被误判为「已上报」。
-    if (this.springTimer !== -1) { clearTimeout(this.springTimer); this.springTimer = -1; }
+    // 决策已生效、这张卡的回弹窗口就此结束（见 endSpringWindow 的说明）
+    this.endSpringWindow();
     // 飞出距离按卡宽推导，确保卡片完全离开视野（硬编码 600 在宽屏上可能只挪到边上）
     const w = this.cardWidth > 0 ? this.cardWidth : 360;
     const outX = dir * (w * 1.4);
@@ -215,7 +230,8 @@ export struct CardStack {
       const out: SwipeRollback = { kind: 'rollback' };
       this.onDecide(this.item.photoId, out);
     }
-    if (this.springTimer !== -1) { clearTimeout(this.springTimer); }
+    // 旧窗口先结束、再开新窗口：等价于原来的「有就清掉、然后重设」，防抖语义不变。
+    this.endSpringWindow();
     this.springTimer = setTimeout(() => { this.springTimer = -1; }, SPRING_BACK_MS);
 
     animateTo({ duration: SPRING_BACK_MS, curve: Curve.Friction }, () => {
