@@ -8,13 +8,29 @@
  *   旧版"照片用线吊在钉子下、占 26×34"那套几何连同它的布局代码一起删掉了 ——
  *   那才是"地图一条、照片飘在空白里"的成因（见 core/render.ts 的文件头）。
  *
+ * ── 视野（task-19 的用户裁决："地图铺满高度，左右横滑"）────────────────────────
+ *   上一版地图只占画布高度的 44.7%（真机实测图框 376×279.62@(0,172.62)：上面一薄条、
+ *   下面 62% 空地、4 个钉子散在空地里）。新模型两条规则各管一头，缺一不可：
+ *     · **视野是一屏**（`defaultWallView`）：纬度恒取中国全域 18~54，经度跨度由画布宽高比
+ *       反推 —— 真机 376×624.86 上是 **27.744185828688188°**，经度中心对齐数据中心；
+ *     · **绘制框恒填满高度**（`mapFrame`）：`h == boxH`，宽度随比例算 —— 比画布宽时
+ *       `x` 为负（真机 −232.12），两侧留在屏幕外，由**横向平移**去看。
+ *   于是真机上量到的三个数：
+ *     **地图绘制高度 / 画布高度 = 1.0000**（纵向铺满，硬要求）
+ *     **地图绘制宽度 / 画布宽度 = 2.2347**（横向溢出 → 必须横滑）
+ *     横向可滑余量 = 34.256° = **464.25pt**
+ *   本页对这两条规则**一个几何都不算**：视野来自 `defaultWallView`、框来自 `mapFrame`、
+ *   横滑来自 `panViewBy`，四个验收数字来自 `viewMetrics`（预览图例与单测读同一份）。
+ *   手势与缩放的全部数学都在 core：`zoomViewAt` / `panViewBy`（纯函数、有单测），
+ *   本页只把手势事件的 vp 除以画布宽高变成归一化位置。
+ *
  * ── 这个页面只做三件事（几何**一行都不算**） ─────────────────────────────────
  *   1. **取数据**：`DecisionStore.walledIds()`（谁是上墙的，唯一判据）+ `LocationIndex`
  *      （它们在哪、什么时候拍的）；
- *   2. **调 core/render**：`fitBounds` 由照片坐标求出**视野框**、`fitViewToCanvas` 把它
- *      撑到与画布同比例（"默认铺满"）、`buildScene` 算钉子与标记、`badgeRectOf` 给「＋N」
- *      的位置；国界/省界/轨迹/钉子共用**同一个** `MapFrame`（`frame.bounds` 是唯一的
- *      经纬度范围来源）；
+ *   2. **调 core/render**：`fitBounds` 求数据框、`defaultWallView` 求**默认视野**
+ *      （铺满高度 + 数据居中）、`refitViewToCanvas` 在画布尺寸变化时把用户视野对齐回来、
+ *      `buildScene` 算钉子与标记、`badgeRectOf` 给「＋N」的位置；国界/省界/轨迹/钉子共用
+ *      **同一个** `MapFrame`（`frame.bounds` 是唯一的经纬度范围来源）；
  *   3. **把数字摆到屏幕上**：标记用 `Circle` 放在 `钉子 + markers[k]` 上，
  *      国界/省界/轨迹用 `Shape` + `Path`。
  *   几何全部来自 `core/render.ts` —— 与 `tools/render-preview.ts` 产出的 SVG **逐点相同**，
@@ -64,12 +80,12 @@ import { CHINA_REGION } from '../core/projection';
 import { parseAreaData } from '../core/areaData';
 import {
   BADGE_H, BADGE_W, MARKER_COLOR, MARKER_R, MAX_MARKERS, PIN_COLOR, PIN_DOT_R, PIN_HALO_R,
-  TRACK_COLOR, TRACK_WIDTH, VIEW_PAD_RATIO, badgeRectOf, buildScene, dateLabel, fitBounds,
-  fitViewToCanvas, geoAspect, mapFillRatio, mapFrame, markerCountOf, outlinePath, panViewBy,
-  parseOutline, PROVINCE_STROKE, PROVINCE_WIDTH, trajectoryPath, viewZoomOf, viewZoomRange,
-  zoomViewAt
+  TRACK_COLOR, TRACK_WIDTH, VIEW_PAD_RATIO, badgeRectOf, buildScene, dateLabel, defaultWallView,
+  fitBounds, geoAspect, mapFrame, markerCountOf, outlinePath, panViewBy, refitViewToCanvas,
+  parseOutline, PROVINCE_STROKE, PROVINCE_WIDTH, trajectoryPath, viewMetrics, viewZoomOf,
+  viewZoomRange, zoomViewAt
 } from '../core/render';
-import type { MapFrame, OutlineData, PinMarker, Rect, ScenePin, WallPhoto } from '../core/render';
+import type { MapFrame, OutlineData, PinMarker, Rect, ScenePin, ViewMetrics, WallPhoto } from '../core/render';
 // MAX_HANG 只在 core/placement.ts 里定义（设计 §6.2 的阈值那儿一份），render.ts 不转手导出。
 import { MAX_HANG } from '../core/placement';
 import { DecisionStore } from '../data/decisionStore';
@@ -148,14 +164,13 @@ struct WallPage {
   // `boxW×boxH` = **地图块** = 整个主体区。地图（底色 + 国界 + 省界）就是这整块区域。
   @State boxW: number = 0;
   @State boxH: number = 0;
-  // `mapW/mapH/mapX/mapY` = 块里那个**不变形**的中国绘制框（居中）。见 core/render.MapFrame。
-  // 为什么不叫"地图块高"：块高就是 `boxH`；`mapH` 是"能画出的最大的、不变形的中国"有多高。
-  @State mapW: number = 0;
-  @State mapH: number = 0;
-  @State mapX: number = 0;
-  @State mapY: number = 0;
-  /** 地图填满度（框面积 / 可用区面积）。诊断行与验收都报这个数（见 core/render.mapFillRatio）。 */
-  @State mapFill: number = 0;
+  // ── 视野的四个验收数字（task-19）────────────────────────────────────────────
+  // **不在 build() 里用** —— 它们只进诊断行（用户截图 = 日志）。所以不放 @State，
+  // 直接在 `rebuild()` 里算完写进 `diag` 字符串，省掉 6 个会被 ArkUI 观察的字段。
+  // 数字全部来自 `core/render.viewMetrics`（预览图例与单测读的是同一个函数）：
+  //   · 地图绘制宽/高（中国全域投影出来的尺寸）、两个比值；
+  //   · 横向偏移 `westX`（中国西缘的屏幕 x，负 = 在屏幕左外侧）；
+  //   · 可横滑余量 `panSlackX`。
   // 状态
   @State phase: number = 0;          // 0 读取中 / 1 完成 / 2 出错
   @State walledTotal: number = 0;    // 已上墙张数（decisionStore 说的）
@@ -215,7 +230,7 @@ struct WallPage {
   /** 当前是否就是"默认铺满"的视野（重置按钮的可用态 + 诊断行）。 */
   @State viewIsDefault: boolean = true;
 
-  /** 默认铺满的视野（由数据 + 画布求出，见 `rebuild`）。**重置视野按钮**回到它。 */
+  /** 默认视野（由数据 + 画布求出，见 `rebuild`）。**重置视野按钮**回到它。 */
   private defaultBounds: number[] = CHINA_REGION.bounds;
   /** 当前视野。`userMoved` 为假时每次 `rebuild` 都跟随数据/画布重算。 */
   private viewBounds: number[] = CHINA_REGION.bounds;
@@ -323,16 +338,18 @@ struct WallPage {
    * 重算场景。**唯一**的几何入口 —— 只在「数据到了」「画布尺寸变了」或「手势抬手」时调用。
    * 画布尺寸没拿到（首帧之前）时什么都不做，等 `onAreaChange` 再来一次。
    *
-   * ── 视野：三层，**顺序不能换**（本批加了第 ②③ 层）────────────────────────────
+   * ── 视野（task-19 的新模型："地图铺满高度，左右横滑"）────────────────────────
    *   ① `fitBounds(this.photos, VIEW_PAD_RATIO)` —— 由**照片数据**求出"能看到全部照片"
-   *      的经纬度范围（一张有坐标的都没有 → 全国视野）。
-   *   ② `fitViewToCanvas(...)` —— **默认铺满**：把它撑成与画布同比例，消掉 `mapFrame`
-   *      的信箱空白（真机真值：376×663.71 的画布上框只有 309.1 宽、左右各空 33.45pt）。
+   *      的经纬度范围（一张有坐标的都没有 → 全国视野）。**只用来定经度中心**。
+   *   ② `defaultWallView(...)` —— **默认铺满**：纬度取中国全域 18~54、经度跨度由画布宽高比
+   *      反推（真机 376×624.86 上是 27.744185828688188°）、经度中心对齐数据中心；
+   *      数据比一屏宽时换成"钉子最多的那一屏"（见 core/render.defaultWallView）。
+   *      与旧的 `fitViewToCanvas` 的区别是**纬度不再由数据决定** —— 那样才能铺满高度。
    *   ③ **用户视野** `this.viewBounds` —— 手势缩放/平移的结果。`userMoved` 为假时
-   *      它就等于 ② 的产物（每次重算都跟随数据）；为真时以它为准，
-   *      但**仍然过一遍 `fitViewToCanvas`**：画布尺寸变了（旋转/分屏）时把手势留下的框
-   *      重新对齐到新的画布比例。它对手势产物是**恒等**的（手势只做等比缩放与平移，
-   *      比例一直等于画布比例），所以这一步不会在正常路径上动用户的视野。
+   *      它就等于 ② 的产物（每次重算都跟随数据）；为真时以它为准，但**仍然过一遍
+   *      `refitViewToCanvas`**：画布尺寸变了（旋转/分屏）时把用户留下的框重新对齐到新的
+   *      画布比例。它对手势产物是**恒等**的（手势只做等比缩放与平移，比例一直等于画布比例），
+   *      所以这一步不会在正常路径上动用户的视野。
    *
    * ⚠️ `bounds` **只算一次、只传一处**：国界、省界（`outlinePath`）与照片（`buildScene`）
    * 都从这**同一个** `MapFrame` 上读 `frame.bounds` —— 各传一套参数就会出现
@@ -347,22 +364,19 @@ struct WallPage {
     // ① 数据视野（没有有效坐标 → 全国视野，与改动前一致）
     const vb: number[] | undefined = fitBounds(this.photos, VIEW_PAD_RATIO);
     const dataBounds: number[] = vb !== undefined ? vb : CHINA_REGION.bounds;
-    // ② 默认铺满：撑成与画布同比例（框 ⊇ 数据；pt/度 不变、框绕数据长出去 → 照片不动）
-    this.defaultBounds = fitViewToCanvas(dataBounds, this.boxW, this.boxH);
-    // ③ 用户视野
-    if (!this.userMoved) { this.viewBounds = this.defaultBounds; }
-    const bounds: number[] = fitViewToCanvas(this.viewBounds, this.boxW, this.boxH);
+    // ② 默认视野：**铺满高度**（经度跨度由画布比例反推、中心对齐数据）
+    this.defaultBounds = defaultWallView(this.photos, VIEW_PAD_RATIO, this.boxW, this.boxH);
+    // ③ 用户视野：没动过就跟随默认；动过就只做"对齐新画布比例"（对比例已匹配的框是逐位恒等）
+    const bounds: number[] = this.userMoved
+      ? refitViewToCanvas(this.viewBounds, this.boxW, this.boxH)
+      : this.defaultBounds;
     this.viewBounds = bounds;
     this.viewIsDefault = !this.userMoved;
-    // 地图块 = 整个主体区（地图是这整块区域的底色）；框 = 块里那个不变形的视野。
-    // 有界视野下 ②③ 让**框恒等于块**（信箱空白 0）；广域视野下框填不满块，
-    // `mapFillRatio` 把那个比值报出来（诊断行/验收读的就是它）。
+    // 地图块 = 整个主体区；框 = **恒填满高度**的那个不变形绘制框（宽度放不下时 x 为负 ——
+    // 横向溢出正是"左右横滑"的几何形态，见 core/render 的 MapFrame 一节）。
     const frame: MapFrame = mapFrame(this.boxW, this.boxH, bounds);
-    this.mapX = r2(frame.x);
-    this.mapY = r2(frame.y);
-    this.mapW = r2(frame.w);
-    this.mapH = r2(frame.h);
-    this.mapFill = r2(mapFillRatio(frame));
+    // 四个验收数字（地图绘制宽/高、两个比值、横向偏移、可滑余量）——**只进诊断行**
+    const vm: ViewMetrics = viewMetrics(frame);
 
     // 国界：坐标已按 frame 平移过（与钉子同一个坐标系）；投影用的 bounds 就是 frame.bounds，
     // 与 buildScene 读的是同一处（outlinePath 已经没有 bounds 参数了）；视口剔除也在里面
@@ -433,30 +447,28 @@ struct WallPage {
     this.locatedTotal = located;
     this.shownTotal = markers.length;
     // ── 诊断（临时）：真机上抓不到 hilog，所以把同样的数字也画在屏幕上 ──────────
-    // 要的就是这一行的真值：`boxW / boxH` 是 onAreaChange 给的**地图块**（整个主体区），
-    // `图框 W×H@(x,y)` 是块里那个不变形的绘制框，`pathLen` 是国界 path 的字符数
-    //（=0 就说明国界根本没画出来，那是另一类缺陷），`track` 是轨迹折线的字符数。
-    //
-    // 本形态新增三样，都是为了**真机一眼核对**：
-    //   · `填满 x%`：`mapFillRatio` —— 框面积 / 可用区面积。**有界视野必须是 100%**
-    //     （那就是"地图铺满"的字面意思）；广域视野会小于 100%，那时它是**预期的**
-    //     （撑满块会把视野拉到南半球、中国反而更小 —— 见 core/render 的 MapFrame 注释）。
-    //   · `pins N ｜ 标记 M`：M 是墙上真正画出来的圆点数（= 每个钉子的 min(张数, 5) 之和）。
-    //     它与 `上墙` 的差额就是所有「＋N」的和 —— 照片一张都没丢，点开钉子就在面板里。
-    //   · `国界 N 省界 N`：两条 path 的字符数。省界那个数**必须明显大于国界**
-    //     （省界是内陆的线网、国界只是海岸线）；`省界 0` = 那一层根本没画出来。
-    //   · `视野态` 与 `手势 k/T`：默认铺满 / 已改，以及可缩放的倍数区间。
+    // 用户截一张图就等于把日志交回来。task-19 要核对的是**新模型的四个数字**：
+    //   · `地图 W×H`：中国全域投影出来的尺寸（来自 `core/render.viewMetrics`）。
+    //     **`地图高/画布高` 必须是 1.00**（纵向铺满，用户那条硬要求）；
+    //     **`地图宽/画布宽` 必须 > 1**（本批真机是 2.2347 —— 这就是"要横滑"的判据）。
+    //   · `横偏 x`：中国西缘的屏幕 x（负 = 在屏幕左外侧）。默认视野下真机实测 −365.68pt；
+    //     **往西拖到头时它应当正好变成 0.00**（中国西缘贴住屏幕左缘、再拖就停）。
+    //   · `可滑 Npt`：横向还能滑多少（真机 464.25pt，即 34.256° 经度）。
+    //   · `填满`：`heightRatio` 的百分数。铺满那一档是 100%；放大态会 > 100%（地图比画布大，
+    //     正常）；**< 100% 才是缺陷**（画布上有空白带）。
+    // 其余几样沿用旧形态的核对点：`pins N ｜ 标记 M`（M = 每个钉子的 min(张数,5) 之和，
+    // 与"上墙"的差额就是所有「＋N」的和）、`国界/省界` 的 path 字符数（省界必须明显更大）、
+    // `视野态` 与 `手势 k/T`。
     const diagBounds: string = `数据[${r2(dataBounds[0])},${r2(dataBounds[1])},${r2(dataBounds[2])},${r2(dataBounds[3])}]`
       + `→铺满[${r2(bounds[0])},${r2(bounds[1])},${r2(bounds[2])},${r2(bounds[3])}]`;
-    // 缩放界限换算成"放大倍数"口径：最小 1×（= 视野框恒等于全国框）、最大 62/0.6 ≈ 103×。
-    // **两个数都从 core 的 `viewZoomRange()` 读**，不再手写 `'1×'`。
-    // 手写的那个 1× 曾经只是显示：经度跨度确实被夹在 62°，而同一个框的纬度能膨胀到 −20.6°
-    // （用户看到的就是这个）。现在约束端（`containInChina`）与显示端读同一份定义，
+    // 可缩区间**从 core 读**（下界随画布比例变：真机 2.2347×~103.33×），不再手写 '1×'。
     // `render.test.ts` 里有一条单测直接断言"显示的下界 == 反复缩小实际到达的下界"。
-    const zoomRange: number[] = viewZoomRange();
+    const zoomRange: number[] = viewZoomRange(this.boxW, this.boxH);
     const zoomMin: number = zoomRange[0];
     const zoomMax: number = zoomRange[1];
-    this.diag = `box ${r2(this.boxW)}×${r2(this.boxH)} ｜ 图框 ${this.mapW}×${this.mapH}@(${this.mapX},${this.mapY}) 填满 ${this.mapFill * 100}%`
+    this.diag = `box ${r2(this.boxW)}×${r2(this.boxH)} ｜ 图框 ${r2(frame.w)}×${r2(frame.h)}@(${r2(frame.x)},${r2(frame.y)})`
+      + ` ｜ **地图 ${r2(vm.mapW)}×${r2(vm.mapH)}**（高/画布 ${r2(vm.heightRatio)} 宽/画布 ${r2(vm.widthRatio)}）`
+      + ` ｜ 横偏 ${r2(vm.westX)} 可滑 ${r2(vm.panSlackX)}pt`
       + ` ｜ 视野 ${diagBounds}${vb !== undefined ? '(数据)' : '(全国)'}`
       + ` ｜ 放大 ${r2(viewZoomOf(dataBounds))}×→${r2(viewZoomOf(bounds))}×`
       + ` ｜ pins ${pins.length} ｜ 标记 ${markers.length}`
@@ -466,12 +478,13 @@ struct WallPage {
       + ` ｜ 上墙 ${this.walledTotal} 命中 ${located} 标记 ${markers.length}`;
     hilog.info(DOMAIN, TAG, '%{public}s',
       `${DIAG} rebuild：boxW=${this.boxW} boxH=${this.boxH}`
-      + ` blockH=${frame.blockH} mapW=${frame.w} mapH=${frame.h} mapX=${frame.x} mapY=${frame.y}`
-      + ` mapFill=${this.mapFill}`
+      + ` frameW=${frame.w} frameH=${frame.h} frameX=${frame.x} frameY=${frame.y}`
+      + ` mapW=${vm.mapW} mapH=${vm.mapH} widthRatio=${vm.widthRatio} heightRatio=${vm.heightRatio}`
+      + ` westX=${vm.westX} eastX=${vm.eastX} northY=${vm.northY} panSlackX=${vm.panSlackX} lonSpan=${vm.lonSpan}`
       + ` dataBounds=[${r2(dataBounds[0])},${r2(dataBounds[1])},${r2(dataBounds[2])},${r2(dataBounds[3])}]`
       + ` bounds=[${r2(bounds[0])},${r2(bounds[1])},${r2(bounds[2])},${r2(bounds[3])}]`
       + ` boundsFromData=${vb !== undefined}`
-      + ` viewZoomData=${r2(viewZoomOf(dataBounds))} viewZoomFilled=${r2(viewZoomOf(bounds))}`
+      + ` viewZoomData=${r2(viewZoomOf(dataBounds))} viewZoomFloor=${r2(viewZoomOf(bounds))}`
       + ` geoAspect=${geoAspect(bounds).toFixed(4)} canvasAspect=${(this.boxW / this.boxH).toFixed(4)}`
       + ` pins=${pins.length} markers=${markers.length}`
       + ` chinaPath.length=${chinaPath.length} provincePath.length=${provincePath.length}`
@@ -592,7 +605,7 @@ struct WallPage {
       + ` 放大=${r2(viewZoomOf(nb))}× pins=${this.pins.length}`);
   }
 
-  /** **重置视野**：一键回到"默认铺满"（`rebuild` 会重新由数据求出它，不存旧值）。 */
+  /** **重置视野**：一键回到"**铺满高度 + 数据居中**"（`rebuild` 会重新由数据求出它，不存旧值）。 */
   private resetView(): void {
     this.userMoved = false;
     this.gK = 1;
@@ -638,10 +651,11 @@ struct WallPage {
           .onClick(() => { router.back(); })
         Text(`地图墙 ｜ ${this.pinsView.length} 个地点 · ${this.shownTotal} 个标记 / 上墙 ${this.walledTotal} 张`)
           .fontSize(15).fontWeight(FontWeight.Medium).layoutWeight(1)
-        // ── 重置视野：一键回到"默认铺满"──────────────────────────────────
+        // ── 重置视野：一键回到"**铺满高度 + 数据居中**"（task-19）────────────
         // 放在**手势容器之外**（这一行在 Stack 外面），所以它不会被自己的手势缩放/平移，
         // 也不会与地图的拖动冲突 —— 一个"永远在原位"的按钮才找得到。
         // 已经在默认视野时变灰：不是禁用（点了也无害），而是告诉用户"你现在就是默认状态"。
+        // 它**必须**存在：地图比画布宽 2.23 倍，用户横滑到西头之后得有一条回家的路。
         Text(this.viewIsDefault ? '已铺满' : '重置视野')
           .fontSize(13)
           .fontColor(this.viewIsDefault ? '#AAAAAA' : '#1F6FEB')
@@ -660,7 +674,8 @@ struct WallPage {
         Stack({ alignContent: Alignment.TopStart }) {
           Stack({ alignContent: Alignment.TopStart }) {
             // 地图块的底色 = 整个主体区。这一层就是"地图铺满主体区"最直接的体现：
-            // 它替代了旧版那条只占上方 37% 的 `height(this.mapH)` 色带。
+            // 它替代了旧版那条只占上方 37% 的色带；task-19 之后**绘制框也填满高度**
+            // （`mapFrame` 恒 `h == boxH`），所以"地图"与"主体区"在纵向是同一件事。
             Column().width('100%').height('100%').backgroundColor('#F2F7EF')
 
             // 国界：一条 path 装下 96 个环（不放 96 个组件）。
@@ -830,7 +845,7 @@ struct WallPage {
         Text(`诊断 ${this.diag}`).fontSize(9).fontColor('#B08A5A')
           .width('100%').padding({ left: 12, right: 12, bottom: 2 })
       }
-      Text('双指缩放 · 拖动平移 · 点钉子或「＋N」看这个地点的全部照片').fontSize(10).fontColor('#AAA')
+      Text('双指缩放 · 左右拖动看全国 · 点钉子或「＋N」看这个地点的全部照片').fontSize(10).fontColor('#AAA')
         .width('100%').padding({ left: 12, right: 12, bottom: 8 })
 
       // ── 点开钉子的详情：**这是看大图的地方**（本形态下墙上只有小圆点）────────
