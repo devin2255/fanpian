@@ -7,6 +7,8 @@
  *   node --experimental-strip-types tools/render-preview.ts --nearby
  *   node --experimental-strip-types tools/render-preview.ts --many
  *   node --experimental-strip-types tools/render-preview.ts --zoomout
+ *   node --experimental-strip-types tools/render-preview.ts --pan=west
+ *   node --experimental-strip-types tools/render-preview.ts --pan=east
  *   node --experimental-strip-types tools/render-preview.ts <数据.json> [输出.svg]
  *
  *   node --experimental-strip-types tools/render-preview.ts \
@@ -23,12 +25,16 @@
  *   --w=--h=         画布尺寸（pt，默认 360×720 —— 一台常见鸿蒙手机的 vp 尺寸）
  *   --zoom=          地图缩放（默认 1）。小于 placement.MIN_ZOOM_FOR_EXPAND 时全部收成光点。
  *   --pad=           视野内边距比例（默认 `render.VIEW_PAD_RATIO` = 0.15，**与设备同一个常量**）。
- *                    0 = 视野紧贴数据；调大 = 四周留白更多（地图更"远"）。
+ *                    0 = 数据框紧贴数据；它现在只影响"经度中心"与"数据比一屏宽吗"的判断
+ *                    （纬度恒取中国全域，不再由数据决定）。
  *   --scale=         SVG 的像素放大倍数（默认 2；**只改 width/height，几何一点不变**）
  *   --footer=        顶部图例条的高度（pt，默认 34）。
  *   --nearby         用"三个邻近城市"的那份数据（**贴用户真机**：上海+北京+天津）
  *   --many           用 18 个钉子的那份数据（演示"钉子多时收成点"）
- *   --zoomout        先算"默认铺满"的视野，再一路缩到最小（模拟真机上一直捏合）后出图
+ *   --zoomout        从默认视野先放大 6 步、再一路捏合缩回**下界**后出图
+ *                    （下界 = 完整的中国纬度；输出名加 `-zoomedout` 后缀）
+ *   --pan=west|east  **同一次视野下横滑到最西 / 最东**（输出名加 `-pan-west` / `-pan-east`）。
+ *                    这就是"横向溢出"的可视化：地图比画布宽 2.23 倍，不滑就只能看到其中一段。
  *
  * ── 形态（task-18 的用户裁决："地图为主：照片改小、点开才看大图"）────────────────
  *   · 地图是**主角**：底色 + 国界 + 省界铺满整块画布，钉子撒在上面；
@@ -40,29 +46,26 @@
  *   2 倍图下两者视觉大小同量级，改它有它的理由（真屏上 6.5 会糊），
  *   而标记的半径与位置**一点不差**（都读同一份常量与同一个 `pinMarkers`）。
  *
- * ── 视野（viewport）是怎么定的：**由数据求出**，与设备侧共用 core/render.fitBounds ────
- *   · `fitBounds(photos, pad)` 求"能看到全部照片"的经纬度范围（一张有坐标的都没有 →
- *     退回 `CHINA_REGION.bounds`，与设备侧的退化路径逐点一致）；
- *   · **`fitViewToCanvas(数据框, w, h)` 把它撑成与画布同比例**（"默认铺满"）——
- *     少了这一步 `mapFrame` 只能在块里 contain，框的一侧会空出一条带。撑开只作用在
- *     **没被限制**的那根轴上 → 框 ⊇ 数据（照片一张都不会跑出去），且 pt/度 不变、
- *     框绕数据长出去 → 照片在屏幕上**一动都不动**；
- *   · 用它 `mapFrame(w, h, bounds)` 得到不变形的绘制框 —— bounds 存在框里，
- *     **国界、省界与钉子都从框上读**（`frameBounds`），不可能各画各的。
- *   · 于是"广域数据 → 接近全国视野"与"邻近城市 → 放大 9 倍铺满屏幕"是同一段代码的
- *     两个结果，差别只在数据。跑 `--nearby` 与默认（广域）两份就能看见这个差别。
+ * ── 视野（viewport）：**铺满高度 + 横向溢出**（task-19 的用户裁决"地图铺满高度，左右横滑"）──
+ *   · `fitBounds(photos, pad)` 求数据框（一张有坐标的都没有 → 退回 `CHINA_REGION.bounds`）；
+ *   · **`defaultWallView(photos, pad, w, h)`** 求默认视野：纬度恒取中国全域 18~54、
+ *     经度跨度由**画布宽高比**反推、经度中心对齐数据中心（数据比一屏宽时退成"钉子最多的
+ *     那一屏"）。与设备侧 `WallPage.rebuild` 调的是**同一个函数**；
+ *   · 用它 `mapFrame(w, h, bounds)` 得到**恒填满高度**的绘制框 —— bounds 存在框里，
+ *     **国界、省界与钉子都从框上读**（`frameBounds`），不可能各画各的；
+ *   · `viewMetrics(frame)` 给出四个验收数字（地图绘制宽/高、两个比值、横向偏移、可滑余量）——
+ *     图例里印的就是它，与设备诊断行是同一个函数。
  *
- * ── 画布分区是怎么定的（与设备侧共用 core/render.mapFrame / mapFillRatio）────────
- *   · **地图块** = 整块画布 `--w × --h`：地图是它的底色，钉子撒在它上面。
- *   · **地图框** = 地图块里那个**不变形**的矩形（`MapFrame`）：先按"填满高度"算宽度，
- *     宽度放不下就改成"填满宽度"，然后**居中**。
- *   · **填满度** = `mapFillRatio(frame)` = 框面积 / 可用区面积。**图例里印的就是它**：
- *     有界视野下铺满生效 → 100%；广域视野下框填不满块（37.18% @360×720）——
- *     那是**故意的**：撑满会把视野拉到南半球、中国反而更小（见 core/render 的 MapFrame 注释）。
+ * ── 三个比值（画布 360×720、默认视野）：**先看懂这三个数再看图** ─────────────────
+ *   · 一屏经度跨度 = `360/720 × 0.80471895621705 / DEG` = **23.0535°**；
+ *   · **地图绘制高度 / 画布高度 = 1.00**（纵向铺满 —— 用户那条硬要求）；
+ *   · **地图绘制宽度 / 画布宽度 = 2.6894**（横向溢出 —— 所以要横滑；`--pan=` 那两张就是它）。
  *
  * 输出断言（脚本自己会检查，不符合就非零退出）：
  *   · 文件写出且非空；· 没有 NaN/Infinity 坐标；· 有 <svg> 根元素；
- *   · 每个标记都贴着钉子（`dy ∈ (0, MARKER_DY]`、`|dx| ≤ 9pt`）—— 新形态的硬不变量。
+ *   · 每个标记都贴着钉子（`dy ∈ (0, MARKER_DY]`、`|dx| ≤ 9pt`）—— 新形态的硬不变量；
+ *   · **地图绘制高度 ≥ 画布高度**（纵向铺满：默认视野下必须恰好等于画布高）；
+ *   · **数据装得下一屏时，每一个钉子都必须在可见区里**（否则"默认让钉子可见"就是空话）。
  */
 
 import fs from 'node:fs';
@@ -73,11 +76,11 @@ import { CHINA_REGION, projectMercator } from '../entry/src/main/ets/core/projec
 import { MIN_ZOOM_FOR_EXPAND } from '../entry/src/main/ets/core/placement.ts';
 import {
   BLOCK_FILL, MARKER_DY, MARKER_R, MARKER_STEP, MAX_MARKERS, PROVINCE_STROKE, PROVINCE_WIDTH,
-  VIEW_PAD_RATIO, badgeRectOf, buildScene, fitBounds, fitViewToCanvas, frameBounds, geoAspect,
-  mapFillRatio, mapFrame, markerCountOf, outlinePath, parseOutline, pinMarkers, sceneToSvg,
-  trajectoryOrder, viewZoomOf, zoomViewAt
+  VIEW_PAD_RATIO, badgeRectOf, buildScene, defaultWallView, fillHeightLonSpan, fillHeightView,
+  fitBounds, frameBounds, geoAspect, mapFrame, markerCountOf, outlinePath, panViewBy, parseOutline,
+  pinMarkers, sceneToSvg, trajectoryOrder, viewMetrics, viewZoomOf, zoomViewAt
 } from '../entry/src/main/ets/core/render.ts';
-import type { MapFrame, PinMarker, ScenePin, WallPhoto } from '../entry/src/main/ets/core/render.ts';
+import type { MapFrame, PinMarker, ScenePin, ViewMetrics, WallPhoto } from '../entry/src/main/ets/core/render.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
@@ -98,10 +101,16 @@ interface Options {
   footer: number;
   pad: number;
   /**
-   * `--zoomout`：先算出"默认铺满"的视野，再**一路缩到最小**（模拟用户在真机上一直捏合），
-   * 然后按那一帧出图。task-17 的验收物（`tools/out/wall-preview-zoomedout.svg`）用它生成。
+   * `--zoomout`：从默认视野先放大 6 步、再**一路捏合缩回下界**（模拟用户在真机上一直捏合），
+   * 然后按那一帧出图。下界 = **完整的中国纬度**（task-19），输出名加 `-zoomedout` 后缀。
    */
   zoomout: boolean;
+  /**
+   * `--pan=west|east`：**同一次视野下横滑到最西 / 最东**（`panViewBy(bounds, ±50, 0)`，
+   * 与设备上"手指一直往一个方向拖"走的是同一条路径）。输出名加 `-pan-west` / `-pan-east`。
+   * 这两张就是"横向溢出 2.23 倍"的可视化：同一块画布、同一个缩放，只是窗口滑到了另一头。
+   */
+  pan: string;
 }
 
 function parseArgs(argv: string[]): Options {
@@ -116,7 +125,8 @@ function parseArgs(argv: string[]): Options {
     footer: 34,
     // **与设备同一个常量**：两边各写一个数就会变成"电脑上看到的和真机上看到的不是同一张图"
     pad: VIEW_PAD_RATIO,
-    zoomout: false
+    zoomout: false,
+    pan: ''
   };
   const positional: string[] = [];
   for (const a of argv) {
@@ -150,6 +160,12 @@ function parseArgs(argv: string[]): Options {
     if (key === '--scale') { o.scale = Number(val); continue; }
     if (key === '--footer') { o.footer = Number(val); continue; }
     if (key === '--pad') { o.pad = Number(val); continue; }
+    if (key === '--pan') {
+      if (val !== 'west' && val !== 'east') { throw new Error(`--pan 只认 west / east，收到「${val}」`); }
+      o.pan = val;
+      o.out = o.out.replace(/\.svg$/, `-pan-${val}.svg`);
+      continue;
+    }
     if (a.startsWith('--')) { throw new Error(`未知参数：${a}`); }
     positional.push(a);
   }
@@ -238,27 +254,34 @@ function main(): number {
 
   const loaded = loadPhotos(o.data, o.decisions);
 
-  // ── 视野：由**数据**求出（与设备侧同一个 fitBounds）─────────────────────────
-  // 一张有效坐标都没有 → 退回全国视野，与设备侧的退化路径逐点一致。
-  // 这一步是整个预览脚本存在意义的所在：`--nearby`（上海+北京+天津）与默认的广域数据
-  // 走的是同一段代码，区别只在数据 —— 于是"地图铺满屏幕"能在电脑上先看见。
+  // ── 视野：**铺满高度 + 横向溢出**（与设备侧同一个 `defaultWallView`）────────────
+  // 一张有效坐标都没有 → `fitBounds` 返回 undefined → 退回全国视野（设备侧同一条退化路径）。
   const vb: number[] | undefined = fitBounds(loaded.photos, o.pad);
   const dataBounds: number[] = vb !== undefined ? vb : CHINA_REGION.bounds;
-  // ── **默认铺满**：把数据框撑成与画布同比例（与设备侧同一个 fitViewToCanvas）────────
-  // 少了这一步，`mapFrame` 只能在块里 contain（居中信箱式），框的一侧会空出一条带 ——
-  // 那正是用户说的"没铺满"。撑开只作用在**没被限制**的那根轴上，所以框 ⊇ 数据
-  //（照片一张都不会跑出去），而且 pt/度 不变、框绕数据长出去 → 照片在屏幕上不动。
-  const boundsFilled: number[] = fitViewToCanvas(dataBounds, o.w, o.h);
+  // 默认视野：纬度恒取中国全域 18~54、经度跨度由**画布宽高比**反推（真机 27.744185828688188°）、
+  // 经度中心对齐数据中心；数据比一屏宽时退成"钉子最多的那一屏"。
+  // 这就是"地图铺满高度、横向溢出"的那一帧（`WallPage.rebuild` 的第 ② 步）。
+  let bounds: number[] = defaultWallView(loaded.photos, o.pad, o.w, o.h);
+  const defaultBounds: number[] = bounds.slice(0, bounds.length);
+  // 一屏的经度跨度（把"为什么是 2.23 倍"变成可复算的数）
+  const oneScreenSpan: number = fillHeightLonSpan(o.w, o.h);
 
-  // ── `--zoomout`：把视野**缩到最小**（task-17 的验收物）──────────────────────────
-  // 模拟用户在真机上一直捏合缩小：反复调 `zoomViewAt(b, 0.5, 0.5, 0.5)`，直到**不再变化**。
-  // 本次修复的判据就在这一步的结果上：缩到底**必须**是"整个中国"（`CHINA_REGION.bounds`），
-  // 而不是"经度到顶 62°、纬度按画布比例搭车到 −20.6°"（用户截图里那一帧）。
-  // 为什么在**铺满框**上缩而不是在数据框上缩：设备侧 `viewBounds` 就是铺满框
-  //（`rebuild` 的第 ② 步），用户的手势从那一帧开始 —— 复现要照抄这条路径。
-  let bounds: number[] = boundsFilled;
+  // ── `--pan=west|east`：**同一次视野下横滑到最西 / 最东**────────────────────────
+  // 走的是设备上"手指一直往一个方向拖"那条路径（`panViewBy` + `containInChina` 的平移钳制）：
+  // 拖到头就停住，窗口贴住 73°E / 135°E。这两张图放在一起看，就是"横向溢出 2.23 倍"的证据：
+  // 同一个缩放、同一块画布，只有窗口位置不同 —— 两屏之间的那 34.256° 只能滑过去。
+  let panNote = '';
+  if (o.pan === 'west') { bounds = panViewBy(bounds, 50, 0); panNote = '横滑到最西（窗口贴住 73°E）'; }
+  if (o.pan === 'east') { bounds = panViewBy(bounds, -50, 0); panNote = '横滑到最东（窗口贴住 135°E）'; }
+
+  // ── `--zoomout`：先放大 6 步、再一路缩回**下界**（task-19 的验收物）──────────────
+  // 下界 = **完整的中国纬度**（旧模型这里是"经度到顶 62°、纬度搭车到 −20.6°"，用户截图里那一帧）。
+  // 复现路径照抄设备：视野从**默认那一帧**开始，手势只调 `zoomViewAt`。
   let zoomSteps: number = 0;
+  let zoomInNote: number[] = bounds;
   if (o.zoomout) {
+    for (let i = 0; i < 6; i++) { bounds = zoomViewAt(bounds, 2, 0.3, 0.7); }
+    zoomInNote = bounds.slice(0, bounds.length);
     for (let i = 0; i < 40; i++) {
       const nb: number[] = zoomViewAt(bounds, 0.5, 0.5, 0.5);
       if (nb[0] === bounds[0] && nb[1] === bounds[1] && nb[2] === bounds[2] && nb[3] === bounds[3]) { break; }
@@ -267,16 +290,21 @@ function main(): number {
     }
   }
   const zoomFactor: number = viewZoomOf(bounds);
-  // 撑开前后的放大倍数（真机上诊断行印的就是这一对数字）
+  // 数据框与默认视野的放大倍数（真机诊断行印的就是这一对数字）
   const zoomData: number = viewZoomOf(dataBounds);
+  const zoomDefault: number = viewZoomOf(defaultBounds);
+  // 缩到底那一帧的**逐位**性质：从默认视野做一次纯缩小，必须一动不动（它是终点）
+  const pureOut: number[] = zoomViewAt(defaultBounds, 0.5, 0.5, 0.5);
+  const pureOutSame: boolean = pureOut[0] === defaultBounds[0] && pureOut[1] === defaultBounds[1]
+    && pureOut[2] === defaultBounds[2] && pureOut[3] === defaultBounds[3];
 
-  // 地图块 = 整块画布（地图是主体区的底色）；地图框 = 块里那个**不变形**的矩形（居中）。
+  // 地图块 = 整块画布；绘制框 = **恒填满高度**的那个不变形矩形（宽度放不下时 x 为负）。
   // bounds 存在框里（`MapFrame.bounds`），国界/省界/钉子都从框上读它 —— 不可能各画各的。
   const frame: MapFrame = mapFrame(o.w, o.h, bounds);
   // 投影实际用的 bounds（从框上读，与 buildScene / outlinePath 同一处）
   const fb: number[] = frameBounds(frame);
-  // **填满度**：框面积 / 可用区面积。这就是验收第 1 条那个数字（设备诊断行印的是同一个）。
-  const fillRatio: number = mapFillRatio(frame);
+  // **四个验收数字**：地图绘制宽/高、两个比值、横向偏移、可滑余量 —— 设备诊断行印的是同一个函数。
+  const vm: ViewMetrics = viewMetrics(frame);
 
   // 国界：数据文件在就画，不在就退化成"只有钉子和线"（脚本仍然能跑，报告里说明）
   let chinaPath = '';
@@ -319,17 +347,27 @@ function main(): number {
   const pins: ScenePin[] = buildScene(loaded.photos, frame, o.zoom);
   let svg = sceneToSvg(pins, o.w, o.h, chinaPath, o.scale, provincePath);
 
-  // 地图框的**标注**：一条虚线框，让"框在主体区里的位置与大小"在图上一眼可见。
-  // 它**不是地图的一部分**（`sceneToSvg` 不画它，设备侧也不画）—— 这是预览的排版标注，
+  // 地图框 / 地图内容 / 画布的**标注**：三条虚线框，让"谁比谁大"在图上一眼可见。
+  // 它们**不是地图的一部分**（`sceneToSvg` 不画、设备侧也不画）—— 这是预览的排版标注，
   // 和下面那三行图例是同一类东西。所以底色只有一种（`BLOCK_FILL`，与设备一致），
-  // "地图块 / 地图框"的区分靠这条虚线与图例里的数字，而不是靠两层颜色。
+  // 分区靠这三条虚线与图例里的数字，而不是靠几层颜色。
+  //   · **画布**（灰）：`0,0 → w×h` —— 真机上就是屏幕里那块主体区；
+  //   · **绘制框**（绿）：`frame.x/y/w/h` —— 默认视野下与画布**完全重合**（这就是"铺满"）；
+  //   · **中国绘制范围**（赭）：`[westX, northY] → mapW × mapH` —— 真机上量到的"地图"有多大。
+  //     它比画布宽 2.23 倍 → **两侧一定会伸出画布**（`--pan=` 那两张就是滑过去看的结果）。
   {
-    const mark = `<rect x="${round2(frame.x)}" y="${round2(frame.y)}" width="${round2(frame.w)}" `
+    const marks: string[] = [];
+    marks.push(`<rect x="0" y="0" width="${round2(o.w)}" height="${round2(o.h)}" fill="none" `
+      + `stroke="#C9C2B4" stroke-width="0.6" stroke-dasharray="2 3" opacity="0.9"/>`);
+    marks.push(`<rect x="${round2(frame.x)}" y="${round2(frame.y)}" width="${round2(frame.w)}" `
       + `height="${round2(frame.h)}" fill="none" stroke="#9FBE97" stroke-width="0.6" `
-      + `stroke-dasharray="5 4" opacity="0.85"/>`;
+      + `stroke-dasharray="5 4" opacity="0.85"/>`);
+    marks.push(`<rect x="${round2(vm.westX)}" y="${round2(vm.northY)}" width="${round2(vm.mapW)}" `
+      + `height="${round2(vm.mapH)}" fill="none" stroke="#D08A46" stroke-width="0.6" `
+      + `stroke-dasharray="1.5 2.5" opacity="0.9"/>`);
     const lines = svg.split('\n');
     const bg = lines.findIndex((l) => l.includes(`fill="${BLOCK_FILL}"`));
-    lines.splice(bg + 1, 0, mark);
+    lines.splice(bg + 1, 0, marks.join('\n'));
     svg = lines.join('\n');
   }
 
@@ -345,52 +383,64 @@ function main(): number {
     const extra: number = p.photos.length - markerCountOf(p);
     if (extra > 0) { plusN += extra; clippedPins++; }
   }
-  // 「照片级」的地图框外计数：按**原始坐标**算，不受聚簇影响。
+  // 「照片级」的**画布外**计数：按**原始坐标**算，不受聚簇影响。
   // 为什么必须单独算：400km 外的两张照片会在屏幕上被并进同一个钉子（MIN_PIN_DIST_PT=40
-  // 在全国视野下约等于 6.9° 经度），此时"某个钉子在画布外"就再也看不出来了 ——
-  // 三沙永兴岛（16.83°N）正是这样消失的。用**当前的** `fb` 投影（不是全国 bounds）：
-  // 这个数要回答的是"这张照片的图钉会落在本次画出来的那块地图里吗"。
+  // 在一屏 23° 经度下约等于 2.6° 经度），此时"某个钉子在屏幕外"就再也看不出来了 ——
+  // 三沙永兴岛（16.83°N）正是这样消失的。判据是**画布**（`[0, w]×[0, h]`）而不是绘制框：
+  // task-19 之后框可以比画布宽，而"用户这一眼看得见吗"问的是画布。
   const outside: string[] = [];
+  const insideCount: number[] = [0, 0];
   for (const ph of loaded.photos) {
     const has = ph.manual === true || ph.lat !== 0 || ph.lon !== 0;
     if (!has) { continue; }
+    // 注意：这里的 `q` 是**框坐标**，要加上 frame.x/frame.y 才是画布坐标
     const q = projectMercator(ph.lon, ph.lat, frame.w, frame.h, fb);
-    if (q.x < 0 || q.x > frame.w || q.y < 0 || q.y > frame.h) {
-      outside.push(`${ph.place === undefined ? `${ph.lat.toFixed(2)},${ph.lon.toFixed(2)}` : ph.place}(y=${q.y.toFixed(1)})`);
+    const cx = q.x + frame.x;
+    const cy = q.y + frame.y;
+    if (cx < 0 || cx > o.w || cy < 0 || cy > o.h) {
+      outside.push(`${ph.place === undefined ? `${ph.lat.toFixed(2)},${ph.lon.toFixed(2)}` : ph.place}(x=${round2(cx)})`);
+      insideCount[1]++;
+    } else {
+      insideCount[0]++;
     }
   }
   const track = trajectoryOrder(pins);
   const boundsText = `[${round2(fb[0])},${round2(fb[1])},${round2(fb[2])},${round2(fb[3])}]`;
   const dataText = `[${round2(dataBounds[0])},${round2(dataBounds[1])},${round2(dataBounds[2])},${round2(dataBounds[3])}]`;
-  // `--zoomout` 时图例要报的是**缩到底**那个框（`boundsText` 本来就是从 `frame` 上读的，
-  // 所以它天然跟着变）；铺满框只在控制台里与它并列印出来做对照。
-  const filledText = `[${round2(boundsFilled[0])},${round2(boundsFilled[1])},${round2(boundsFilled[2])},${round2(boundsFilled[3])}]`;
+  // `--zoomout` / `--pan` 时图例要报的是**当前那一帧**的框（`boundsText` 本来就是从 `frame`
+  // 上读的，所以它天然跟着变）；默认那一帧只在控制台里与它并列印出来做对照。
+  const defaultText = `[${round2(defaultBounds[0])},${round2(defaultBounds[1])},${round2(defaultBounds[2])},${round2(defaultBounds[3])}]`;
   const legend: string[] = [];
   // 图例画在**顶部**，并带一条底衬 —— **只影响这张 SVG 好不好读，不改任何几何**。
-  // 为什么不放底部：`fitBounds` 的边距保证最北的钉子至少离画布顶 `pad/(1+2pad)` 的高度
-  // （0.15 → 720pt 上是 83pt，标签再往上 10pt 也够），所以 34pt 的图例条不会压到任何东西；
-  // 而底部在广域视野下正好是"地图框外"那块（最南的钉子在那里）。
+  // 为什么不放底部：默认视野的纬度是中国全域（18~54），最南的钉子也在画布偏下的位置；
+  // 顶部 34pt 的图例条压不到任何东西。
   // 设备侧没有这个问题（提示文字在 Stack **外面**、不占画布），所以这是预览**绘制**上的差异。
   const legendH: number = o.footer > 20 ? o.footer : 34;
   legend.push(`<rect x="0" y="0" width="${round2(o.w)}" height="${round2(legendH)}" `
     + `fill="${BLOCK_FILL}" opacity="0.9"/>`);
   // 字号 6.5：7 号字在 360pt 宽上会**右侧截断**（SVG 的 text 不换行，超出的部分直接看不见）
-  // —— 预览是给人看的，截断的图例等于没有图例。三行，每行都写得尽量短。
+  // —— 预览是给人看的，截断的图例等于没有图例。四行，每行都写得尽量短。
   legend.push(`<g id="legend" font-size="6.5" fill="#7A8577">`);
-  legend.push(`<text x="8" y="${round2(legendH - 23)}">地图墙预览 ｜ ${pins.length} 钉子 ｜ 标记 ${drawn} 个 ｜ 轨迹 ${track.length} 点 ｜ 上墙 ${onWall} 张（输入 ${total}，无地点 ${total - onWall}）</text>`);
+  const pinsInView: number = pins.filter((p) => p.x >= 0 && p.x <= o.w && p.y >= 0 && p.y <= o.h).length;
+  legend.push(`<text x="8" y="${round2(legendH - 28)}">地图墙预览${panNote.length > 0 ? `（${escapeText(panNote)}）` : ''} ｜ 钉子 ${pinsInView}/${pins.length} 个在屏内 ｜ 标记 ${drawn} 个 ｜ 轨迹 ${track.length} 点 ｜ 上墙 ${onWall} 张（输入 ${total}，无地点 ${total - onWall}）</text>`);
   const viewLine: string = o.zoomout
-    ? `视野 数据 ${dataText}${vb !== undefined ? '(数据)' : '(全国)'} → 缩到底 ${boundsText}`
-      + `（${zoomSteps} 步捏合，== 全国）｜ 放大 ${round2(zoomData)}×→${round2(zoomFactor)}×`
-    : `视野 数据 ${dataText}${vb !== undefined ? '(数据)' : '(全国)'} → 铺满 ${boundsText}`
+    ? `视野 默认 ${defaultText} →（放大 6 步 → ${zoomInNote.map(round2).join(',')}）→ 缩到底 ${boundsText}`
+      + `（${zoomSteps} 步捏合，纬度 == 中国全域）｜ 放大 ${round2(zoomData)}×→${round2(zoomFactor)}×`
+    : `视野 数据 ${dataText}${vb !== undefined ? '(数据)' : '(全国)'} → 一屏（经度 ${round2(oneScreenSpan)}°）${boundsText}`
       + ` ｜ 放大 ${round2(zoomData)}×→${round2(zoomFactor)}×`;
-  legend.push(`<text x="8" y="${round2(legendH - 12)}">${viewLine}</text>`);
-  // 第三行的四个数字是本形态的关键：**填满度**（地图占了多少可用区）、**一个钉子最多几个标记**、
-  // **有多少张被画成＋N**、以及地图框的位置。它们与设备诊断行印的是同一批函数的值。
+  legend.push(`<text x="8" y="${round2(legendH - 18)}">${viewLine}</text>`);
+  // ②′ 新模型的**三个验收数字**：
+  //   · **地图绘制宽/高**（中国全域投影出来的尺寸）与两个比值：
+  //     `高/画布` 铺满那一档必须是 **1**，`宽/画布` 必须 **> 1**（那就是"要横滑"）；
+  //   · **横向偏移**（中国西缘的屏幕 x，负 = 在屏幕左外侧）与**可滑余量**。
+  // 它们与设备诊断行印的是同一个 `viewMetrics` 的值。
+  legend.push(`<text x="8" y="${round2(legendH - 8)}">**地图绘制 ${round2(vm.mapW)}×${round2(vm.mapH)}pt ｜ 高/画布 ${round2(vm.heightRatio)} 宽/画布 ${round2(vm.widthRatio)}** ｜ 横偏 ${round2(vm.westX)} 可滑 ${round2(vm.panSlackX)}pt ｜ 视野经度 ${round2(vm.lonSpan)}°</text>`);
   // ⚠️ 措辞不能出现 "地图框 N×Npt@(x,y)" 之外的**第二种同形写法** ——
   // `tools/wall-audit.ts` 用 `/地图框 ([\d.]+)×([\d.]+)pt@\((-?[\d.]+),(-?[\d.]+)\)/`
   // 从图例里读分区；本行原来写成 "地图框 ... ｜ 标记 3.8pt..."，其中 `3.8pt` 后面紧跟的
   // 字符让那条正则先匹配到**别处**，量出来的分区就变成了"整块画布"（静默的错误读数）。
-  legend.push(`<text x="8" y="${round2(legendH - 1)}">地图框 ${round2(frame.w)}×${round2(frame.h)}pt@(${round2(frame.x)},${round2(frame.y)}) **填满 ${round2(fillRatio * 100)}%** ｜ 标记直径 ${round2(MARKER_R * 2)}pt·一钉最多 ${MAX_MARKERS} 个 ｜ ＋N ${plusN} 张/${clippedPins} 钉 ｜ 框外 ${outside.length} ｜ 时间未知 ${undated} ｜ ${escapeText(outlineShort)} ${escapeText(provinceNote)}</text>`);
+  // 所以这一行里**只有一处** `地图框 W×Hpt@(x,y)`，其余数字都写成"地图绘制 …"。
+  legend.push(`<text x="8" y="${round2(legendH + 3)}">地图框 ${round2(frame.w)}×${round2(frame.h)}pt@(${round2(frame.x)},${round2(frame.y)}) ｜ 标记直径 ${round2(MARKER_R * 2)}pt·一钉最多 ${MAX_MARKERS} 个 ｜ ＋N ${plusN} 张/${clippedPins} 钉 ｜ 屏外 ${outside.length} ｜ 时间未知 ${undated} ｜ ${escapeText(outlineShort)} ${escapeText(provinceNote)}</text>`);
   legend.push(`</g>`);
   svg = svg.replace('</svg>', legend.join('\n') + '\n</svg>');
 
@@ -416,6 +466,30 @@ function main(): number {
     console.error(`✗ 有 ${badMarkers} 个标记不贴着钉子（新形态的硬不变量）—— 拒绝写盘`);
     return 1;
   }
+  // ③ task-19 的硬不变量：**纵向铺满**（地图绘制高度 ≥ 画布高度 —— 小于就说明画布上有空白带；
+  //    默认视野下必须**恰好**等于画布高）。这条是用户那条要求的机器可读形式。
+  if (!(vm.heightRatio >= 1 - 1e-9)) {
+    console.error(`✗ 地图没铺满高度：绘制高度 ${round2(vm.mapH)} < 画布高 ${round2(o.h)} —— 拒绝写盘`);
+    return 1;
+  }
+  if (!o.zoomout && o.pan.length === 0 && vm.heightRatio !== 1) {
+    console.error(`✗ 默认视野的地图高度比应当是 1（纵向铺满那一档），实测 ${vm.heightRatio} —— 拒绝写盘`);
+    return 1;
+  }
+  // ④ task-19 的第二条硬不变量：**数据装得下一屏时，每一个钉子都必须在可见区里**。
+  //    （装不下时只能"尽可能多"，那就由 `defaultWallView` 的规则与 §6 的取舍负责。）
+  const dataSpan: number = dataBounds[2] - dataBounds[0];
+  if (!o.zoomout && o.pan.length === 0 && dataSpan <= vm.lonSpan + 1e-9) {
+    let hidden: number = 0;
+    for (const p of pins) {
+      if (p.x < 0 || p.x > o.w || p.y < 0 || p.y > o.h) { hidden++; }
+    }
+    if (hidden > 0) {
+      console.error(`✗ 数据只占 ${round2(dataSpan)}°（一屏 ${round2(vm.lonSpan)}°）却有 ${hidden} 个钉子在屏外`
+        + ` —— "默认让钉子可见"没做到，拒绝写盘`);
+      return 1;
+    }
+  }
 
   fs.mkdirSync(path.dirname(o.out), { recursive: true });
   fs.writeFileSync(o.out, svg, 'utf8');
@@ -426,57 +500,50 @@ function main(): number {
   console.log(`画布：${o.w}×${o.h}pt（scale=${o.scale} → ${o.w * o.scale}×${o.h * o.scale}px）`);
   console.log(`分区：地图块 0→${round2(o.h)}pt（地图是整块主体区的底色：底 + 国界 + 省界 + 轨迹 + 钉子）`);
   console.log(`视野：数据框 ${dataText}${vb !== undefined ? '(数据：fitBounds)' : '(全国：没有有效坐标的退化路径)'}`);
-  console.log(`      铺满框 ${o.zoomout ? filledText : boundsText}（fitViewToCanvas 撑到与画布同比例）`
-    + ` ｜ 放大 ${round2(zoomData)}× → ${round2(o.zoomout ? viewZoomOf(boundsFilled) : zoomFactor)}×`
-    + `（= 全国经度跨度 62° / 视野经度跨度）`
-    + ` ｜ pad=${o.pad}`);
-  console.log(`        经度跨度 ${round2(dataBounds[2] - dataBounds[0])}° → ${round2(fb[2] - fb[0])}°`
-    + `（撑开 ${(fb[2] - fb[0]) / (dataBounds[2] - dataBounds[0]) > 1 ? ((fb[2] - fb[0]) / (dataBounds[2] - dataBounds[0])).toFixed(4) : '1.0000'} 倍）`
-    + ` ｜ 数据仍全部可见 = ${dataBounds[0] >= fb[0] - 1e-9 && dataBounds[2] <= fb[2] + 1e-9 && dataBounds[1] >= fb[1] - 1e-9 && dataBounds[3] <= fb[3] + 1e-9}`);
-  console.log(`      地图框 ${round2(frame.w)}×${round2(frame.h)}pt 左上角 (${round2(frame.x)}, ${round2(frame.y)})`
+  console.log(`      默认视野 ${defaultText}（defaultWallView：纬度取中国全域、经度跨度由画布比反推）`);
+  console.log(`        一屏经度跨度 = ${(o.w / o.h).toFixed(10)} × 0.80471895621705 / DEG = **${oneScreenSpan}°**`
+    + ` ｜ 横向可滑余量 = 62 − ${round2(oneScreenSpan)} = **${round2(62 - oneScreenSpan)}°**`
+    + ` ｜ 放大 ${round2(zoomData)}× → ${round2(zoomDefault)}×`);
+  console.log(`      当前视野 ${boundsText}${panNote.length > 0 ? `（${panNote}）` : ''}`
+    + ` ｜ 放大 ${round2(zoomFactor)}× ｜ pad=${o.pad}`);
+  console.log(`      绘制框 ${round2(frame.w)}×${round2(frame.h)}pt 左上角 (${round2(frame.x)}, ${round2(frame.y)})`
     + ` —— 框宽高比 = 墨卡托 ${geoAspect(fb).toFixed(4)}（**不变形**＝画布比 ${(o.w / o.h).toFixed(4)}）`);
-  // **填满度**：验收第 1 条那个数字。这里把它与"撑满会怎样"的数字并列印出来 ——
-  // 后者是 task-18 复核"该不该放宽 ⊆ 中国"的**证据**（撑满会把中国变小且拉到南半球）。
-  console.log(`      **填满度 = ${round2(fillRatio * 100)}%**（框面积 ${round2(frame.w * frame.h)} / 可用区 ${round2(o.w * o.h)}pt²）`
-    + ` ｜ 信箱空白 x=${round2(frame.x)}pt y=${round2(frame.y)}pt`
-    + `${fillRatio >= 1 - 1e-9 ? ' → **框 == 块：地图铺满整个可用区**' : ' → 框填不满块（那两条带是底色，理由见下）'}`);
-  if (fillRatio < 1 - 1e-9) {
-    // "撑满块"的等价物：把视野的纬度撑到画布比例（放弃 ⊆ 中国）。这里**只算不动**。
-    const want: number = o.w / o.h;
-    const y0: number = Math.log(Math.tan(Math.PI / 4 + (fb[1] * Math.PI / 180) / 2));
-    const y1: number = Math.log(Math.tan(Math.PI / 4 + (fb[3] * Math.PI / 180) / 2));
-    const needY: number = ((fb[2] - fb[0]) * Math.PI / 180) / want;
-    const yc: number = (y0 + y1) / 2;
-    const inv = (y: number): number => (2 * Math.atan(Math.exp(y)) - Math.PI / 2) / (Math.PI / 180);
-    const latLo: number = inv(yc - needY / 2);
-    const latHi: number = inv(yc + needY / 2);
-    const chinaShare: number = (54 - 18) / (fb[3] - fb[1]);
-    const filledShare: number = (54 - 18) / (latHi - latLo);
-    console.log(`        若"框填满块"（放弃 ⊆ 中国）→ 纬度会变成 [${round2(latLo)}, ${round2(latHi)}]`
-      + `${latLo < 0 ? '（**南半球**）' : ''}：中国只占画面高度的 ${round2(filledShare * 100)}%，`
-      + `而现在是 ${round2(chinaShare * 100)}% —— **填满度换不来更大的中国**，所以本函数选择后者`);
-  }
-  const fillH: number = o.h * geoAspect(fb);
-  console.log(`        先按"填满高度"算宽 = ${round2(o.h)}×${geoAspect(fb).toFixed(4)} = ${round2(fillH)}pt`
-    + ` ${fillH > o.w + 1e-6 ? `> 画布宽 ${o.w} → 改成"填满宽度"`
-      : (Math.abs(fillH - o.w) <= 1e-6 ? '== 画布宽 → **两条同时成立**（框 == 块，填满度 100%）'
-        : '≤ 画布宽 → **填满高度成功**')}`);
+  // **三个验收数字**（`viewMetrics`，与设备诊断行同一个函数）——
+  // 这就是"地图铺满高度 / 需要横滑"这两句话的机器可读形式。
+  console.log(`      **地图绘制 ${round2(vm.mapW)}×${round2(vm.mapH)}pt**`
+    + ` ｜ **高/画布 = ${vm.heightRatio}**（铺满那一档必须 == 1，放大态 > 1，< 1 才是缺陷）`
+    + ` ｜ **宽/画布 = ${vm.widthRatio}**（> 1 = 横向溢出 → 必须横滑）`);
+  console.log(`        横向偏移（中国西缘的屏幕 x）westX = ${round2(vm.westX)}pt（负 = 在屏幕左外侧）`
+    + ` ｜ eastX = ${round2(vm.eastX)} ｜ northY = ${round2(vm.northY)}`
+    + ` ｜ 可横滑 ${round2(vm.panSlackX)}pt ｜ 视野经度跨度 ${round2(vm.lonSpan)}°`);
+  console.log(`        屏内**照片** ${insideCount[0]} 张 / 屏外 ${insideCount[1]} 张`
+    + ` ｜ 屏内**钉子** ${pins.filter((p) => p.x >= 0 && p.x <= o.w && p.y >= 0 && p.y <= o.h).length} 个 / 共 ${pins.length} 个`
+    + `${dataSpan <= vm.lonSpan + 1e-9 ? '（数据装得下一屏 → **钉子必须全部在屏内**，脚本自检）'
+      : `（数据 ${round2(dataSpan)}° 比一屏 ${round2(vm.lonSpan)}° 宽 → 只能"尽可能多"，见报告 §6）`}`);
   console.log(`      zoom=${o.zoom}${o.zoom < MIN_ZOOM_FOR_EXPAND ? '（< 展开阈值：全部收成光点）' : ''} ｜ 图例 ${o.footer}pt`);
   if (o.zoomout) {
-    // task-17/18 的判据：缩到底**必须**是"整个中国"，且纬度必须落在 [18,54]（不许有南半球）
+    // task-19 的判据：缩到底**必须**是"完整的中国纬度"（[18,54] 逐位），经度跨度 == 一屏；
+    // 而且**从默认视野再缩一次必须一动不动**（下界是可达的终点）。
     const cb: number[] = CHINA_REGION.bounds;
-    const isNation: boolean = Math.abs(bounds[0] - cb[0]) < 1e-9 && Math.abs(bounds[1] - cb[1]) < 1e-9
-      && Math.abs(bounds[2] - cb[2]) < 1e-9 && Math.abs(bounds[3] - cb[3]) < 1e-9;
+    const latExact: boolean = bounds[1] === cb[1] && bounds[3] === cb[3];
     const latOk: boolean = bounds[1] >= cb[1] - 1e-9 && bounds[3] <= cb[3] + 1e-9;
-    console.log(`--zoomout：从铺满框 ${round2(boundsFilled[2] - boundsFilled[0])}° 经度跨度`
-      + ` 一路缩到最小（${zoomSteps} 步 × 0.5，绕中心）`);
-    console.log(`        缩到底 = [${round2(bounds[0])},${round2(bounds[1])},${round2(bounds[2])},${round2(bounds[3])}]`
-      + ` ｜ 放大 ${round2(zoomFactor)}× ｜ **== 全国范围** = ${isNation}`
-      + ` ｜ 纬度 ⊆ [18,54] = ${latOk}（下界 ${round2(bounds[1])}，真机旧行为是 −20.6）`);
-    console.log(`        全国视野下 mapFrame：${round2(frame.w)}×${round2(frame.h)}pt @(${round2(frame.x)},${round2(frame.y)})`
-      + ` 填满 ${round2(fillRatio * 100)}%`
-      + ` —— 横向顶满 = ${Math.abs(frame.w - o.w) < 1e-9}，纵向居中 = ${Math.abs(frame.y - (o.h - frame.h) / 2) < 1e-9}`
-      + `，上下留白合计 ${round2(100 - (frame.h / o.h) * 100)}%（画布比 ${(o.w / o.h).toFixed(4)} vs 中国比 ${geoAspect(cb).toFixed(4)}，不可兼得）`);
+    console.log(`--zoomout：从默认视野 ${defaultText} 先放大 6 步（×2，不动点 0.3,0.7）→ ${zoomInNote.map(round2).join(',')}`);
+    console.log(`        再一路捏合缩回下界（${zoomSteps} 步 × 0.5，绕中心）→ ${boundsText}`);
+    console.log(`        缩到底的纬度 = [${bounds[1]}, ${bounds[3]}] ｜ **== [18,54] 逐位** = ${latExact}`
+      + ` ｜ 纬度 ⊆ [18,54] = ${latOk}（真机旧行为是 −20.6°/南半球）`
+      + ` ｜ 经度跨度 ${round2(vm.lonSpan)}° == 一屏 ${round2(oneScreenSpan)}° = ${Math.abs(vm.lonSpan - oneScreenSpan) < 1e-9}`);
+    console.log(`        下界是**终点**：从默认视野再缩一次逐位不动 = ${pureOutSame}`
+      + ` ｜ 这一帧仍然铺满高度（高/画布 = ${vm.heightRatio}）`);
+  }
+  if (o.pan.length > 0) {
+    // 横滑前后：**跨度一点没变**（所以比例、铺满都不变），变的只有窗口位置 —— 这就是"溢出"的证据。
+    const dVm: ViewMetrics = viewMetrics(mapFrame(o.w, o.h, defaultBounds));
+    console.log(`--pan=${o.pan}：从默认视野 ${defaultText} 横滑`
+      + `（panViewBy(±50, 0)，与设备上"手指一直往一个方向拖"同一条路径）`);
+    console.log(`        默认：bounds ${defaultText} ｜ 西缘 x=${round2(dVm.westX)} 东缘 x=${round2(dVm.eastX)}`);
+    console.log(`        滑后：bounds ${boundsText} ｜ 西缘 x=${round2(vm.westX)} 东缘 x=${round2(vm.eastX)}`
+      + ` ｜ **跨度不变** = ${Math.abs((bounds[2] - bounds[0]) - (defaultBounds[2] - defaultBounds[0])) < 1e-9}`
+      + ` ｜ 画布横向移动了 ${round2(Math.abs(vm.westX - dVm.westX))}pt`);
   }
   console.log(`国界：${outlineNote}`);
   console.log(`省界：${provinceNote}　（${PROVINCE_STROKE} ${PROVINCE_WIDTH}pt —— 与国界同色、线宽是它的 ${PROVINCE_WIDTH}/0.8）`);
@@ -497,7 +564,7 @@ function main(): number {
   console.log(`没有地点的照片 ${hidden} 张（不上墙）`);
   console.log(`**标记 ${drawn} 个 / 上墙 ${onWall} 张**：${onWall - drawn} 张画成「＋N」（${clippedPins} 个钉子有 ＋N）`
     + ` —— 照片一张都没丢，点开钉子在底部详情面板里逐张看（设备侧 72×92 + 日期）`);
-  console.log(`地图框外（按原始坐标算，不受聚簇影响）${outside.length} 张：${outside.length === 0 ? '（无）' : outside.join('、')}`);
+  console.log(`画布外（按原始坐标算、判据是**画布**而不是绘制框，不受聚簇影响）${outside.length} 张：${outside.length === 0 ? '（无）' : outside.join('、')}`);
   console.log(`**标记坐标表（n=1..${MAX_MARKERS + 3}；相对钉子的 pt）** —— 每一个都贴着钉子：`);
   for (let n = 1; n <= MAX_MARKERS + 3; n++) {
     const ms: PinMarker[] = pinMarkers(n);
