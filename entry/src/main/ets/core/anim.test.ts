@@ -11,9 +11,14 @@ import assert from 'node:assert/strict';
 import {
   isAnimatedCandidate, shouldDecodeFrames, framePixelBudget, frameDecodeSize, releaseAll,
   ANIM_EXTENSIONS, MAX_ANIM_FRAMES, ANIM_TOTAL_PIXEL_BUDGET,
-  ANIM_MIN_FRAME_PIXELS, ANIM_MAX_FRAME_PIXELS
+  ANIM_MIN_FRAME_PIXELS, ANIM_MAX_FRAME_PIXELS,
+  decodeAnim, isStaticConclusion,
+  ANIM_NOT_CANDIDATE, ANIM_CACHED_STATIC, ANIM_STATIC_FEW_FRAMES, ANIM_STATIC_ORIENTATION,
+  ANIM_NO_HANDLE, ANIM_EMPTY_FRAMES, ANIM_FAILED, ANIM_READY
 } from './anim.ts';
-import type { FrameLike, FrameSize } from './anim.ts';
+import type {
+  FrameLike, FrameSize, AnimIo, AnimSourceHandle, AnimDecoded, AnimDecodeResult
+} from './anim.ts';
 
 // ── 1. 疑似判据：后缀白名单 ────────────────────────────────────────────────
 
@@ -353,4 +358,261 @@ test('释放：release() 返回被拒绝的 Promise 必须被吞掉（否则进�
   const n: number = releaseAll([r]);
   assert.equal(n, 1);
   assert.equal(r.released, true);
+});
+
+// ── 6. 负缓存策略（缺陷 D3）：只对**确定性结论**写，瞬时失败绝不写 ───────────────
+//
+// 这一节是 D3 的**可执行证据**。旧实现把"要不要记成永久结论"写在
+// `data/animSource.ets` 的 try/catch / 各分支里（共 5 处），而那个文件 import `@kit.*`
+// → 在 Node 上跑不起来，于是这条策略**没有任何测试能碰到它**。
+// 现在流水线在 core（`decodeAnim`），平台能力经 `AnimIo` 注入，于是下面这些断言
+// 可以用假实现真跑一遍 —— 尤其是工单点名要的「第一次抛、第二次成功」。
+
+/** 记帐假句柄：按脚本决定每一步的结局，并记下 `close()` 有没有被调用。 */
+class FakeHandle implements AnimSourceHandle<FakeFrame> {
+  frameCount: number;
+  orientation: string;
+  width: number = 4000;
+  height: number = 3000;
+  /** `createPixelMapList` 返回的帧数；0 = 返回**空数组**（"一帧都没解出来"）。 */
+  frameTotal: number;
+  throwOnDecode: boolean = false;
+  throwOnDelay: boolean = false;
+  closed: boolean = false;
+  /** 最后一次喂给 `createPixelMapList` 的 desiredSize（null = 从没调用过）。 */
+  lastTarget: FrameSize | null = null;
+  decoded: FakeFrame[] = [];
+
+  constructor(frameCount: number, orientation: string, frameTotal: number) {
+    this.frameCount = frameCount;
+    this.orientation = orientation;
+    this.frameTotal = frameTotal;
+  }
+
+  async getFrameCount(): Promise<number> {
+    return this.frameCount;
+  }
+
+  async getImageSize(): Promise<FrameSize> {
+    return { width: this.width, height: this.height };
+  }
+
+  async getOrientation(): Promise<string> {
+    return this.orientation;
+  }
+
+  async createPixelMapList(target: FrameSize): Promise<FakeFrame[]> {
+    this.lastTarget = target;
+    if (this.throwOnDecode) { throw new Error('decode-oom'); }
+    const out: FakeFrame[] = [];
+    for (let i = 0; i < this.frameTotal; i++) { out.push(new FakeFrame(`f${i}`, 'ok')); }
+    this.decoded = out;
+    return out;
+  }
+
+  async getDelayTimeList(): Promise<number[]> {
+    if (this.throwOnDelay) { throw new Error('delay-boom'); }
+    return [];
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+}
+
+/**
+ * 假端口：前 `failTimes` 次 `open` **抛错**，之后每次都给一个正常句柄。
+ * 这就是工单要求的"第一次抛、第二次成功"的载体。
+ */
+class FlakyIo implements AnimIo<FakeFrame> {
+  failTimes: number;
+  opens: number = 0;
+  handles: FakeHandle[] = [];
+  frameCount: number;
+  orientation: string;
+  frameTotal: number;
+  /** 在句柄交给调用点**之前**改它的脚本（例如让 getDelayTimeList 抛）。 */
+  prepare: (h: FakeHandle) => void = (h: FakeHandle) => {};
+
+  constructor(failTimes: number, frameCount: number, orientation: string, frameTotal: number) {
+    this.failTimes = failTimes;
+    this.frameCount = frameCount;
+    this.orientation = orientation;
+    this.frameTotal = frameTotal;
+  }
+
+  async open(uri: string): Promise<AnimSourceHandle<FakeFrame> | undefined> {
+    this.opens = this.opens + 1;
+    if (this.opens <= this.failTimes) { throw new Error(`transient-oom#${this.opens}`); }
+    const h: FakeHandle = new FakeHandle(this.frameCount, this.orientation, this.frameTotal);
+    this.prepare(h);
+    this.handles.push(h);
+    return h;
+  }
+}
+
+/** 假端口：永远给不出句柄（旧实现的第三个写点就在这里）。 */
+class NoHandleIo implements AnimIo<FakeFrame> {
+  opens: number = 0;
+
+  async open(uri: string): Promise<AnimSourceHandle<FakeFrame> | undefined> {
+    this.opens = this.opens + 1;
+    return undefined;
+  }
+}
+
+const RETRY_URI: string = 'file://media/Photo/9/big.gif';
+
+test('D3「两次调用」：第一次抛错、第二次成功 —— 第二次仍能装载，且负缓存里没有该 uri', async () => {
+  const cache: Map<string, boolean> = new Map();
+  const io: FlakyIo = new FlakyIo(1, 30, '1', 30);
+
+  // ── 第一次：平台抛错（内存压力 / fd 耗尽 / 文件被占用 —— 全是**瞬时**的）
+  const first: AnimDecodeResult<FakeFrame> = await decodeAnim(RETRY_URI, io, cache);
+  assert.equal(first.decoded, undefined);
+  assert.equal(first.outcome, ANIM_FAILED);
+  assert.ok(first.detail.includes('transient-oom#1'), '失败原因必须带上来（真机日志靠它）');
+  assert.equal(cache.has(RETRY_URI), false, '瞬时失败**绝不能**写进负缓存 —— 这就是 D3');
+  assert.equal(cache.size, 0, '负缓存必须一条都没写');
+  assert.equal(io.opens, 1);
+
+  // ── 第二次：同一张 uri、**同一个** cache，平台这次成功
+  const second: AnimDecodeResult<FakeFrame> = await decodeAnim(RETRY_URI, io, cache);
+  assert.equal(second.outcome, ANIM_READY, '第二次必须仍能装载（重试入口还在）');
+  if (second.decoded === undefined) {
+    assert.fail(`第二次应当装载成功，实际 outcome=${second.outcome}`);
+  }
+  const d2: AnimDecoded<FakeFrame> = second.decoded;
+  assert.equal(d2.frames.length, 30);
+  assert.equal(d2.frameCount, 30);
+  assert.equal(d2.srcW, 4000);
+  assert.equal(d2.budget, framePixelBudget(30));
+  assert.equal(cache.has(RETRY_URI), false, '成功也不写负缓存（肯定结论不能缓存：帧离开卡时就被释放）');
+  assert.equal(io.opens, 2, '第二次确实又开了一次文件 —— 这就是"坏文件每次滑回来重试一次"的代价');
+  // 每次探测一个 fd：句柄必须被关掉
+  assert.equal(io.handles.length, 1);
+  assert.equal(io.handles[0].closed, true, '句柄必须在 finally 里被关上');
+  // 交出去的帧**不能**被 core 释放（所有权已经转移给调用点）
+  for (const f of io.handles[0].decoded) {
+    assert.equal(f.released, false, '已交出去的帧不能被 core 的 finally 释放');
+  }
+});
+
+test('D3：确定性结论**仍然**写负缓存（帧数 ≤ 1 / 超上限），且第二次一次文件都不开', async () => {
+  const cache: Map<string, boolean> = new Map();
+  const uri: string = 'file://media/Photo/9/static.webp';
+  const io: FlakyIo = new FlakyIo(0, 1, '1', 0);   // getFrameCount() = 1 → 静态图
+
+  const a: AnimDecodeResult<FakeFrame> = await decodeAnim(uri, io, cache);
+  assert.equal(a.outcome, ANIM_STATIC_FEW_FRAMES);
+  assert.equal(cache.get(uri), true, '确定性结论必须写缓存，否则每张静态 webp 每次滑回都要读一遍文件头');
+  assert.equal(io.opens, 1);
+
+  const b: AnimDecodeResult<FakeFrame> = await decodeAnim(uri, io, cache);
+  assert.equal(b.outcome, ANIM_CACHED_STATIC);
+  assert.equal(io.opens, 1, '命中负缓存时**一次文件都不开** —— 这是缓存存在的全部意义');
+
+  // 帧数超上限（> MAX_ANIM_FRAMES）同样是确定性结论（帧数是文件头里的事实）
+  const over: FlakyIo = new FlakyIo(0, MAX_ANIM_FRAMES + 1, '1', 0);
+  const c: AnimDecodeResult<FakeFrame> = await decodeAnim('file://media/Photo/9/long.gif', over, cache);
+  assert.equal(c.outcome, ANIM_STATIC_FEW_FRAMES);
+  assert.equal(cache.get('file://media/Photo/9/long.gif'), true);
+  assert.equal(over.handles[0].lastTarget, null, '帧数不合格时不该走到解帧');
+});
+
+test('D3：确定性结论**仍然**写负缓存（方向需静态路径摆正），且解帧之前就挡住', async () => {
+  const cache: Map<string, boolean> = new Map();
+  const uri: string = 'file://media/Photo/9/rot90.gif';
+  const io: FlakyIo = new FlakyIo(0, 30, '6', 30);   // orientation 6 = Rotate 90 CW
+
+  const a: AnimDecodeResult<FakeFrame> = await decodeAnim(uri, io, cache);
+  assert.equal(a.outcome, ANIM_STATIC_ORIENTATION);
+  assert.equal(a.detail, '6');
+  assert.equal(cache.get(uri), true, '方向是文件里的事实 → 确定性结论 → 写缓存');
+  // 方向判定发生在**解帧之前** → 一帧都不该解（这是省内存最直接的一刀）
+  assert.equal(io.handles[0].lastTarget, null, '方向不对时不该调 createPixelMapList');
+  assert.equal(io.handles[0].closed, true, '句柄仍然必须被关掉');
+});
+
+test('D3：createPixelMapList 返回空 = 没探到（内存压力的头号形态）→ 不写负缓存、下次还重试', async () => {
+  const cache: Map<string, boolean> = new Map();
+  const uri: string = 'file://media/Photo/9/huge.gif';
+  // 帧数 30（权威判据通过，说明"它确实是动图"），但一帧都解不出来
+  const io: FlakyIo = new FlakyIo(0, 30, '1', 0);
+
+  const a: AnimDecodeResult<FakeFrame> = await decodeAnim(uri, io, cache);
+  assert.equal(a.outcome, ANIM_EMPTY_FRAMES);
+  assert.equal(a.decoded, undefined);
+  assert.equal(cache.has(uri), false, '这一支必须**不写**负缓存 —— SDK 明说它"一次解出全部帧"，头号成因是内存压力');
+  assert.equal(io.handles[0].closed, true);
+
+  const b: AnimDecodeResult<FakeFrame> = await decodeAnim(uri, io, cache);
+  assert.equal(b.outcome, ANIM_EMPTY_FRAMES);
+  assert.equal(io.opens, 2, '第二次必须仍然开文件重试（用户还有重试入口）');
+  assert.equal(cache.size, 0);
+});
+
+test('D3：平台给不出句柄 = 没探到 → 不写负缓存（第三个被去掉的写入点）', async () => {
+  const cache: Map<string, boolean> = new Map();
+  const uri: string = 'file://media/Photo/9/odd.gif';
+  const io: NoHandleIo = new NoHandleIo();
+
+  const a: AnimDecodeResult<FakeFrame> = await decodeAnim(uri, io, cache);
+  assert.equal(a.outcome, ANIM_NO_HANDLE);
+  assert.equal(cache.has(uri), false);
+  const b: AnimDecodeResult<FakeFrame> = await decodeAnim(uri, io, cache);
+  assert.equal(b.outcome, ANIM_NO_HANDLE);
+  assert.equal(io.opens, 2, '给不出句柄也必须允许下次重试');
+  assert.equal(cache.size, 0);
+});
+
+test('D3：解出帧**之后**才失败 —— 已解的帧必须被释放（否则每划一张漏一整套帧）', async () => {
+  const cache: Map<string, boolean> = new Map();
+  const uri: string = 'file://media/Photo/9/late-fail.gif';
+  const io: FlakyIo = new FlakyIo(0, 30, '1', 30);
+  // 让最后一步（读帧时长）抛：此时帧已经解出来了，所有权还在 core 手上
+  io.prepare = (h: FakeHandle) => { h.throwOnDelay = true; };
+
+  const r: AnimDecodeResult<FakeFrame> = await decodeAnim(uri, io, cache);
+  assert.equal(r.outcome, ANIM_FAILED);
+  assert.equal(cache.has(uri), false, '晚到的失败同样不写负缓存');
+  const h: FakeHandle = io.handles[0];
+  assert.equal(h.decoded.length, 30);
+  for (const f of h.decoded) {
+    assert.equal(f.released, true, '没交出去的帧必须由 core 的 finally 释放');
+  }
+  assert.equal(h.closed, true, '失败路径也必须关句柄（否则每失败一次漏一个 fd）');
+});
+
+test('D3：喂给 createPixelMapList 的 desiredSize 就是 frameDecodeSize(framePixelBudget(真实帧数))', async () => {
+  const cache: Map<string, boolean> = new Map();
+  const io: FlakyIo = new FlakyIo(0, 240, '1', 240);   // 240 = MAX_ANIM_FRAMES，最坏内存档
+  io.prepare = (h: FakeHandle) => { h.width = 4000; h.height = 3000; };
+
+  const r: AnimDecodeResult<FakeFrame> = await decodeAnim('file://media/Photo/9/240.gif', io, cache);
+  assert.equal(r.outcome, ANIM_READY);
+  if (r.decoded === undefined) { assert.fail('应当解帧成功'); }
+  const t: FrameSize | null = io.handles[0].lastTarget;
+  if (t === null) { assert.fail('必须调用过 createPixelMapList'); }
+  // 与 D5 的参数化表是同一条事实的两种表述（这里走的是**整条生产流水线**）
+  assert.deepEqual(t, { width: 258, height: 193 });
+  assert.deepEqual(t, frameDecodeSize(4000, 3000, framePixelBudget(240)));
+  assert.equal(r.decoded.budget, 50000);
+  assert.equal(r.decoded.targetW, 258);
+  assert.equal(r.decoded.targetH, 193);
+});
+
+test('D3：负缓存的判据**只有一个** —— 结局码真值表（未知结局按"没探到"处理）', () => {
+  assert.equal(isStaticConclusion(ANIM_STATIC_FEW_FRAMES), true);
+  assert.equal(isStaticConclusion(ANIM_STATIC_ORIENTATION), true);
+  // 三种"没探到"：一个都不许写
+  assert.equal(isStaticConclusion(ANIM_NO_HANDLE), false);
+  assert.equal(isStaticConclusion(ANIM_EMPTY_FRAMES), false);
+  assert.equal(isStaticConclusion(ANIM_FAILED), false);
+  // 成功与"连文件都没开"的两支也不写（缓存对它们没有意义）
+  assert.equal(isStaticConclusion(ANIM_READY), false);
+  assert.equal(isStaticConclusion(ANIM_NOT_CANDIDATE), false);
+  assert.equal(isStaticConclusion(ANIM_CACHED_STATIC), false);
+  // 保守方向：认不出来的结局一律当"没探到"（宁可多试一次，也不要永久错误的结论）
+  assert.equal(isStaticConclusion('garbage'), false);
 });

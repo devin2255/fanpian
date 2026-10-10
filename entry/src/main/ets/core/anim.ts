@@ -227,3 +227,269 @@ export function releaseAll(frames: FrameLike[]): number {
   }
   return n;
 }
+
+// ── 装载流水线：判定留在这里，平台调用从外面注入 ──────────────────────────────
+//
+// ── 这一段为什么必须存在（本批缺陷 D3 的修法）─────────────────────────────────
+//   缺陷形态：`data/animSource.ets` 的 `catch`（内存不足 / 解码失败）与
+//   `createPixelMapList` 返回空这两支**也**写了永久负缓存 `confirmedStatic`。
+//   而 `createPixelMapList` 的官方 NOTE 是「一次解出全部帧 … can lead to significant
+//   memory usage」—— 它的头号成因就是**内存压力**（解码器 OOM / fd 耗尽 / 文件被占用），
+//   全是瞬时的。于是"刷到一张大 GIF、恰逢内存吃紧"会把这张图永久钉成静态图，
+//   用户没有任何重试入口，而日志只打过一行、与"第一次就没播"完全同形。
+//
+//   修法 = **只对确定性结论写负缓存**。但"哪次失败算确定"这件事写在平台层里就
+//   **无法被单测证明**（`fileIo` / `image` 在 Node 上不存在）。所以这里把流水线整个
+//   搬进 core，平台能力经 `AnimIo` 注入：`data/animSource.ets` 只剩一层薄适配
+//   （SDK 调用 + 日志 + 组装 descriptor），而"第一次抛错、第二次成功"这条断言
+//   可以用假 `AnimIo` 在 Node 上**真跑一遍**。
+//
+// ── 负缓存的两支保留 / 三支去掉（逐条对应本文件里的写入点）───────────────────
+//   保留（**确定性结论**：这张确实没有可播放的多帧）：
+//     · `ANIM_STATIC_FEW_FRAMES` —— `getFrameCount()` 成功返回且 `<= 1`（或超帧数上限）；
+//     · `ANIM_STATIC_ORIENTATION` —— 成功拿到方向、判定需要静态路径摆正。
+//   去掉（**没探到**：瞬时/环境，下次滑回来必须再试一次）：
+//     · `ANIM_NO_HANDLE` —— 平台给不出 ImageSource 句柄；
+//     · `ANIM_EMPTY_FRAMES` —— `createPixelMapList` 返回空（内存压力的头号形态）；
+//     · `ANIM_FAILED` —— 任何抛错（OOM / fd 耗尽 / 文件被占用 / 格式不支持）。
+//   代价（与 `data/movingPhotoSource.ets` 的开头论证同取舍）：坏文件每次滑回来会重试一次。
+//   这是**故意**付的：宁可多开一次文件，也不要一个永久错误的结论。
+
+/** 连后缀白名单都没过（连文件都不开）。 */
+export const ANIM_NOT_CANDIDATE: string = 'not-candidate';
+/** 负缓存命中：这张之前已经**确定**没有可播放的多帧。 */
+export const ANIM_CACHED_STATIC: string = 'cached-static';
+/** **确定性结论**：`getFrameCount()` 成功，但不是 2..MAX_ANIM_FRAMES。 */
+export const ANIM_STATIC_FEW_FRAMES: string = 'static-few-frames';
+/** **确定性结论**：方向需要静态路径摆正，播出来会躺下。 */
+export const ANIM_STATIC_ORIENTATION: string = 'static-orientation';
+/** **没探到**：平台给不出 ImageSource 句柄。 */
+export const ANIM_NO_HANDLE: string = 'no-handle';
+/** **没探到**：`createPixelMapList` 返回空（内存压力 / 解码器资源不足）。 */
+export const ANIM_EMPTY_FRAMES: string = 'empty-frames';
+/** **没探到**：任何抛错（OOM / fd 耗尽 / 文件被占用 / 格式不支持）。 */
+export const ANIM_FAILED: string = 'failed';
+/** 成功解出可播放的多帧。 */
+export const ANIM_READY: string = 'ready';
+
+/**
+ * 这个结局是不是**确定性结论**（这张确实没有可播放的多帧）？
+ *
+ * **这是负缓存的唯一判据** —— 调用点不许再自己写一份分支，否则"哪次失败算确定"
+ * 就有了两个真相来源，而 D3 正是这么来的（平台层的 catch 里写了一个隐式的答案）。
+ */
+export function isStaticConclusion(outcome: string): boolean {
+  return outcome === ANIM_STATIC_FEW_FRAMES || outcome === ANIM_STATIC_ORIENTATION;
+}
+
+/**
+ * 一个**已打开**的图片源句柄。方法名与 SDK `image.ImageSource` 的对应关系是刻意的
+ * （语义逐个相同），但类型刻意不引用它 —— core 不得 import `@kit.*`。
+ *
+ * `TFrame` 是**帧的具体类型**：真实现里是 `image.PixelMap`（组装 descriptor 时必须这个类型），
+ * 单测里是一个假帧。core 只要求它满足 `FrameLike`（够用来释放），别的一概不问。
+ */
+export interface AnimSourceHandle<TFrame extends FrameLike> {
+  /** SDK `ImageSource.getFrameCount()`。**权威判据的输入**。可能抛。 */
+  getFrameCount(): Promise<number>;
+  /** SDK `ImageSource.getImageInfo().size`（只读文件头，不解码像素）。可能抛。 */
+  getImageSize(): Promise<FrameSize>;
+  /** 方向标签（EXIF/TIFF Orientation 的字符串形式；读不到返回空串）。**不抛**。 */
+  getOrientation(): Promise<string>;
+  /** SDK `ImageSource.createPixelMapList(opts)`。**空数组 = 一帧都没解出来**。可能抛。 */
+  createPixelMapList(target: FrameSize): Promise<TFrame[]>;
+  /** SDK `ImageSource.getDelayTimeList()`。拿不到返回空数组（不抛）。 */
+  getDelayTimeList(): Promise<number[]>;
+  /** 释放句柄（`ImageSource.release()` + `closeSync(fd)`）。**必须不抛、幂等**。 */
+  close(): Promise<void>;
+}
+
+/**
+ * 平台端口：`data/animSource.ets` 是它唯一的**真实现**，单测注入假实现。
+ * 只开文件、只给句柄 —— 句柄的生命周期由 `decodeAnim` 的 `finally` 统一兜底。
+ */
+export interface AnimIo<TFrame extends FrameLike> {
+  /** 打开一张照片。返回 undefined = 平台给不出句柄。**可能抛**（打不开 / OOM）。 */
+  open(uri: string): Promise<AnimSourceHandle<TFrame> | undefined>;
+}
+
+/** 解好的帧与元数据（**还没有 descriptor**：平台对象由平台层拿到这个之后才组装）。 */
+export interface AnimDecoded<TFrame extends FrameLike> {
+  /** 解出来的全部帧。**所有权交给调用者**。 */
+  frames: TFrame[];
+  /** 每帧时长；长度与 `frames` 不一致时为空数组（交给默认节奏，见 data/animSource 的说明）。 */
+  durations: number[];
+  srcW: number;
+  srcH: number;
+  frameCount: number;
+  /** 实际喂给 `desiredSize` 的目标尺寸（真机核验"有没有按 desiredSize 解"的证据）。 */
+  targetW: number;
+  targetH: number;
+  /** 这一帧的像素预算（`framePixelBudget(count)` 的结果，进日志）。 */
+  budget: number;
+}
+
+/** 一次装载尝试的结果：产物 + 结局码 + 只用于日志的补充文本。 */
+export interface AnimDecodeResult<TFrame extends FrameLike> {
+  decoded: AnimDecoded<TFrame> | undefined;
+  outcome: string;
+  detail: string;
+}
+
+/** 把 catch 到的值转成一行可打印文本（与平台层的 errText 同款口径）。 */
+function errText(e: Object): string {
+  if (e instanceof Error) { return e.message; }
+  return JSON.stringify(e);
+}
+
+/** 结局结果的小工厂（避免在每个 return 点重复三行字面量）。 */
+function outcomeOf<TFrame extends FrameLike>(
+  decoded: AnimDecoded<TFrame> | undefined, outcome: string, detail: string
+): AnimDecodeResult<TFrame> {
+  return { decoded: decoded, outcome: outcome, detail: detail };
+}
+
+/**
+ * 读一张照片的动图帧。**不抛错**：任何失败都返回 `decoded: undefined`，
+ * 调用点据此显示静态图（第一帧或原 URI）—— 即"解析失败 → 退回静态"，绝不白屏。
+ *
+ * 三道闸，按代价从低到高，**顺序不可换**（换了就白花钱）：
+ *   1) 后缀白名单（纯字符串，见 `isAnimatedCandidate`）；
+ *   2) 负缓存（这张已**确定**没有多帧）；
+ *   3) 开文件 + `getFrameCount()`（**权威判据**）→ `getImageSize()` → `createPixelMapList()`。
+ *
+ * `staticCache` 由调用点持有（core 保持无状态）。
+ *
+ * ── D3 的修法就是**下面这一行 if** ────────────────────────────────────────────
+ *   全函数只有**一个**负缓存写点，判据是 `isStaticConclusion(outcome)`。
+ *   改之前有**五个**写点散在平台层的 try/catch/各分支里，"哪次失败算确定"因此
+ *   有了一个隐式的、无法被单测的答案 —— 其中三支（给不出句柄 / 一帧都没解出来 /
+ *   抛错）记的都是**瞬时**失败（内存压力是 `createPixelMapList` 的头号成因），
+ *   于是"刷到一张大 GIF、恰逢内存吃紧"会把这张图**永久**钉成静态图。
+ */
+export async function decodeAnim<TFrame extends FrameLike>(
+  uri: string, io: AnimIo<TFrame>, staticCache: Map<string, boolean>
+): Promise<AnimDecodeResult<TFrame>> {
+  if (!isAnimatedCandidate(uri)) { return outcomeOf(undefined, ANIM_NOT_CANDIDATE, ''); }
+  if (staticCache.get(uri) === true) { return outcomeOf(undefined, ANIM_CACHED_STATIC, ''); }
+  const r: AnimDecodeResult<TFrame> = await runDecode(uri, io);
+  // **负缓存的唯一写点**：只有确定性结论才写；"没探到"一律不写，下次滑回来会重试。
+  if (isStaticConclusion(r.outcome)) { staticCache.set(uri, true); }
+  return r;
+}
+
+/**
+ * 真正干活的那一半：开文件 → 读元数据 → 解帧。**不碰负缓存**（写点唯一，见 `decodeAnim`）。
+ * 与 `decodeAnim` 拆开的理由只有一条：让"要不要记成永久结论"成为一个**看得见的**、
+ * 只有一处的判据，而不是散在各分支里的五个写入。
+ */
+async function runDecode<TFrame extends FrameLike>(
+  uri: string, io: AnimIo<TFrame>
+): Promise<AnimDecodeResult<TFrame>> {
+  let handle: AnimSourceHandle<TFrame> | undefined = undefined;
+  // 已解出的帧。所有权在**成功构造 AnimDecoded 的那一刻**转移（那之后把它置空，
+  // 于是 finally 不会误释放已经交出去的帧）。任何别的路径都由 finally 释放。
+  let frames: TFrame[] = [];
+  try {
+    handle = await io.open(uri);
+    if (handle === undefined) {
+      // 平台给不出句柄：**没探到**（与下面的 catch 同一口径），绝不写负缓存。
+      return outcomeOf(undefined, ANIM_NO_HANDLE, '');
+    }
+    // ── 权威判据：多帧才算动图 ────────────────────────────────────────────
+    // 后缀命中的静态 gif / webp 在这里被挡掉（`shouldDecodeFrames` 要求 count > 1），
+    // 并且做帧数上限保护（超上限退回静态第一帧，而不是把内存乘爆）。
+    // 这是**确定性结论**（帧数是文件头里的事实）。
+    const count: number = await handle.getFrameCount();
+    if (!shouldDecodeFrames(count)) {
+      return outcomeOf(undefined, ANIM_STATIC_FEW_FRAMES, `帧数=${count}`);
+    }
+    // ── 原图尺寸：只读文件头，不解码像素 ──────────────────────────────────
+    const info: FrameSize = await handle.getImageSize();
+    // ── 方向：与静态路径保持一致，不一致就不播（见下）─────────────────────
+    const orientation: string = await handle.getOrientation();
+    if (!isDisplayOrientationNormal(orientation)) {
+      // 静态路径 `Image(uri)` 会按 EXIF/TIFF 方向自动摆正，而我们解出来的帧是**原始像素**。
+      // 若不管，同一张照片会"静态时是正的、一播就躺下" —— 这是比"不播"严重得多的故障。
+      // 所以这里选择**不播**（退回静态图，方向由框架摆正），而不是去映射旋转角：
+      // 旋转只能表达 90/180/270，镜像（orientation 2/4/5/7）根本表达不了，
+      // 映射一半反而会造出"有的转有的不转"的更坏形态。
+      // 这是**确定性结论**（方向是文件里的事实）。
+      return outcomeOf(undefined, ANIM_STATIC_ORIENTATION, orientation);
+    }
+    // ── 解码尺寸：唯一的降采样杠杆 ────────────────────────────────────────
+    // 刻意**不写** `sampleSize`：SDK 文档（`@ohos.multimedia.image.d.ts:3253`）写着
+    // 「Sampling size of the thumbnail. The default value is 1. Currently, the value
+    //   can only be 1.」—— 它在本 SDK 上不是降采样杠杆。写 0 或 2 只会让人误以为它在起作用。
+    // 真正起作用的是 desiredSize，而它必须**自己算**（见 frameDecodeSize）。
+    const budget: number = framePixelBudget(count);
+    const target: FrameSize = frameDecodeSize(info.width, info.height, budget);
+    frames = await handle.createPixelMapList(target);
+    if (frames === undefined || frames === null || frames.length === 0) {
+      // **没探到**：SDK 明说本函数"一次解出全部帧"，内存压力是它的头号成因。
+      // 这一支**不写负缓存**（D3 去掉的第二支）—— 下次滑回来重试一次。
+      return outcomeOf(undefined, ANIM_EMPTY_FRAMES, `原图=${info.width}x${info.height}`);
+    }
+    // ── 每帧时长 ──────────────────────────────────────────────────────────
+    // 拿不到不算失败：不传 frameDurations，交给 AnimationOptions.duration 语义。
+    let durations: number[] = [];
+    const dl: number[] = await handle.getDelayTimeList();
+    // 长度必须与帧数一致才用：SDK 说长度不一致时"按总时长摊"，那会让节奏整体变形，
+    // 不如干脆不传（交给默认节奏），至少不会越播越偏。
+    if (dl !== undefined && dl !== null && dl.length === frames.length) { durations = dl; }
+    const decoded: AnimDecoded<TFrame> = {
+      frames: frames,
+      durations: durations,
+      srcW: info.width,
+      srcH: info.height,
+      frameCount: count,
+      targetW: target.width,
+      targetH: target.height,
+      budget: budget
+    };
+    // ── 成功：所有权转移，finally 不再释放 ────────────────────────────────
+    frames = [];
+    return outcomeOf(decoded, ANIM_READY, '');
+  } catch (e) {
+    // 打不开（URI 失效/已删除）、不是支持的格式、**内存不足**、解码失败 —— 全部走静态退路。
+    // ⚠️ 这一支**不写负缓存**（D3 去掉的第一支，也是本缺陷的原始形态）：
+    //    这一支里占绝大多数的是**瞬时**失败（解码器 OOM / fd 耗尽 / 文件被占用），
+    //    把它记成"这张不是动图"就是一个**不会自愈的静默降级**。
+    //    代价是坏文件每次滑回来重试一次 —— 与 data/movingPhotoSource.ets 的开头同取舍。
+    return outcomeOf(undefined, ANIM_FAILED, errText(e));
+  } finally {
+    if (frames.length > 0) { releaseAll(frames); }
+    if (handle !== undefined) {
+      // close() 按契约不抛；真抛了也不改结论（释放失败不该盖掉真正的失败原因）。
+      try { await handle.close(); } catch (e) { /* 释放失败不改结论 */ }
+    }
+  }
+}
+
+/**
+ * 读照片的方向标签（EXIF/TIFF Orientation 的字符串形式，如 `"1"` / `"Top-left"`）。
+ * 读不到（没有该标签、或平台不支持）返回空串 —— 空串按"正常方向"处理，见下。
+ *
+ * 平台无关，所以它留在 core：单测能直接钉住"读不到 = 正常方向"这条取舍。
+ */
+export function normalizeOrientation(v: string | null | undefined): string {
+  if (v === undefined || v === null) { return ''; }
+  return v;
+}
+
+/**
+ * 这个方向标签是不是「无需摆正」。
+ *
+ * 判据刻意取**宽**（只有明确表示"要转/要翻"的值才算不正常）：
+ * 平台回传的形态不止一种（数字 `"1"`、也可能是 `"Top-left"` 这类文本），
+ * 与其穷举，不如只挡明确异常的几个 —— 判错的代价是"这张不播"（退回静态、方向正确），
+ * 比反过来（照播但躺下）轻得多。
+ *
+ * 空串 = 没有该标签 = 正常（绝大多数动图走这一支）。
+ */
+export function isDisplayOrientationNormal(orientation: string): boolean {
+  if (orientation === '') { return true; }
+  if (orientation === '1') { return true; }
+  if (orientation === 'Top-left' || orientation === 'TopLeft') { return true; }
+  return false;
+}
