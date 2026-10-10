@@ -3,6 +3,8 @@ import { fileIo } from '@kit.CoreFileKit';
 import { buffer } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { Decision, DecisionState } from '../core/queue';
+import { errText } from '../core/atomicText';
+import { writeTextAtomic } from './atomicWrite';
 
 const DOMAIN = 0x0000;
 const TAG = 'PhotoWall';
@@ -13,10 +15,8 @@ function decisionStorePath(filesDir: string): string {
   return `${filesDir}/decisions.json`;
 }
 
-// 原子写的临时文件：先写它，再 rename 覆盖真身。
-function tmpPathOf(filesDir: string): string {
-  return `${filesDir}/decisions.json.tmp`;
-}
+// 原子写的临时文件路径由 core/atomicText.ts 的 tmpPathOf 统一推导（真身路径 + ".tmp"），
+// 本文件不再自己拼 —— 原先那个私有 tmpPathOf 随本批迁移删掉了（拼错会 rename 到别的路径）。
 
 /** state 必须是 DecisionState 的成员；外部数据（持久化回放）不得静默通过（Ruling 18 同类要求） */
 function isValidState(s: string): boolean {
@@ -87,7 +87,11 @@ export class DecisionStore {
         hilog.warn(DOMAIN, TAG, '%{public}s', `决策文件中有 ${skipped} 条非法记录，已跳过`);
       }
     } catch (e) {
-      hilog.warn(DOMAIN, TAG, '%{public}s', '决策文件存在但读取/解析失败，已按空状态处理');
+      // 必须带 e：这一支的四种成因（JSON 语法错、编码错、短读越界、fileIo 报错）在日志里
+      // 长得一模一样，只有 e.message 能分开 —— 而它正是"用户已归档/收藏/上墙的决策为什么
+      // 全部复活了"的答案（本批修复的 D2 里，这就是短写事故的第二现场）。
+      hilog.warn(DOMAIN, TAG, '%{public}s',
+        `决策文件存在但读取/解析失败，已按空状态处理（所有照片会回到队列）: ${errText(e)}`);
     }
     return m;
   }
@@ -95,20 +99,18 @@ export class DecisionStore {
   saveAll(m: Map<string, Decision>): void {
     const arr: Decision[] = [];
     m.forEach((v: Decision) => { arr.push(v); });
-    const dir = this.ctx.filesDir;
-    const tmp = tmpPathOf(dir);
     try {
-      // 原子写：先写临时文件，再 rename 覆盖，避免写到一半失败留下半个文件
-      const file = fileIo.openSync(tmp,
-        fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
-      try {
-        fileIo.writeSync(file.fd, JSON.stringify(arr));
-      } finally {
-        fileIo.closeSync(file);
-      }
-      fileIo.renameSync(tmp, decisionStorePath(dir));
+      // 原子写：先写 .tmp → **校验短写（UTF-8 字节数）** → 相等才 rename 覆盖。
+      // 实现见 core/atomicText.ts（纯逻辑，有单测）+ data/atomicWrite.ets（平台适配）。
+      //
+      // 旧形态（本批修掉的 D2）：有 .tmp + rename，但 `fileIo.writeSync(...)` 的返回值被丢弃、
+      // **无条件 rename** —— 截断的 .tmp 覆盖掉一份好决策 → 下次 loadAll() 解析抛 →
+      // 空 Map → 用户已归档/收藏/上墙的决策全部"复活"。这不是"没保存"，是把好数据换成空的。
+      writeTextAtomic(decisionStorePath(this.ctx.filesDir), JSON.stringify(arr), '决策');
     } catch (e) {
-      hilog.warn(DOMAIN, TAG, '%{public}s', '决策落盘失败');
+      // 本文件的既有契约是「落盘失败只告警不抛错」（调用点在滑动/页面退出的收尾路径上，
+      // 抛出去没有任何人能接住）。日志**已经由 writeTextAtomic 打过**（含 want/got 与实际原因，
+      // 以及"盘上旧文件未改动"），所以这里只把异常降级为"不抛"，不再重复打一行。
     }
   }
 

@@ -12,6 +12,7 @@ import { buffer } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { ExifInfo } from '../core/exifParse';
 import { readExif } from './exifReader';
+import { writeTextAtomic } from './atomicWrite';
 
 const DOMAIN = 0x0000;
 const TAG = 'PhotoWall';
@@ -82,10 +83,8 @@ export function locationIndexPath(filesDir: string): string {
   return `${filesDir}/locations.json`;
 }
 
-// 原子写的临时文件：先写它，再 rename 覆盖真身。
-function tmpPathOf(filesDir: string): string {
-  return `${filesDir}/locations.json.tmp`;
-}
+// 原子写的 `.tmp` 路径由 core/atomicText.ts 的 tmpPathOf 统一推导（真身路径 + ".tmp"）：
+// 原先本文件私有的 tmpPathOf 随本批迁移删掉了（它拼出来的仍是 `locations.json.tmp`，逐字相同）。
 
 // 「正在构建」标记。**模块级**而非实例级：首页与（将来的）地图页各自 new 一个
 // LocationIndex，实例级标记挡不住这两个实例并发写同一个 locations.json.tmp。
@@ -233,40 +232,30 @@ export class LocationIndex {
   }
 
   /**
-   * 原子写：先写 `.tmp`，再 rename 覆盖；写到一半失败不会留下半个文件（内部只告警不抛错）。
+   * 原子写：先写 `.tmp`，**校验短写**，只有字节数完全相等才 rename 覆盖真身；
+   * 任何一步失败都不会留下半个文件（内部只告警不抛错）。
    *
-   * **rename 只在 writeSync 的返回值等于 payload 的 UTF-8 字节数时才执行**：
+   * 本方法原本是本仓库**唯一**写对的那个实现，这份注释就是全项目的范本：
    * 短写（POSIX 语义下 ENOSPC 等可以短计数而**不抛**）若不检出，截断的 `.tmp` 会覆盖掉
    * 一份好索引 → 下次 `load()` 的 JSON.parse 抛错 → 告警 → 返回空索引 → 地图墙空白，
    * 而用户会以为"照片都没 GPS"（正是读侧短读要防的那个最坏后果，换到了写侧）。
    *
-   * 失败时可能残留一个 `locations.json.tmp`：无害，下次 save 用 TRUNC 打开它即被覆盖。
+   * 本批把这段逻辑**原样**搬到了 core/atomicText.ts（纯逻辑，可单测）+
+   * data/atomicWrite.ets（平台适配），因为另外三个 store 要么没有 `.tmp`、要么不校验短写。
+   * 迁移后的行为逐项对齐（见报告"迁移矩阵"）：
+   *   · `.tmp` 路径：`locations.json.tmp`（tmpPathOf = 真身路径 + ".tmp"，与原来拼出来的完全一致）；
+   *   · 字节数比对：仍是 UTF-8 字节数（core 的 utf8ByteLength，并与 buffer.from(text).length 交叉校验）；
+   *   · rename 只在 `w === want` 时执行，且**在 close 之后**（close 负责把写缓冲刷下去）；
+   *   · 失败只告警不抛错（方法签名与调用方契约不变）。
+   * 唯二的可见差异（都写进报告）：告警文本多了"盘上旧文件未改动"六个字（前缀不变，仍可 grep）；
+   * 以及 `JSON.stringify` 从 openSync 之后移到了之前（对 LocationEntry[] 不可观测）。
    */
   save(list: LocationEntry[]): void {
-    const dir = this.ctx.filesDir;
-    const tmp = tmpPathOf(dir);
     try {
-      const file = fileIo.openSync(tmp,
-        fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
-      try {
-        const payload: string = JSON.stringify(list);
-        // 必须按**字节数**比对，不是 payload.length —— 非 ASCII 的 photoId 会让两者不等。
-        // 短写若不检出，截断的 .tmp 会覆盖掉好索引，下次 load() 解析失败 → 空索引 → 地图空白
-        //（读侧已修的同一个最坏后果，换到了写侧）。
-        const want: number = buffer.from(payload).length;
-        const w: number = fileIo.writeSync(file.fd, payload);
-        if (w !== want) {
-          // 抛进 catch：于是**不会**执行下面的 renameSync，盘上的好索引原封不动。
-          throw new Error(`writeSync 短写：期望 ${want} 字节，实际写入 ${w} 字节`);
-        }
-      } finally {
-        // 保持不动：无论上面抛不抛，句柄都在这里关掉（短写路径也要关，否则泄漏 fd）。
-        fileIo.closeSync(file);
-      }
-      // 只有上面**没抛**（即 w === want）才可能走到这一行 —— 这就是"绝不拿截断的 .tmp 覆盖好索引"。
-      fileIo.renameSync(tmp, locationIndexPath(dir));
+      writeTextAtomic(locationIndexPath(this.ctx.filesDir), JSON.stringify(list), '地点索引');
     } catch (e) {
-      hilog.warn(DOMAIN, TAG, '%{public}s', `地点索引落盘失败: ${errText(e)}`);
+      // 与 load() 的既有契约一致：只告警不抛错（本方法的调用方 PlaceStore.setManual 不接异常）。
+      // 日志已经由 writeTextAtomic 打过（含期望/实际字节数与"盘上旧文件未改动"），不重复打。
     }
   }
 

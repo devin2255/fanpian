@@ -3,6 +3,8 @@ import { fileIo } from '@kit.CoreFileKit';
 import { buffer } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SwipeSession } from '../core/session';
+import { errText } from '../core/atomicText';
+import { writeTextAtomic } from './atomicWrite';
 
 const DOMAIN = 0x0000;
 const TAG = 'PhotoWall';
@@ -84,10 +86,8 @@ function seenStorePath(filesDir: string): string {
   return `${filesDir}/seen.json`;
 }
 
-// 原子写的临时文件：先写它，再 rename 覆盖真身（与 decisionStore 同规矩）。
-function seenTmpPath(filesDir: string): string {
-  return `${filesDir}/seen.json.tmp`;
-}
+// 原子写的临时文件路径由 core/atomicText.ts 的 tmpPathOf 统一推导（真身路径 + ".tmp"），
+// 本文件不再自己拼（原先的私有 seenTmpPath 随本批迁移删掉了）。
 
 // ── 模块级缓存（不是实例字段，理由见 SessionStore 的类注释）────────────────────
 let seenLoaded: boolean = false;
@@ -218,7 +218,10 @@ function readState(path: string): SeenState {
     }
     return { entries: parseEntries(asFile.entries), prevQueue: parsePrevQueue(asFile.prevQueue) };
   } catch (e) {
-    hilog.warn(DOMAIN, TAG, '%{public}s', 'seen.json 存在但读取/解析失败，已按「全都没看过」处理');
+    // 必须带 e：这一支的成因（JSON 语法错、编码错、短读越界、fileIo 报错）在日志里长得
+    // 一模一样，只有 e.message 能分开 —— 而它正是"为什么全都没看过、上一批也丢了"的答案。
+    hilog.warn(DOMAIN, TAG, '%{public}s',
+      `seen.json 存在但读取/解析失败，已按「全都没看过」处理（抽样优先级会退化）: ${errText(e)}`);
   }
   return { entries: new Map<string, SeenEntry>(), prevQueue: [] };
 }
@@ -226,24 +229,23 @@ function readState(path: string): SeenState {
 /**
  * 全量原子落盘（v2 形状：entries + prevQueue 写进**同一个**文件）。失败只告警
  * （不抛：调用点在页面退出的收尾路径上）。
+ *
+ * 旧形态（本批修掉的 D2）：有 .tmp + rename，但 `fileIo.writeSync(...)` 的返回值被丢弃、
+ * **无条件 rename** —— 截断的 .tmp 覆盖掉一份好文件 → 解析抛 → 空 entries →
+ * "全都没看过" + 上一批丢失，抽样优先级一起退化。这个文件上限 5000 条 ≈ 480 KB，
+ * 是四个文件里最大、短写概率最高的一个，所以它是 D2 里最该修的那一个。
  */
 function writeEntries(filesDir: string, entries: Map<string, SeenEntry>, prevQueue: string[]): void {
   const arr: SeenEntry[] = [];
   entries.forEach((e: SeenEntry) => { arr.push(e); });
   const payload: SeenFile = { entries: arr, prevQueue: prevQueue };
-  const tmp = seenTmpPath(filesDir);
   try {
-    // 原子写：先写临时文件，再 rename 覆盖，避免写到一半失败留下半个文件
-    const file = fileIo.openSync(tmp,
-      fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
-    try {
-      fileIo.writeSync(file.fd, JSON.stringify(payload));
-    } finally {
-      fileIo.closeSync(file);
-    }
-    fileIo.renameSync(tmp, seenStorePath(filesDir));
+    // 原子写：先写 .tmp → 校验短写（UTF-8 字节数）→ 相等才 rename 覆盖。
+    // 实现见 core/atomicText.ts（纯逻辑，有单测）+ data/atomicWrite.ets（平台适配）。
+    writeTextAtomic(seenStorePath(filesDir), JSON.stringify(payload), '看过记录');
   } catch (e) {
-    hilog.warn(DOMAIN, TAG, '%{public}s', 'seen.json 落盘失败');
+    // 本函数的既有契约是「只告警不抛错」（调用点在页面退出的收尾路径上，抛了没人接）。
+    // 日志已由 writeTextAtomic 打过（含 want/got 与原因），这里只降级为"不抛"，不重复打。
   }
 }
 
