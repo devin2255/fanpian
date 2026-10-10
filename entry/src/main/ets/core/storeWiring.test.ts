@@ -9,7 +9,7 @@
 // 因此断言刻意保持**语义级**（有没有调用、有没有绕过），不比对格式/行号。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 function readEtc(rel: string): string {
@@ -35,15 +35,36 @@ function stripCommentLines(src: string): string {
   return out.join('\n');
 }
 
+/**
+ * 递归列出 `entry/src/main/ets/` 下所有 `.ets` 源文件。
+ * 与 `readEtc` 一样靠 `import.meta.url` 定位（`..` 即 ets/ 目录），跑在哪个 cwd 下都一样。
+ * 路径统一成 `/` 分隔，这样后缀判断与报错文本在 Windows 上也稳定。
+ */
+function listEtsSources(): string[] {
+  const root: string = fileURLToPath(new URL('..', import.meta.url)).split('\\').join('/');
+  const rel: string[] = readdirSync(root, { recursive: true }) as string[];
+  const out: string[] = [];
+  for (let i = 0; i < rel.length; i++) {
+    const p: string = rel[i].split('\\').join('/');
+    if (p.endsWith('.ets')) { out.push(root + p); }
+  }
+  return out;
+}
+
 // 本文件在 core/ 下，store 在 ../data/ 下；用 import.meta.url 定位，与运行时的工作目录无关。
+// 这五个是**全部**会做全量落盘的 store。
 const STORES: string[] = [
   '../data/claimStore.ets',
   '../data/decisionStore.ets',
   '../data/sessionStore.ets',
-  '../data/locationIndex.ets'
+  '../data/locationIndex.ets',
+  // metricsStore 原先**自己实现了一遍**正确的原子写（`.tmp` + 按字节校验 + 抛出即不 rename），
+  // 所以当时不在这个列表里。fix-batch-38 把它迁到 writeTextAtomic 后，五个 store 共用同一份实现
+  // —— 列表必须同步补上：这条守卫的作用正是"谁绕过了共用实现"，漏一个就等于留一个盲区。
+  '../data/metricsStore.ets'
 ];
 
-test('四个 store 都不再直接调 fileIo.writeSync（写盘只剩 writeTextAtomic 一条路）', () => {
+test('五个 store 都不再直接调 fileIo.writeSync（写盘只剩 writeTextAtomic 一条路）', () => {
   for (let i = 0; i < STORES.length; i++) {
     const src: string = stripCommentLines(readEtc(STORES[i]));
     assert.equal(src.indexOf('fileIo.writeSync(') < 0, true,
@@ -53,11 +74,34 @@ test('四个 store 都不再直接调 fileIo.writeSync（写盘只剩 writeTextA
   }
 });
 
-test('四个 store 都从 data/atomicWrite 引入 writeTextAtomic（不是各写一份）', () => {
+test('五个 store 都从 data/atomicWrite 引入 writeTextAtomic（不是各写一份）', () => {
   for (let i = 0; i < STORES.length; i++) {
     const src: string = readEtc(STORES[i]);
     assert.match(src, /import \{[^}]*writeTextAtomic[^}]*\} from '\.\/atomicWrite'/, `${STORES[i]} 的 import 不对`);
   }
+});
+
+// 上面两条只点名了那五个 store；这一条把**整个 ets/ 源码树**扫一遍，挡住"新加一个文件
+// 又写了一遍原子写"这条路（本缺陷族的成因就是"某一份漏改了"，而漏改的那一份当时不在任何名单里）。
+test('全仓库只有 data/atomicWrite.ets 一处 rename / 平台写盘（"原子写只有一份实现"的不变式）', () => {
+  const all: string[] = listEtsSources();
+  // 假绿判据：扫描本身失效时（readdir 的 recursive 行为变化、root 算错）必须**报红**，
+  // 而不是"一个文件都没扫到 → 循环一次没跑 → 通过"。
+  assert.equal(all.length > 10, true, `只扫到 ${all.length} 个 .ets 文件，扫描本身失效了`);
+  let sawAtomicWrite = false;
+  for (let i = 0; i < all.length; i++) {
+    const f: string = all[i];
+    if (f.endsWith('/data/atomicWrite.ets')) {
+      sawAtomicWrite = true;   // 唯一允许出现平台写盘的地方（由下一条用例逐项检查）
+      continue;
+    }
+    const src: string = stripCommentLines(readFileSync(f, 'utf-8'));
+    assert.equal(src.indexOf('renameSync') < 0, true,
+      `${f} 出现了 renameSync —— 原子写有第二份实现`);
+    assert.equal(src.indexOf('fileIo.writeSync(') < 0, true,
+      `${f} 出现了 fileIo.writeSync( —— 写盘绕过了 writeTextAtomic`);
+  }
+  assert.equal(sawAtomicWrite, true, '没扫到 data/atomicWrite.ets，说明排除规则与实际路径对不上');
 });
 
 test('data/atomicWrite.ets 把平台层与纯逻辑接起来（端口 + 字节数交叉校验 + 失败必抛）', () => {

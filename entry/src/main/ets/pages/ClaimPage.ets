@@ -27,6 +27,44 @@ import { DEFAULT_SESSION_SIZE, SESSION_SIZE_CHOICES, sampleSession, SwipeSession
 // 「预选同一张数」就静默失效了。存一份到 AppStorage 让它在任何重建路径下都成立。
 const SIZE_KEY = 'sessionSize';
 
+/**
+ * 把 catch 到的值渲染成一句**用户可见**的失败文案。
+ *
+ * 为什么需要它（本页修掉的缺陷）：原来两处 catch 都写
+ *     `const err = e as BusinessError; this.msg = `…失败：${err.code} ${err.message}`;`
+ * 而 **`code` 只有 BusinessError 才有**。本页的 catch 里冒出普通 `Error` 不是意外，是常态：
+ * `restock` 的 catch 包住 `claimStore.addBatch` → `data/atomicWrite.ets` 的 `writeTextAtomic`，
+ * 它失败时抛的是 `new Error('认领列表落盘失败: …')` —— 普通 Error，**没有 `code` 字段**。
+ * 于是用户看到的是
+ *     `选图失败：undefined 认领列表落盘失败: writeSync 短写：期望 N 字节，实际写入 M 字节`
+ * ——一个凭空出现的 "undefined" 顶在真正的原因前面，把唯一有用的信息挤到后面。
+ *
+ * 规则（本页所有面向用户的失败文案统一走这里）：
+ *   · **`message` 是主文案** —— 普通 Error 与 BusinessError 都有它，而且本项目所有失败原因
+ *     （含 `writeTextAtomic` 的 want/got）都写在 message 里；
+ *   · **`code` 只在确实是数字时**作为补充附在末尾。它不是"所有异常的必有字段"，
+ *     所以这里用 `typeof` 收窄（写法同 `data/claimStore.ets` 的 `typeof p.batchId === 'number'`），
+ *     保证"没有 code"这条路径下文案里**不会**出现 `undefined`。
+ *
+ * 与 `core/atomicText.ts` / `data/locationIndex.ets` / `data/metricsStore.ets` 的 `errText`
+ * 同一口径（`e instanceof Error` 优先，非 Error 退化成 `JSON.stringify`），
+ * 差别只在于这里要塞进 UI 文案而不是日志，所以要额外带上 code。
+ */
+function failureMsg(e: Object): string {
+  if (e instanceof Error) {
+    // BusinessError 是 Error 的子类（`interface BusinessError extends Error { code: number }`）。
+    // 注：本行只是把 `message`/`code` 读出来，**不改变任何控制流** ——
+    // 该中断的仍然中断、该回退的仍然回退，此处只负责把异常渲染成一句人话。
+    const err = e as BusinessError;
+    if (typeof err.code === 'number') {
+      return `${err.message}（错误码 ${err.code}）`;
+    }
+    return err.message;
+  }
+  // 非 Error（SDK 违约路径上什么都可能抛）：至少留下一行能搜的东西，而不是 "undefined"。
+  return JSON.stringify(e);
+}
+
 @Entry
 @Component
 struct ClaimPage {
@@ -207,8 +245,10 @@ struct ClaimPage {
       try {
         await router.pushUrl({ url: 'pages/SwipePage' });
       } catch (e) {
-        const err = e as BusinessError;
-        this.msg = `进入刷照片页失败：${err.code} ${err.message}`;
+        // router.pushUrl 抛的确实是 BusinessError（有 code，如 100002），渲染规则仍与选图失败一致：
+        // message 是主文案，code 只在确实存在时附在末尾（见 failureMsg 的说明）。
+        // 这里**只改文案构造**：原来是 `err.code err.message` 硬拼，其余控制流一字未动。
+        this.msg = `进入刷照片页失败：${failureMsg(e)}`;
       }
     } finally {
       // 在这里复位 = 覆盖上面**所有**出口（含空池 return 与任何异常）。
@@ -252,8 +292,13 @@ struct ClaimPage {
         ? `本次新增 ${added} 张，池子共 ${next.photos.length} 张`
         : `没有新增（这 ${next.photos.length} 张都在池子里了）`;
     } catch (e) {
-      const err = e as BusinessError;
-      this.msg = `选图失败：${err.code} ${err.message}`;
+      // 这个 catch 接住的是**两类**异常，写法必须同时容得下它们：
+      //   · `pickPhotos` 拒绝时抛的 BusinessError（选图器/权限，带 code）；
+      //   · `claimStore.addBatch` → `writeTextAtomic` 失败时抛的**普通 Error**
+      //     （无 code，原因写在 message 里，如"认领列表落盘失败: writeSync 短写：…"）。
+      // 旧写法 `${err.code} ${err.message}` 对后者会渲染成 `选图失败：undefined 认领列表落盘失败: …`。
+      // 只改文案构造：仍然把异常吞在这里（本方法没有"向上抛"的契约），msg 之外什么都不动。
+      this.msg = `选图失败：${failureMsg(e)}`;
     }
   }
 }
