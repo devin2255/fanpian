@@ -30,7 +30,20 @@
 //   ⚠️ 新增手势（Pinch / 双击 Tap）与既有 PanGesture（翻页）**共存**的仲裁是本批最大风险，
 //      详见 build() 里 `.gesture(...)` 上方的说明与 onActionUpdate 里的 fingerList 判据。
 //
-// ── 依赖方向（本批唯一新增的一条）──────────────────────────────────────────
+// ── 本批（task-21）新增的一件事：动态照片（拍摄的 Live Photo）长按播放 ──────────
+//   7. **动态照片**：用户要的是「刷卡时**默认不自动播**，**长按**才播，松手回静态」。
+//      实现只有一句话：**播放器组件默认不挂载，只在长按按住期间存在**
+//      —— `MovingPhotoView` 是重组件（要解码视频），常驻等于每张卡都替用户预先解码。
+//      识别判据（`PhotoSubtype.MOVING_PHOTO`）与"长按该不该起播"的闸门都在
+//      `core/movingPhoto.ts`（纯函数 + 单测），平台侧读取在 `data/movingPhotoSource.ets`。
+//      与动图（第 5 条）的关系：**两条路互不相干**（动图 = `AnimatedDrawableDescriptor`
+//      喂 `Image`；动态照片 = `MovingPhotoView`），一张照片最多走其中一条。
+//
+//   ⚠️ 本批最大的风险是**手势仲裁**：现在卡片上有四个手势（Pan / Pinch / 双击 Tap / 长按）。
+//      逐条分析写在长按手势那一节；核心结论是「长按**不写** gestureId/decidedId，
+//      不参与作废体系，它的作废由**换卡即卸载**承担」（与动图的 releaseAnim 同一机制）。
+//
+// ── 依赖方向（本批新增的两条）──────────────────────────────────────────────
 //   `ui/` → `data/animSource`。动图的帧数组是**平台资源**（`fileIo` + `Image` + 一个
 //   与 Image 组件 1:1 绑定的 `AnimatedDrawableDescriptor`），它必须由**渲染它的那个组件**
 //   持有：把它经 `@Prop` 从页面传下来会有两个问题 ——
@@ -39,13 +52,35 @@
 //     · 平移边界还需要这张照片的**固有像素尺寸**（`AnimFrames.srcW/srcH`），
 //       拆成"页面传 descriptor + 页面传宽高"就是同一个事实的两处表达，迟早漂移。
 //   所以：谁渲染，谁持有，谁释放。
+//
+//   `ui/` → `data/movingPhotoSource`（本批新增）。同一原则，但理由里多一条**必要性**：
+//   `MovingPhoto` **没有 release API**，"放手"只能靠**唯一的持有者**丢掉引用 ——
+//   而唯一需要它的地方就是 `MovingPhotoView({ movingPhoto: ... })`，也就是本文件。
+//   经 `@Prop` 传到本文件反而会多出一个持有者（唯一的持有者变成两个），
+//   那正好把"换卡即放手"这条唯一的释放路径弄坏。
+//   ⚠️ 与动图的一条**关键差别**：动态照片的对象是**异步**来的（探针：`requestMovingPhoto`
+//   回调），所以本文件多两个字段（`motionForId` / `motionSeq`）做"结果还算不算数"的判定，
+//   而这部分在 animSource 里是靠"解帧比换卡慢"这个事实自然覆盖的（那里也有 seq）。
+//   另：本文件**没有**给动态数据做"页面级"的预取或缓存 —— 缓存所有权会立刻破坏上面那条唯一性。
+import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+// `MovingPhotoView` 是 ArkUI 组件，但它由 **MediaLibraryKit** 导出（不在 component/ 下），
+// 所以必须显式 import —— 与探针逐字同款（探针报告 §13 的 SDK 原文）。
+import { MovingPhotoView, MovingPhotoViewController } from '@kit.MediaLibraryKit';
 import { AnimFrames, loadAnimFrames } from '../data/animSource';
+import { MotionHandle, loadMotion } from '../data/movingPhotoSource';
 import { clampScale, isZoomed, resolveContentSize, clampOffset, SCALE_MIN, ZoomSize, PanOffset } from '../core/zoom';
+import { MotionStartGate, shouldStartMotionPlayback, MOTION_LONG_PRESS_MS } from '../core/movingPhoto';
 
 // 与 pages/SwipePage.ets 同款口径（DOMAIN / TAG 在本项目里是全局一致的）。
 const DOMAIN = 0x0000;
 const TAG = 'PhotoWall';
+
+/** 把 catch 到的值转成一行可打印文本（与 data/animSource.ets 的 errText 同款口径）。 */
+function errText(e: Object): string {
+  if (e instanceof Error) { return e.message; }
+  return JSON.stringify(e);
+}
 
 export const NAV_VELOCITY = 800;         // vp/s：轻轻一甩就翻页
 export const NAV_DISTANCE_RATIO = 0.28;  // 卡高比例：拖到位也翻页
@@ -54,6 +89,15 @@ export const SPRING_BACK_MS = 150;
 // 双击复位缩放的动画时长。与 springBack 的 150ms 同一量级：短到"立刻到位"、
 // 长到能让人看出"这是复位而不是跳变"。刻意**不**导出：它不是任何判定的依据，纯观感。
 const ZOOM_RESET_MS = 150;
+
+// 长按播放期间的卡片描边宽度（vp）。它是**按压反馈**的一半（另一半是角标变成「播放中」）。
+// 刻意用描边而不是"卡片轻微缩放"（任务里给的另一个例子）：上一批刚刚把
+// `.scale()`/`.offset()`/`clip` 这套渲染管线在真机上验过一遍，再往同一个节点上叠一个
+// render 变换，会让"照片的缩放"与"卡片的缩放"变成两个都要读文档才能确定顺序的变换
+// （见 photoNode 里那段 offset 与 scale 分属布局/渲染两层、顺序是事实而不是约定的说明）。
+// 描边是**布局内**的属性，不动任何变换，与上一批的成果零交互。
+// 2vp 的依据：卡片宽度的 0.5% 左右，在 3x 屏上是 6px —— "看得见但不抢戏"。
+const MOTION_PRESS_BORDER = 2;
 
 // 队列里的一张照片。定义在这里并导出：CardStack 自己要用它，
 // SwipePage 也从这里 import（不要各自定义一份）。
@@ -218,6 +262,39 @@ export struct CardStack {
   // 更可靠地说明"这是缩放"，作为 fingerList 判据的补充（第三根手指抬起等瞬时形态）。
   private pinching: boolean = false;
 
+  // ── 动态照片（本批新增）──────────────────────────────────────────────────
+  // 「这张的动态照片对象已经就绪」——**角标与长按闸门用的是同一个布尔**。
+  // 刻意不拆成两个（"它是不是动态照片"与"对象取到了没"）：拆开就会出现
+  // "角标亮着但长按没反应"的窗口，用户没有任何办法理解那是什么意思。
+  // 代价（写进报告）：角标比卡片晚一点点出现（后台取对象的耗时），
+  // 好处是"角标可见" ⟺ "长按一定有效"这条契约是**结构**保证的。
+  @State motionReady: boolean = false;
+  // 「长按按住期间」——它同时是两件事：播放器组件的挂载开关、角标文案的开关。
+  // **默认 false**：这就是"刷卡时动态照片默认不自动播"的全部实现（组件根本不挂载）。
+  @State motionOn: boolean = false;
+  // 动态照片对象的**唯一持有者**（与 animOwner 同一角色）。释放出口见 releaseMotion()。
+  private motionOwner: MotionHandle | undefined = undefined;
+  // 「哪一张的结论已经拿到（含"不是动态照片"）」+「正在取」：一个字段两用，与 animForId 同款。
+  private motionForId: string = '';
+  // 取对象是异步的，换卡比它快时旧结果必须被丢弃 —— 与 animSeq 同款的递增序号凭据。
+  private motionSeq: number = 0;
+  // 播放控制器：**每次起播都新建一个**（探针就是这么做的：每个 trial 全新的
+  // MovingPhotoViewController + 全新的组件实例）。复用一个控制器跨多次挂载/卸载会引入
+  // "控制器还指着上一棵已销毁的节点吗"这种框架内部行为，不值得赌。
+  private motionCtl: MovingPhotoViewController = new MovingPhotoViewController();
+  // 「本次 Pan 手势期间起过一次长按播放」——settle() 用它决定**要不要记一次回弹**。
+  // 生命周期与 gestureIsZoom 完全同款（写入：长按识别时置真 + Pan 的 update 里补置；
+  // 清除：Pan 的 onActionStart / onActionEnd（在 settle 之后）/ onActionCancel，以及换卡复位）。
+  // 三个写入点都是"置真"、唯一的清除者是**Pan 自己** —— 这样"手指抬起时两个手势的
+  // 回调谁先到"就不影响 settle() 的判据（长按的 onActionEnd 不清它，见 onMotionRelease）。
+  private gestureHadMotion: boolean = false;
+  // 动态照片的读取需要 Context（`getPhotoAccessHelper(ctx)` / `requestMovingPhoto(ctx, …)`）。
+  // 取法与 pages/SwipePage.ets 逐字一致（`getContext(this)`）：它带一个 deprecated 告警，
+  // 但那正是本工程**已经验过**的写法；换成 `getUIContext().getHostContext()` 会引入
+  // 一个 `Context | undefined` 的新形态，而这条路径上没有一处能容下 undefined
+  //（`loadMotion` 的入参是确定的 Context）。
+  private ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+
   // ── 几何：三个尺寸，各来自不同的事实（都只在回调里读，不需要 @State）──────
   // 卡片盒子尺寸（vp）= 照片要做 Contain 的那个"框"，由 onAreaChange 量到。
   private boxW: number = 0;
@@ -255,6 +332,9 @@ export struct CardStack {
     // 第一张卡：`@Watch` 在 @Prop **初始化时不触发**（SDK 明说），所以首张必须在这里主动起装载。
     this.curItemId = this.item.photoId;
     this.ensureAnimForCurrent();
+    // 动态照片与动图**并行**起装载，两者互不影响（一张照片最多是其中一种；
+    // 判定成本不同：动图是后缀白名单 + 解帧，动态照片是一次查库 + 一次对象请求）。
+    this.ensureMotionForCurrent();
   }
 
   // 组件卸载（用户 210ms 内返回上一页）后不能再回调 onDecide。
@@ -264,6 +344,8 @@ export struct CardStack {
     this.endSpringWindow();
     // 卸载 = 这张卡永远消失：动图帧必须在这里放手（见 releaseAnim 的三条出口）。
     this.releaseAnim();
+    // 动态照片同理：先停播（组件随后被销毁）再放开句柄（见 releaseMotion 的三条出口）。
+    this.resetMotion();
   }
 
   /**
@@ -283,9 +365,14 @@ export struct CardStack {
     if (id === this.curItemId) { return; }   // 同卡重渲染：一概不动（理由见上第 1 条）
     this.curItemId = id;
     this.releaseAnim();
+    // 动态照片：**先停播再放手**（顺序有意义 —— 播放器组件还挂着的时候让平台先停，
+    // 而不是把"停止"这件事交给组件销毁时的析构）。这也正是"换卡 = 长按播放的作废时刻"：
+    // 长按不写 decidedId/gestureId（见长按手势那一节），它的作废只能靠这条结构性出口。
+    this.resetMotion();
     this.resetZoom();
     this.clearPhotoGeometry();
     this.ensureAnimForCurrent();
+    this.ensureMotionForCurrent();
   }
 
   /** 把「不随 item 变化而自动重置」的缩放/平移状态归位到 1× 居中（平赋值，不做动画）。 */
@@ -297,6 +384,10 @@ export struct CardStack {
     // 留着 gestureIsZoom = true 会让新卡上的第一次拖动被静默忽略。
     this.gestureIsZoom = false;
     this.pinching = false;
+    // 本批新增：与 gestureIsZoom 同一条理由（换卡后遗留的"上次手势的定性"必须清掉）。
+    // 它的读取者是 settle()：残留 true 只会让**下一张卡**的第一次回弹不上报（指标偏低），
+    // 不会锁死任何手势 —— 但既然是同一个事实（"上次手势起过长按播放"），就一起清。
+    this.gestureHadMotion = false;
   }
 
   /**
@@ -428,6 +519,187 @@ export struct CardStack {
     return this.item.thumbUri;
   }
 
+  // ── 动态照片：装载 / 播放 / 释放（本批新增）──────────────────────────────────
+
+  /**
+   * 为**当前这张**取动态照片对象（后台进行，**不阻塞刷卡**）。
+   *
+   * 三道闸都在 `data/movingPhotoSource.ets` 里（负缓存 → 查库 + subtype 判据 → 请求对象），
+   * 这里只负责"触发一次"与"结果回来时还算不算数"。去重靠 `motionForId`：
+   * 它同时表示"正在取"与"已经有结论（含'不是动态照片'）"，所以同一张卡最多探一次。
+   */
+  private ensureMotionForCurrent(): void {
+    const id: string = this.item.photoId;
+    if (id === '') { return; }
+    if (this.motionForId === id) { return; }
+    this.releaseMotion();
+    this.motionForId = id;
+    this.motionSeq = this.motionSeq + 1;
+    const seq: number = this.motionSeq;
+    loadMotion(this.ctx, id)
+      .then((h: MotionHandle | undefined): void => { this.onMotionLoaded(id, seq, h); })
+      .catch((): void => {
+        // loadMotion 内部已吞掉全部异常（任何失败都返回 undefined）——
+        // 这里只是不让一个意外的 rejection 变成未处理异常。失败退路是"没有角标"，不是白屏。
+      });
+  }
+
+  /**
+   * 取对象的异步结果回来。**第一件事是判定它还算不算数** —— 用户完全可能在这几百毫秒里
+   * 已经翻走（这正是"不阻塞刷卡"的必然代价）。不算数的那一份必须**当场放手**。
+   */
+  private onMotionLoaded(id: string, seq: number, h: MotionHandle | undefined): void {
+    if (seq !== this.motionSeq || this.motionForId !== id || this.item.photoId !== id) {
+      if (h !== undefined) {
+        hilog.info(DOMAIN, TAG, '%{public}s',
+          `动态照片结果已过期，直接放手: ${id}（本次真正放手=${h.release()}）`);
+      }
+      return;
+    }
+    if (h === undefined) {
+      // 不是动态照片 / 查不到 / 请求失败：保持"没有角标、长按无所作为"。
+      // motionForId 已经是这张，所以不会再重复探测（这是"失败要优雅"的全部代价：
+      // 一张像静态图一样显示、长按没反应的卡 —— 与真正的静态照片观感完全一致）。
+      return;
+    }
+    // 同一张卡理论上不会再有一个 owner（motionForId 去重），但换卡路径可能留下旧的：
+    // 释放掉再装，保证"最多只有一个 MotionHandle 活着"这条不变量。
+    if (this.motionOwner !== undefined) {
+      hilog.info(DOMAIN, TAG, '%{public}s',
+        `替换旧的动态照片句柄（真正放手=${this.motionOwner.release()}）: ${id}`);
+      this.motionOwner = undefined;
+    }
+    this.motionOwner = h;
+    this.motionReady = true;
+    // 真机核验"角标什么时候亮"的唯一直接证据：这行日志必须早于这张卡的第一次长按。
+    hilog.info(DOMAIN, TAG, '%{public}s', `动态照片角标点亮: ${id}`);
+  }
+
+  /**
+   * 放手当前动态照片句柄。**这是 `MotionHandle` 唯一的释放出口**，三个调用点穷举了所有
+   * "这张卡不再需要它"的时刻：
+   *   1) `onItemChanged`（换卡，经 resetMotion）；
+   *   2) `aboutToDisappear`（页面卸载，经 resetMotion）；
+   *   3) `onMotionLoaded` 的过期分支（结果回来时这张卡已经走了）。
+   *
+   * 与 `releaseAnim` 的差别只有一点、但必须记住：**`MovingPhoto` 没有 `release()` API**
+   * （SDK 只给了 `requestContent` / `getUri`），所以这里的"放手"= **唯一的持有者丢掉引用**
+   *（详见 data/movingPhotoSource.ets 的 MotionHandle）。正因如此"谁持有"必须唯一 ——
+   * 这也是本文件刻意不把句柄经 `@Prop` 传给别的组件的理由（多一个持有者就毁掉这条路径）。
+   */
+  private releaseMotion(): void {
+    // 先让在途的取对象结果作废（它回来时会自己放手自己那一份），再放手当前这份。
+    this.motionSeq = this.motionSeq + 1;
+    this.motionForId = '';
+    if (this.motionOwner !== undefined) {
+      const ok: boolean = this.motionOwner.release();
+      this.motionOwner = undefined;
+      // 真机核验"换卡有没有放手"的唯一直接证据（与"换卡释放动图帧"同一手法）：
+      // 每换走一张**动态照片**就该看到一行，且真正放手=true。
+      hilog.info(DOMAIN, TAG, '%{public}s', `换卡放手动态照片句柄: 真正放手=${ok}`);
+    }
+    this.motionReady = false;
+  }
+
+  /**
+   * 「这张卡到此为止」：**停播 + 放手**，两条必须成对。只停播不放手会漏一个句柄；
+   * 只放手不停播会让一个已经没人持有的对象继续被组件渲染（那是最难查的一种状态）。
+   * 换卡与页面卸载都只调它，不分别调两半 —— 这样"成对"是结构保证，不靠调用点自觉。
+   */
+  private resetMotion(): void {
+    this.stopMotionPlayback();
+    this.releaseMotion();
+  }
+
+  /**
+   * 停止播放 = **卸载播放器组件**，回到静态图。**幂等**：松手、动效播完、换卡、卸载
+   * 四条路径都会调它，重复调用必须无害（`motionOn` 已经是 false 就直接返回）。
+   * 顺序：先让平台停（此刻节点还活着），再改 @State 触发卸载 —— 反过来就是
+   * "节点已经销毁了再去指挥它的控制器"。
+   */
+  private stopMotionPlayback(): void {
+    if (!this.motionOn) { return; }
+    try {
+      this.motionCtl.stopPlayback();
+    } catch (e) {
+      // 控制器还没挂上（组件刚挂载就被松手）等情况会抛。播放必须停，
+      // 但**不能**因为停不下来就不卸载 —— 卸载才是"回到静态图"的唯一手段。
+      hilog.warn(DOMAIN, TAG, '%{public}s', `stopPlayback 失败（仍然卸载播放器）: ${errText(e)}`);
+    }
+    this.motionOn = false;
+    hilog.info(DOMAIN, TAG, '%{public}s', '动态照片：停止播放 → 回到静态图');
+  }
+
+  /**
+   * 长按识别成功（按住 `MOTION_LONG_PRESS_MS`）→ 起播。
+   *
+   * 六个判据全在纯函数 `core/movingPhoto.ts::shouldStartMotionPlayback` 里（有单测），
+   * 这里只负责把"当前状态"读成它的入参。这么拆的意义是：判据能被穷举，
+   * 而它们的**取值来源**集中在这一处、一眼看得全（漏一个来源在真机上就是"长按没反应"）。
+   */
+  private onMotionPress(e: GestureEvent): void {
+    // 读不到 fingerList 时按 0（= 未知）传下去：闸门对"未知"是**放行**的 ——
+    // "平台没报手指数"不该让整个功能失灵（见 core/movingPhoto.ts 的取舍说明）。
+    let fingers: number = 0;
+    if (e !== undefined && e.fingerList !== undefined) { fingers = e.fingerList.length; }
+    const g: MotionStartGate = {
+      movingPhotoReady: this.motionOwner !== undefined && !this.motionOwner.isReleased(),
+      alreadyPlaying: this.motionOn,
+      cardAnimating: this.animating,
+      gestureVoided: this.isGestureVoided(),
+      zoomInProgress: this.pinching || this.gestureIsZoom,
+      fingers: fingers
+    };
+    if (!shouldStartMotionPlayback(g)) { return; }
+    // 记下"本次手势期间起过播放"：settle() 据此**不记回弹**（按住看动态不是一次滑动尝试）。
+    this.gestureHadMotion = true;
+    // 每次都新建控制器：与探针一致（每个 trial 全新的组件实例 + 全新的控制器）。
+    this.motionCtl = new MovingPhotoViewController();
+    // 挂载播放器。`autoPlay(true)` 会在资源就绪后自己起播 —— 这就是"长按 → 播放动态"。
+    this.motionOn = true;
+    hilog.info(DOMAIN, TAG, '%{public}s',
+      `动态照片：长按起播（fingers=${fingers} 缩放=${this.zoomScale}）: ${this.item.photoId}`);
+  }
+
+  /**
+   * 松手 / 长按被取消 → 回到静态图。
+   *
+   * ⚠️ 它**刻意不清** `gestureHadMotion`，理由是一个在真机上无法保证的事实：
+   * "手指抬起时 LongPress 的 onActionEnd 与 Pan 的 onActionEnd 谁先到"没有任何文档保证。
+   * 若在这里清，先到的那个就会把标记清掉，于是 settle() 把一次"按住看动态"记成一次回弹
+   *（回弹率被这类操作污染）。把清除权交给 Pan 自己（且都在 settle() **之后**），
+   * 两种回调顺序就得到同一个结果 —— 这是"用一个可枚举的所有者换掉一个不确定的顺序"。
+   */
+  private onMotionRelease(): void {
+    this.stopMotionPlayback();
+  }
+
+  /**
+   * 一次动效**播完** → 主动回到静态图（不等松手）。
+   *
+   * 这是本批明确的产品裁决，两个候选都写在这里备查：
+   *   (a) 播完停在末帧、等用户松手（`repeatPlay(false)` + 什么都不做）——
+   *       用户按住 5s 而片子只有 2.4s 时，后 2.6s 是一张**冻住的画面**：
+   *       那读起来像"卡住了"，而不像"播完了"；
+   *   (b) 播完即回静态（**本实现**）—— "长按 = 播一次动态"变成一个**有终点**的动作，
+   *       而且终点由平台的 `onFinish` 明确给出（不靠计时器猜时长）。
+   *       想再看一次的人松手再按，代价是一次按压，收益是没有任何"冻住"的歧义。
+   * 想改成 (a)：删掉本方法体里那一行 `stopMotionPlayback()` 即可（日志保留）。
+   * ⚠️ 边界：`onFinish` 若在某些设备上不触发，就一直停在末帧 —— 那时用户松手照样回静态
+   *（松手路径与它无关），所以这条边界不会造成"停在动态画面上下不来"。
+   */
+  private onMotionFinished(): void {
+    hilog.info(DOMAIN, TAG, '%{public}s', `动态照片：一次动效播完 → 回静态图: ${this.item.photoId}`);
+    this.stopMotionPlayback();
+  }
+
+  /** 播放器回调的统一日志出口：真机排障靠的是"**哪一步没发生**"（onError 没有错误码可打）。 */
+  private motionCb(name: string): void {
+    hilog.info(DOMAIN, TAG, '%{public}s',
+      `MovingPhotoView.${name}（按住中=${this.motionOn}）: ${this.item.photoId}`);
+  }
+
+
   /**
    * `onComplete`：静态图加载完成时框架报的尺寸。
    * 三个输入各有用处：固有尺寸（px，算 Contain）与**实际绘制尺寸**（算平移边界，
@@ -537,6 +809,13 @@ export struct CardStack {
       .objectFit(ImageFit.Contain)
       .scale({ x: this.zoomScale, y: this.zoomScale })
       .offset({ x: this.panX, y: this.panY })
+      // 本批新增：把"长按被平台拖拽抢走"这条风险显式关掉。
+      // 两个 SDK 说法在这里是**冲突**的，所以不赌任何一边：
+      //   · `gesture.d.ts:1403-1411` 把 Image 列进"默认支持拖拽"的组件，并规定
+      //     长按 ≥500ms 时"拖拽优先于长按"（我们的 duration 正是 500，正好落在边界上）；
+      //   · `common.d.ts:20759` 的 `draggable` 却说"By default, the component is not draggable"。
+      // 写死 false 的代价是一次属性调用，收益是这条冲突从"要赌"变成"不可能发生"。
+      .draggable(false)
       // 静态图加载完成 → 拿到固有尺寸与实际绘制尺寸（动图**不走**这里，SDK 明说不触发）。
       // 只读四个数，不写任何与手势/决策有关的状态，所以不会与手势回调争状态。
       .onComplete((event) => {
@@ -544,6 +823,85 @@ export struct CardStack {
         this.onPhotoDrawn(event.width, event.height, event.contentWidth, event.contentHeight);
       })
   }
+
+  /**
+   * 动态照片的**播放器节点**（只在长按按住期间存在 —— 这就是"默认不自动播"的落点）。
+   *
+   * 三样东西必须与 `photoNode()` **逐字相同**：盒子尺寸（100%×100%）、`objectFit`、
+   * 以及那个几何变换（`.scale()` + `.offset()`）。任何一条不同，长按的那一瞬间就会
+   * 看到"照片跳一下"：前两条决定"照片画在框里的哪儿"，第三条决定"框被搬到哪儿、放大几倍"。
+   *
+   * ⚠️ 这三行是同一个事实的**两处表达**（`Image` 与 `MovingPhotoView` 是两个节点，
+   * 没法共用一个 @Builder），所以它们最容易漂移 —— 改动其中一处必须同时改另一处。
+   * 想消掉这份重复只有一条路：把变换提到公共父节点（卡片 Stack）上。
+   * 本批**不做**：上一批刚在真机上验过那套管线（offset 属布局、scale 属渲染、
+   * 父节点还有 `clip(true)` 与 `translate`），把变换搬上去等于重新洗一遍顺序假设，
+   * 而收益只是省三行注释。
+   *
+   * `objectFit(ImageFit.Contain)`：与静态图一致。上一批的 `Cover→Contain` 是产品决策
+   *（"看到的就是全图"），播放器必须跟着它 —— 否则"长按看动态"看到的会是**被裁掉**的画面，
+   * 那比不播更让人困惑。
+   */
+  @Builder
+  motionNode() {
+    // 非空判据必须写在**这里**：@Builder 是独立的函数体，调用点那个 `if (this.motionOn)`
+    // 的判据不会流进来（`this.motionOwner` 的静态类型仍是 `MotionHandle | undefined`）。
+    // 用一个 if 包住而不是靠断言（`as`）：断言在"句柄已被换卡释放"那条路径上会静默渲染
+    // 一个已放弃的对象，而 if 只会什么都不画（退化成静态图，正是我们要的退路）。
+    if (this.motionOwner !== undefined) {
+      MovingPhotoView({ movingPhoto: this.motionOwner.movingPhoto, controller: this.motionCtl })
+        // 有声音：动效的一半意义在声音（用户要的是"拍摄的动态图"）。
+        // 已知未验：系统静音开关打开时是否仍出声由平台决定（见报告 §8）。
+        .muted(false)
+        // autoPlay(true)：**"长按即播"的唯一驱动**。它之所以不违反"默认不自动播"，
+        // 是因为这个节点只在按住期间存在 —— "自动播放"的作用域被限制在"用户正按着"的
+        // 那一段时间里，默认状态下根本没有这个节点（也没有解码）。
+        // 不用 `controller.startPlayback()` 手动起播：那要额外依赖一个"就绪"回调，
+        // 多一条"回调没来就永远不播"的失败路径，而 autoPlay 是探针实测过的形态之一。
+        .autoPlay(true)
+        // repeatPlay(false)：见 onMotionFinished 的产品裁决（播完即回静态，不留冻帧）。
+        .repeatPlay(false)
+        .objectFit(ImageFit.Contain)
+        .width('100%').height('100%')
+        .scale({ x: this.zoomScale, y: this.zoomScale })
+        .offset({ x: this.panX, y: this.panY })
+        // 与 photoNode 同款：把"长按被平台拖拽抢走"这条风险显式关掉（理由见那里）。
+        .draggable(false)
+        // 七个回调全部只做两件事：打一行日志、必要时回静态。
+        // ⚠️ `onError` 的签名是 `() => void`（**拿不到错误码**，SDK 限制，见
+        // `@ohos.multimedia.movingphotoview.d.ts:92/190`），所以真机排障唯一的线索是
+        // "**哪一步没有发生**"（onPrepared 没来？onStart 没来？）—— 这正是七个都打日志的原因。
+        .onComplete(() => { this.motionCb('onComplete'); })
+        .onPrepared(() => { this.motionCb('onPrepared'); })
+        .onStart(() => { this.motionCb('onStart'); })
+        .onPause(() => { this.motionCb('onPause'); })
+        .onStop(() => { this.motionCb('onStop'); })
+        .onFinish(() => { this.motionCb('onFinish'); this.onMotionFinished(); })
+        .onError(() => { this.motionCb('onError'); })
+    }
+  }
+
+  /**
+   * 「动态」角标：**默认状态下唯一能说明"这张可以长按"的东西**。
+   *
+   * 位置 = 卡片右上角（卡片 Stack 的 `alignContent(TopEnd)` + 自身 margin）。
+   * 两个状态共用**同一个节点**（只改文案与底色），所以"按住 → 播放中"的变化是原地发生的，
+   * 不会因为状态切换而抖动位置。
+   * 「播放中」那一版就是本批的按压反馈：它在**按下当帧**就出现，而画面真正动起来还要等
+   * 组件准备（几百毫秒）—— 反馈与真实播放解耦，用户不会以为"按了没反应"。
+   * 尺寸：字号 11 + 上下 padding 3 ≈ 20vp 高，占卡片高度的 5% 左右 —— 小而清楚。
+   */
+  @Builder
+  motionBadge() {
+    Text(this.motionOn ? '● 播放中' : '▶ 动态')
+      .fontSize(11)
+      .fontColor('#FFFFFF')
+      .padding({ left: 7, right: 7, top: 3, bottom: 3 })
+      .backgroundColor(this.motionOn ? '#1F6FEB' : 'rgba(0,0,0,0.55)')
+      .borderRadius(10)
+      .margin({ top: 8, right: 8 })
+  }
+
 
   /**
    * 双击 = 复位到 1× 居中。
@@ -578,11 +936,36 @@ export struct CardStack {
       // 卡片本体：照片 + 翻页/缩放/平移手势 + 位移。按钮**不在**这里 —— 按钮在卡片外侧下方一行，
       // 既完全不遮挡照片主体，也让手势命中区与按钮命中区互不重叠
       //（按钮不是本节点的子节点 → 点按钮不会同时起一个 PanGesture，手势仲裁最简单）。
-      Stack() {
+      Stack({ alignContent: Alignment.TopEnd }) {
         // 照片本体抽成 @Builder：它有**两个源**（静态 URI / 动图 descriptor），
         // 但除源以外的每一个属性都必须完全一致 —— 分两份写迟早漂移，
         // 而漂移不会报错，只会让动图和静态图的观感不同（例如一个有缩放一个没有）。
         this.photoNode()
+        // ── 动态照片的播放器（本批新增）────────────────────────────────────
+        // **只在长按按住期间挂载**，这就是"刷卡时动态照片默认不自动播"的全部实现：
+        // 默认状态下这个节点不存在 —— 不解码、不占内存、不会有任何一帧视频被读出来。
+        // 代价（写进报告，不藏）：**首次播放有准备延迟**（组件创建 + 资源就绪），
+        // 因为预热过的只有数据（`MotionHandle`，后台已取好），不是播放器。
+        // 三个候选的取舍：
+        //   (a) 常驻播放器 + `autoPlay(false)`：零延迟，但每张动态照片都要长期占着
+        //       解码器/视频轨，几十张就是几十份 —— 任务明确要求"不要常驻"；
+        //   (b) 提前一张预挂载（下一张就建好节点）：延迟最低，但"下一张是不是动态照片"
+        //       要先探到（异步）、且要在换卡时序里插一脚 —— 收益是几百毫秒，
+        //       代价是一条新的换卡竞态路径，本批不引入；
+        //   (c) **长按才挂载、松手就卸载（本实现）** —— 延迟由"按住"这个动作自然吸收
+        //       （用户本来就要按住 500ms），配合"按下当帧角标就变「播放中」"的即时反馈，
+        //       观感上不会像失灵。真机若发现延迟明显，再走 (b)。
+        // 它在 `photoNode()` **之后**：同尺寸同变换地盖在静态图上，
+        // 于是"静态 → 动态"的切换不会有任何位移或闪烁（底下的静态图始终在）。
+        // 条件只看 `motionOn`：句柄是否为空由 motionNode() 自己守（@Builder 是独立函数体，
+        // 调用点的非空判据**不会**流进去 —— 那里再写一次 `motionOwner !== undefined`）。
+        if (this.motionOn) {
+          this.motionNode()
+        }
+        // 角标必须是**最后一个**子节点（在播放器之上），否则播放器会盖住它。
+        if (this.motionReady || this.motionOn) {
+          this.motionBadge()
+        }
       }
       // 62% 与 SwipePage.ets 的 CARD_HEIGHT_RATIO 是同一个事实的两处表达：
       // 改一处必须改另一处。父组件量到 Stack 高之后乘 0.62 作为 cardHeight 传进来，
@@ -590,6 +973,14 @@ export struct CardStack {
       .width('100%').height('62%')
       .backgroundColor('#EEE')
       .borderRadius(16)
+      // 本批新增的按压反馈（另一半是角标变「播放中」）：长按起播期间给卡片一圈细描边。
+      // 为什么是描边而不是"卡片轻微缩放"（任务里给的另一个例子）：
+      // 描边是**布局内**的属性，不引入任何新的渲染变换；而卡片上已经有照片自身的
+      // `.scale()`/`.offset()`（上一批验过的管线），再叠一个"卡片的 scale"会让
+      // 两个变换的相对顺序变成需要读文档才能确定的东西 —— 那是本批最不值得冒的风险。
+      // 宽度为 0 时描边不画（默认态与改动前逐像素一致）。
+      .borderWidth(this.motionOn ? MOTION_PRESS_BORDER : 0)
+      .borderColor('#1F6FEB')
       // **放大/平移后必须裁掉溢出**：Contain + 4× 的照片会画到卡片之外，
       // 不裁的话照片会盖住卡片下方的按钮行（那是"看不见的按钮还能点"的形态）。
       // 圆角是否被一并裁掉由平台决定（真机需看一眼），所以照片自身**不再**设 borderRadius：
@@ -649,9 +1040,25 @@ export struct CardStack {
               this.gestureIsZoom = false;
               this.panStartX = this.panX;
               this.panStartY = this.panY;
+              // 本批新增：新手势开始 = 上一次"长按播放"的定性到此为止。
+              // 与 gestureIsZoom 同一位置、同一理由（它们都是"本次 Pan 手势的性质"），
+              // 但清除时机**晚一步**：长按播放的那个标记要活到本项目手势的**结束**
+              //（settle() 在结束时读它），所以它的清除在 onActionEnd/onActionCancel 里。
+              // 这里清的是"上上次手势残留下来的"那一份 —— 没有它，一次"按住看完就松手"
+              //（Pan 从未识别）会把标记留到下一张卡上，吞掉下一张的一次真实回弹上报。
+              this.gestureHadMotion = false;
             })
             .onActionUpdate((e: GestureEvent) => {
               if (this.animating) { return; }
+              // 本批新增（**只置标记、不挡任何东西**）：长按播放正在进行时，本次手势里
+              // 已经混进了一次"按住看动态"。用户在长按期间的手指抖动（>5vp 就会让 Pan
+              // 识别成功）与"想滑动"在数据上完全一样，所以这一次抬手**不上报回弹**
+              //（回弹率的语义是"一次滑动尝试没能产生结果"，而按住看动态不是滑动尝试；
+              //  与「队首下滑不上报」「缩放不上报」同一口径）。
+              // 刻意**不**在这里 return：卡片照常跟手 —— 用户真拖到位就该翻页（那是他的意图），
+              // 而且"按住时卡片不动"会让一次误触长按变成"卡片失灵几百毫秒"的观感故障。
+              // 放在最前面（animating 之后）：多指/缩放/作废那几条早退路径也照样置标记。
+              if (this.motionOn) { this.gestureHadMotion = true; }
               // ── ① 多指 = 缩放，不是翻页（本批新增的第一道判据）────────────────
               // 为什么必须在这里挡：`PanGesture({fingers: 1})` 的 fingers 是**最少**手指数，
               // 两指捏合照样会命中它 —— SDK 还明确写了这种情况下
@@ -715,6 +1122,11 @@ export struct CardStack {
               this.gestureId = '';
               // 缩放的定性同样只在本次手势期间有效（与 gestureId 同一生命周期）
               this.gestureIsZoom = false;
+              // 本批新增：长按播放的定性同理，**且必须在 settle() 之后清** ——
+              // settle() 在"没过阈值"那一支要读它来决定"这次算不算一次滑动尝试"。
+              // 清除权只在这里（和 onActionCancel）与下一手势的 onActionStart：
+              // 长按自己的 onActionEnd 刻意不清（两个回调谁先到没有文档保证，见 onMotionRelease）。
+              this.gestureHadMotion = false;
               // **不**在此清 decidedDuringGesture：判据 1 要求 gestureId === decidedId ≠ ''，
               // 而上面刚把 gestureId 清空 —— 手势结束后它已无读取者，清它是无读者的冗余写入。
               // 它的生命周期由 onActionStart（清）与 commit（置真）划定，不再加第三个写入点。
@@ -763,6 +1175,8 @@ export struct CardStack {
               }
               this.gestureId = '';
               this.gestureIsZoom = false;
+              // 本批新增：与 onActionEnd 同一处置（取消同样要清，否则标记会留到下一张卡上）。
+              this.gestureHadMotion = false;
               // **不**在此清 decidedDuringGesture：与 onActionEnd 的既定处置一致 —— 上面清空
               // gestureId 之后判据 1 不再成立，它已无读取者（见 onActionEnd 的说明）。
             }),
@@ -807,7 +1221,70 @@ export struct CardStack {
           //（另一根手指正在拖这张卡时，这次双击属于哪一张不确定）。
           // 注意：它**不**改 dy、**不**上报任何事件 —— 复位是显示状态，不是一次决策。
           TapGesture({ count: 2 })
-            .onAction((e: GestureEvent) => { this.onDoubleTap(); })
+            .onAction((e: GestureEvent) => { this.onDoubleTap(); }),
+
+          // ── 长按播放动态照片（本批新增，第四个手势）──────────────────────────
+          // 用户原话：「刷卡时动态照片默认不自动播，长按默认播放动态」。
+          //
+          // ⚠️ 四个手势共存（Pan / Pinch / 双击 Tap / 长按）的仲裁是本批最大风险，逐条说明：
+          //
+          // ① 为什么仍然用 **GestureMode.Parallel**（这一条不是沿用，是重新论证过的）：
+          //    `Exclusive` 的语义是"一旦有手势识别成功，其余一律判未识别"。而
+          //    `PanGesture({fingers:1, distance:5})` 只要求 5vp 位移 —— 一个"想长按"的手指
+          //    只要抖 5vp，Pan 就先识别成功，**长按从此再也不会被识别**（与上一批"捏合被
+          //    Pan 吃掉"是同一个陷阱，只是换了个受害者）。Parallel 下四个手势并发识别，
+          //    冲突改由回调里的判据处理 —— 那正是可单测、可推理的一层。
+          //
+          // ② **长按与 Pan 的天然互斥性**（为什么不需要额外的"谁赢"仲裁）：
+          //    平台对长按有自己的移动容差："按住 500ms 且基本不动"才识别；
+          //    而 Pan 只要动 5vp 就识别。两者在同一根手指上**几乎不可能同时成立**，
+          //    真实形态只有两种边界：
+          //      (a) 先抖后按住 —— Pan 先识别（dy 已写了几 vp），500ms 时长按也识别
+          //          → 卡片跟手、播放也起。本实现**允许**这个并存（见 ③），
+          //          并且用 `gestureHadMotion` 把这次手势从回弹率里摘出去；
+          //      (b) 按住后再拖 —— 长按先识别（播放已起），Pan 随后识别 → 卡片开始跟手。
+          //          这是"按住看了两眼、又想滑走"，翻页照常发生；换卡时 resetMotion()
+          //          会把播放停掉（那是"这张卡到此为止"的唯一时刻）。
+          //    特意**不**做"长按期间冻结卡片"（不写 dy、settle 早退）：那会让一次误触长按
+          //    变成"卡片几百毫秒不跟手"的手感故障，而且"冻结"类标记一旦哪条路径漏清
+          //    就是上一批花大力气修掉的那种**不自愈死锁**。这里选择"允许并存 + 只在指标上
+          //    摘出去"，代价小得多、可逆得多。
+          //
+          // ③ **`fingers` 的陷阱这次提前拆掉了**：`LongPressGesture` 的 `fingers` 同样是
+          //    **最少**手指数（`gesture.d.ts:1414` 原文 "minimum number of fingers"），
+          //    所以 `fingers:1` 在双指按住时**照样会命中**。判据不写在参数里（参数做不到），
+          //    而是进闸门：`shouldStartMotionPlayback({... fingers: e.fingerList.length})`
+          //    在 `fingers > 1` 时拒绝起播（有单测）。SDK 另有一条提醒（`gesture.d.ts:1389`）：
+          //    API 18 起部分设备上**系统级双指长按会抢占**，所以这里的取舍是"少播一次"。
+          //
+          // ④ 与**双击**的关系：双击要求"两次短按"，长按要求"一次长按" —— 手指抬起的
+          //    时机把两者分开了，平台侧不需要我们做任何事。唯一的边界是"第一下按太久"：
+          //    那一下会成为长按（起播），双击自然不会完成 —— 这是用户看得懂的结果。
+          //
+          // ⑤ 与**捏合**的关系：不靠手指数猜，直接把"正在缩放"作为闸门的一条
+          //    （`pinching || gestureIsZoom`）—— 一次缩放操作不该变成开始播放。
+          //
+          // ⑥ **作废体系（decidedId / isGestureVoided）**：长按**只读不写**。
+          //    它不产生决策，所以不写 decidedId、不写 decidedDuringGesture；
+          //    它也不写 gestureId —— 那个字段的语义是"本次**拖动**手势的起点卡"，
+          //    而这套机制的两次历史缺陷都出在"多一个写入者 + 生命周期没对齐"上
+          //    （见 isGestureVoided 的注释）。写入者越少，那条不自愈死锁的面越小。
+          //    它需要的"作废"由**换卡即卸载**承担（onItemChanged → resetMotion）：
+          //    与动图的 releaseAnim() 是同一个结构性出口 —— 卡片换了，播放的东西就没了，
+          //    不依赖任何手势回调的顺序。
+          //    唯一读的一次是 `isGestureVoided()`（另一根手指刚把这张卡决定掉时不受理），
+          //    方向取"宁可少受理一次"，与双击/按钮同一取舍。
+          //
+          // 顺序：放在最后（其余三个手势的注释与顺序都不动，改动面最小）。
+          // Parallel 之下顺序不影响仲裁 —— 判据全在回调里。
+          LongPressGesture({ fingers: 1, repeat: false, duration: MOTION_LONG_PRESS_MS })
+            .onAction((e: GestureEvent) => { this.onMotionPress(e); })
+            // 松手 → 回静态图。`onActionEnd` 的 SDK 定义正是"识别成功后所有手指抬起"
+            //（`gesture.d.ts:1466-1467`），与"松手回静态"这条需求一字不差。
+            .onActionEnd(() => { this.onMotionRelease(); })
+            // 取消（识别成功后收到触摸取消）→ 同上：也必须回静态图，
+            // 否则会停在一个"手指早就不在了、画面还在动"的状态。
+            .onActionCancel(() => { this.onMotionRelease(); })
         )
       )
 
@@ -874,7 +1351,14 @@ export struct CardStack {
       if (this.canNav(1)) { this.navOut(1); } else { this.springBack(false); }
     } else {
       // 没过阈值 = 一次真正的「滑了但没结果」：照常上报，这是回弹率分子的唯一来源。
-      this.springBack(true);
+      // 本批新增的第三个 report=false：**本次手势期间起过"长按播放动态"**。
+      // 语义与既有两支完全一致（report 的两个取值与"这是不是一次滑动尝试"一一对应）：
+      // 用户是按住在看动态，不是想滑走 —— 而"按住"本身就会有 >5vp 的手指抖动，
+      // 那会让 Pan 识别成功、抬手时按 dy/velocity 判成一次回弹。
+      // 上报它等于"用户每看一次动态就给回弹率记一笔"（指标向坏的方向失真，但同样是失真）。
+      // ⚠️ 只影响**上不上报**：归位动画与防抖窗口的行为一字不变（见 springBack 的说明），
+      // 所以"静默弹回"与普通回弹在观感上没有任何差别。
+      this.springBack(!this.gestureHadMotion);
     }
   }
 
@@ -991,10 +1475,13 @@ export struct CardStack {
 
   /**
    * 手势回弹：动画归位 +（report 为真时）上报一次回弹。
-   * report 的两个取值与「这是不是一次滑动尝试」一一对应，调用点只有 settle() 的两支：
-   *   - 没过阈值 → true：滑了但没结果，是回弹率分子的唯一来源，不得变成 false；
+   * report 的两个取值与「这是不是一次滑动尝试」一一对应，调用点共四个出口、三种取值：
+   *   - settle() 没过阈值 → `!gestureHadMotion`（本批新增的那条见 settle 的说明）：
+   *     普通情况是 true（滑了但没结果，回弹率分子的唯一来源，不得变成 false）；
+   *     而"本次手势期间起过长按播放"时是 false（按住看动态不是滑动尝试）；
    *   - 队首下滑（canPrev 为假，无法再往前）→ false：不是一次滑动尝试（产品裁决），
-   *     只做视觉归位，不进任何指标。
+   *     只做视觉归位，不进任何指标；
+   *   - 手势被取消（onActionCancel）→ false：取消不是滑动尝试。
    * report 只决定**上不上报**：防抖窗口（springTimer）与归位动画两者的行为完全不变，
    * 所以「静默弹回」不会在窗口管理上留下任何差异（它照样开窗、照样在 150ms 后关窗）。
    */
