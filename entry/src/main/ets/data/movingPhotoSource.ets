@@ -46,6 +46,15 @@ const DOMAIN = 0x0000;
 const TAG = 'PhotoWall';
 
 /**
+ * 入参一律收 **`common.Context`**（而不是 `common.UIAbilityContext`）：SDK 自己就是
+ * `getPhotoAccessHelper(context: Context)` / `requestMovingPhoto(context: Context, …)`
+ *（`@ohos.file.photoAccessHelper.d.ts:48/671`），而调用点能拿到的"宿主 Context"
+ * 正是这个更宽的类型。收窄成 UIAbilityContext 会逼着调用点写一个 `as` 断言 ——
+ * 断言在"取不到宿主"时不会报错，只会把 undefined 一路带到 SDK 里，
+ * 变成一条语焉不详的失败（见 ui/CardStack.ets::ensureMotionForCurrent 的显式处理）。
+ */
+
+/**
  * `requestMovingPhoto` 的**回调等待上限**（ms）。
  *
  * 为什么需要一个上限：这条 API 的返回值是"请求 ID"，真正的对象从 `onDataPrepared` 回调来
@@ -129,7 +138,7 @@ const confirmedNoMotion: Map<string, boolean> = new Map();
  *     `requestMovingPhoto`（探针 R1 正是这个顺序：先 close、后请求，回调拿到对象 ✅）。
  */
 export async function loadMotion(
-  ctx: common.UIAbilityContext, uri: string
+  ctx: common.Context, uri: string
 ): Promise<MotionHandle | undefined> {
   if (uri === '') { return undefined; }
   if (confirmedNoMotion.get(uri) === true) { return undefined; }
@@ -179,7 +188,7 @@ export async function loadMotion(
  * 是被探针验证过的（见 `loadMotion` 的说明）。
  */
 async function findAsset(
-  ctx: common.UIAbilityContext, uri: string
+  ctx: common.Context, uri: string
 ): Promise<photoAccessHelper.PhotoAsset | undefined> {
   try {
     const helper = photoAccessHelper.getPhotoAccessHelper(ctx);
@@ -222,7 +231,7 @@ async function findAsset(
  *     （Promise 只认第一次，但那条日志会把人骗死）。
  */
 function requestMotionObject(
-  ctx: common.UIAbilityContext, asset: photoAccessHelper.PhotoAsset
+  ctx: common.Context, asset: photoAccessHelper.PhotoAsset
 ): Promise<photoAccessHelper.MovingPhoto | undefined> {
   return new Promise<photoAccessHelper.MovingPhoto | undefined>(
     (resolve: (v: photoAccessHelper.MovingPhoto | undefined) => void): void => {

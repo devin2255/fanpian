@@ -288,12 +288,6 @@ export struct CardStack {
   // 三个写入点都是"置真"、唯一的清除者是**Pan 自己** —— 这样"手指抬起时两个手势的
   // 回调谁先到"就不影响 settle() 的判据（长按的 onActionEnd 不清它，见 onMotionRelease）。
   private gestureHadMotion: boolean = false;
-  // 动态照片的读取需要 Context（`getPhotoAccessHelper(ctx)` / `requestMovingPhoto(ctx, …)`）。
-  // 取法与 pages/SwipePage.ets 逐字一致（`getContext(this)`）：它带一个 deprecated 告警，
-  // 但那正是本工程**已经验过**的写法；换成 `getUIContext().getHostContext()` 会引入
-  // 一个 `Context | undefined` 的新形态，而这条路径上没有一处能容下 undefined
-  //（`loadMotion` 的入参是确定的 Context）。
-  private ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
 
   // ── 几何：三个尺寸，各来自不同的事实（都只在回调里读，不需要 @State）──────
   // 卡片盒子尺寸（vp）= 照片要做 Contain 的那个"框"，由 onAreaChange 量到。
@@ -532,11 +526,25 @@ export struct CardStack {
     const id: string = this.item.photoId;
     if (id === '') { return; }
     if (this.motionForId === id) { return; }
+    // Context 在**调用时**取，而不是构造时存一个字段：
+    //   · `getContext(this)` 已 deprecated（本工程其它文件也带着这个告警），
+    //     而 `this.getUIContext()` 是本工程已经在用的写法（见 SwipePage 的 toastReading）；
+    //   · `getHostContext()` 的返回类型**本来就是** `Context | undefined`，
+    //     于是"取不到宿主"成为一个显式分支（下面那行 warn），而不是靠 `as` 断言
+    //     把一个 undefined 一路送进 SDK（那会变成一条语焉不详的失败）。
+    const host: common.Context | undefined = this.getUIContext().getHostContext();
+    if (host === undefined) {
+      // 结构上不该发生（本组件必然挂在某个 UIAbility 的页面上）。留着它的意义是：
+      // 真机上"全都没有角标"这件事会有一行明确的告警可查。
+      // **不写 motionForId** → 下次滑回这张卡还会再试一次（这不是"确定不是动态照片"）。
+      hilog.warn(DOMAIN, TAG, '%{public}s', `取不到宿主 Context，跳过动态照片探测: ${id}`);
+      return;
+    }
     this.releaseMotion();
     this.motionForId = id;
     this.motionSeq = this.motionSeq + 1;
     const seq: number = this.motionSeq;
-    loadMotion(this.ctx, id)
+    loadMotion(host, id)
       .then((h: MotionHandle | undefined): void => { this.onMotionLoaded(id, seq, h); })
       .catch((): void => {
         // loadMotion 内部已吞掉全部异常（任何失败都返回 undefined）——
