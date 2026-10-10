@@ -14,7 +14,32 @@
  *   （`hangOffsets` / `arcSpread` / `hangRects` / `planPin` / `clampRect` / `badgeRect`
  *   已随本次改造删除 —— 它们唯一的存在理由是"把照片画在钉子上"，那个形态没有了）。
  *   留下的只有三件事：**钉子在哪儿**（`buildScene`）、**标记长什么样**（`pinMarkers`）、
- *   **地图画多大**（`mapFrame` / `fitViewToCanvas`）。
+ *   **地图画多大**（`mapFrame` / `fillHeightView`）。
+ *
+ * ── 视野模型（task-19 的用户裁决："地图铺满高度，左右横滑"）─────────────────────
+ *   用户看到的上一版是：**图框 376×279.62@(0,172.62)，地图只占最上一薄条、下面 62% 是空地，
+ *   4 个钉子散在空地里**。成因是一整条链子，两处都要改，缺一不可：
+ *     ① `fitViewToCanvas` 强行让"框 ⊆ 中国"且"框的比例 == 画布的比例" —— 而中国的墨卡托比
+ *        1.3447 与竖屏画布比 0.6017 不可能同时满足，于是它只能把框缩到**填满宽度**
+ *        （376×279.62 居中），地图就只剩一条。
+ *     ② `mapFrame` 的 contain 兜底"宽度放不下就改成填满宽度"—— 就算给了正确的视野，
+ *        它也会把框压回一条。
+ *   新模型把这两处一起反过来：
+ *     · **`mapFrame` 恒填满高度**（`h = blockH`，`w = blockH × 墨卡托比`）—— 宽度放不下时
+ *       **不再缩回去**，`x` 直接为负（框比画布宽）。绘制内容由容器的 `clip(true)` 裁掉两侧，
+ *       用户靠**横向平移**看其余部分。这就是"地图铺满高度、左右横滑"的几何形态。
+ *     · **视野框改成"一屏"**（`fillHeightView`）：纬度恒取中国全域 18~54，**经度跨度由画布
+ *       宽高比反推**。真机 376×624.86 上实测：
+ *         经度跨度 = 0.6017347885926447 × 0.80471895621705 / DEG = **27.744185828688188°**
+ *         中国全宽的绘制宽度 = 376 × 62/27.7442 = **840.25pt = 画布宽的 2.2347 倍** → 必须横滑
+ *         中国全高的绘制高度 = 624.86pt = **画布高的 1.0000 倍**   → 纵向铺满（硬要求）
+ *       于是画布上看到的是"整个纬度带 × 中间 27.74° 的经度"，左右各有 `62 − 27.74 = 34.26°`
+ *       的横向余量可以滑（`34.256° × 376/27.744 = 464.25pt`）。
+ *     · 缩小的**上界因此变成"完整的中国纬度"**：纬度已经顶满 18~54，再缩就只能露出国境之外
+ *       （旧模型正是这样缩到南半球 `[67,-20.6,129,64.4]` 的）。所以"缩到底"现在是一个**有内容
+ *       的终点**：铺满高度的那一帧，四周全是中国。
+ *   代价（如实写在报告里）：经度上一屏只装得下 27.74°，**数据经度跨度大于一屏时钉子会有一半
+ *   在屏幕外**，必须横滑才看得全。取舍与数字见 `defaultWallView` 与 `viewMetrics`。
  *
  * ── 复用了什么（刻意不重写） ────────────────────────────────────────────────
  *   · geo.hasPlace             —— 「这张照片有没有地点」的**唯一定义**（手动 > EXIF；
@@ -78,7 +103,7 @@ export function normalizeBounds(bounds: number[] | undefined): number[] {
   return bounds;
 }
 
-// ── 画布比例：为什么地图不能直接铺满手机屏幕 ────────────────────────────────
+// ── 画布比例：地图怎么画才不变形（也是"一屏装多少经度"的唯一依据） ──────────
 
 const DEG = Math.PI / 180;
 
@@ -96,6 +121,17 @@ function mercYOf(lat: number): number {
   const clamped: number = Math.max(-85, Math.min(85, lat));
   return Math.log(Math.tan(Math.PI / 4 + (clamped * DEG) / 2));
 }
+
+/**
+ * **中国全境的 mercY 跨度**（`mercY(54) − mercY(18)` = `1.12417721569793 − 0.31945825948088`
+ * = `0.80471895621705`）。task-19 的视野模型里它是**缩放的下界**：视野的纬度跨度一旦顶到它，
+ * 就再也没有"外面"可缩（外面是中国国境之外，没有任何轮廓数据可画）。
+ *
+ * ⚠️ 它是 **mercY 空间**的量，不是"36 度"：`36 / 0.80471895621705 × DEG` ≈ 46.1°当量。
+ * 拿 46.1 或 36 去反推经度跨度都会得到与真机不符的数 —— 这正是控制器粗算的"1.96 倍"
+ * 与实测 **2.2347 倍**对不上的原因（复算见报告 §2）。
+ */
+const CHINA_Y_SPAN: number = mercYOf(CHINA_BOUNDS[3]) - mercYOf(CHINA_BOUNDS[1]);
 
 /**
  * 一块 bounds 在墨卡托下的**宽度 / 高度**比。
@@ -120,60 +156,62 @@ export function mapBoxHeight(width: number, bounds: number[]): number {
   return width / a;
 }
 
-// ── 地图块 / 地图框：地图"铺满主体区"但不许变形 ─────────────────────────────
-
+// ── 地图块 / 地图框：**恒填满高度**，宽度放不下就让 x 为负（task-19） ─────────
+//
+// 两个概念（task-14 起就有，task-19 只改了它们的比例关系）：
+//   · **地图块**（`blockW × blockH`）= 页面上留给地图的**那块区域** = 整个主体区。
+//   · **绘制框**（`x, y, w, h`）= 视野（bounds）投影到屏幕上的那个矩形。它的宽高比**必须**
+//     等于 bounds 的墨卡托宽高比，否则中国会被拉变形。
+//
+// ── 旧实现错在哪（用户截图：图框 376×279.62@(0,172.62)，上面一薄条、下面 62% 空地）────
+//   旧规则是 **contain**：先按"填满高度"算宽 `w = blockH × 比`，一旦 `w > blockW` 就
+//   **改成"填满宽度"**（`w = blockW, h = blockW / 比`）再居中。真机 376×624.86 上中国的
+//   墨卡托比是 1.3447，于是 `w = 840.25 > 376` → 立刻退成 `376×279.62` 居中在 `y = 172.62`
+//   → **地图只占 44.7% 的高度，上下都是空地**（用户看到的正是这一帧）。
+//   "框填满块"在竖屏上确实做不到（1.3447 ≠ 0.6017），但**代价不该由地图的高度来付**：
+//   正确做法是让框**比画布宽**，把溢出的部分交给横向平移。
+//
+// ── 新规则：只看高度，宽度随比例（可以超出画布）────────────────────────────────
+//     `h = blockH`（恒成立） ｜ `w = blockH × geoAspect(bounds)` ｜ `y = 0`
+//     `x = (blockW − w) / 2`   ← **`w > blockW` 时 x 为负**（框比画布宽，两侧在屏幕外）
+//   三种画布的实测（`bounds = CHINA_REGION.bounds`，"整个中国"这一档）：
+//     · 竖屏 376×624.86：`w = 840.25, h = 624.86, x = −232.12` → 横向溢出 **2.2347 倍** ★
+//     · 竖屏 360×720：   `w = 968.18, h = 720,    x = −304.09` → 横向溢出 2.6894 倍
+//     · 横屏 1000×600：  `w = 806.82, h = 600,    x = +96.59`  → 画布比地图宽，左右留白
+//   新规则**不是 contain 的放宽，而是它的反面**：contain 保"框 ⊆ 块"、牺牲高度；
+//   新规则保"框高 == 块高"、放弃"框 ⊆ 块"。两者只在比例正好相等时重合（`x = 0`）。
+//
+// ── 为什么"框 ⊆ 块"这条旧不变量可以丢（而不是被无视）──────────────────────────
+//   它当年服务的是"地图整块看得见"，代价是竖屏上**必然**把地图压成一条横幅（上面的实测）。
+//   用户明确选了另一头："地图铺满高度，左右横滑"。所以现在的不变量是：
+//     **框高恒等于块高（纵向铺满）；宽度方向允许溢出，溢出部分靠横向平移查看。**
+//   屏幕外的坐标不会消失：设备侧挂在最外层 Stack 的 `.clip(true)` 裁掉它们，SVG 根元素
+//   默认也是裁的 —— 内容一直都在，只是要滑过去看。
+//
+// ── 视野（bounds）与框的分工：**框恒等于画布，横滑靠移动 bounds** ────────────────
+//   `fillHeightView` 给出的视野其墨卡托比**正好等于画布比**，于是 `w = blockW`、`x = 0`
+//   —— 框 == 块。此时"左右横滑"不靠移动框，而靠**移动视野**（`panViewBy` 改 bounds），
+//   也就是内容在框里整体平移。两者是同一件事的两种写法，本模块选后者：
+//   bounds 是唯一的状态，框永远是它的纯函数（见 `viewMetrics` 里的横向偏移）。
 /**
  * 地图块的尺寸与它里面那个**不变形的绘制框**。
  *
- * ── 两个概念必须分开（这是"地图只占上面一条"的成因）────────────────────────
- *   · **地图块**（`blockW × blockH`）= 页面上留给地图的**那块区域**。它就是整个主体区，
- *     高度 = `onAreaChange` 给的可用高度 —— 地图是这块舞台的底色，照片浮在它上面。
- *   · **绘制框**（`x, y, w, h`）= 中国轮廓与钉子投影用的那个矩形。它的宽高比**必须**
- *     等于 bounds 的墨卡托宽高比，否则中国会被拉变形。
- *
- * 老实现把两者当成一回事：`mapH = mapBoxHeight(画布宽)` 只有 267.7pt（720 高的 37%），
- * 于是地图**只是屏幕上方的一条**，下面一大片交给照片。修法是把"块"撑满可用高度、
- * 把"框"居中放在块里。
- *
- * ── 框的大小：取能放下的最大一块（contain），**永远不变形** ────────────────────
- *   1. 先按"填满高度"算宽度 `w = blockH × aspect`；
- *   2. 算出来的宽度超出地图块宽 → 改成"填满宽度" `w = blockW, h = blockW / aspect`。
- * 两条都**只改尺寸、不改比例**。真正的取舍在下面这段：
- *
- *   **为什么在手机上第 2 条总是生效，以及为什么这才是对的**：
- *   中国 bounds 的墨卡托宽高比是 1.345（横着的 4:3），而手机主体区是 360×710（竖的）。
- *   要"填满高度"就得把宽度开到 `710 × 1.345 = 955pt` —— 是画布的 2.65 倍，
- *   于是只能看到经度 104° ± 12° 那一条，**北京（116.4°E）、上海（121.5°E）、广州（113.3°E）
- *   全在画面外**，而那正是用户照片所在的地方。所以"填满高度"在竖屏上不是"地图更大"，
- *   而是"把要去的地方裁掉"。第 2 条给出的是**在不变形的前提下能画出的最大中国**
- *   （宽 360 × 高 267.7），并且把它**居中**（`x = y = 0` 只在比例刚好匹配时成立）。
- *
- * 换句话说：**地图块填满可用高度（地图是整块主体区的底色），绘制框取不变形的最大一块并居中。**
- * 两者合起来才是"地图铺满主体区"。
- *
- * ── task-18：为什么"框填不满块"这件事**不是**本批要修的东西（实测数字）──────────
- *   新形态把照片变成钉子上的一簇小点（`pinMarkers`）之后，"地图一条、照片飘在空白里"
- *   那个观感已经没有了：整块主体区都是地图（底色 + 国界 + 省界 + 轨迹 + 钉子），
- *   照片不再占据任何纵向空间。于是"框 ⊊ 块"剩下的只是框外那两条带**没有画轮廓数据**
- *   而已（`containInChina` 的取舍：视野 ⊆ 中国，见 `fitViewToCanvas`）。
- *   真机 376×663.71pt 上的实测（`mapFillRatio` = 框面积 / 可用区面积）：
- *     · 近邻城市数据（有界视野）→ 框 == 块，**100%**；
- *     · 广域 fixture（经度占满 62°）→ **43.5%**（框 376×288.3 居中）。
- *   第二档的 43.5% 是**故意保留**的，不是漏修：
- *     把它"填满"的唯一办法是让框的纬度撑到画布比例 —— 实测那会得到
- *     `[73.5, -12.54, 134.5, 68.44]`（**南半球**），中国陆地只占画面高度的 42.8%，
- *     也就是**比现在更小**。所以"框填满块"与"中国尽可能大"在竖屏上是互斥的，
- *     本模块选后者（用户要的是"看见完整的中国且尽量大"）。数字与推导见 task-18 报告。
+ * 规则见上面那段（task-19：恒填满高度，`x` 可以为负）。
  */
 export interface MapFrame {
   /** 地图块宽（pt）= 画布宽。 */
   blockW: number;
   /** 地图块高（pt）= 可用高度（地图是这整块区域的底色）。 */
   blockH: number;
-  /** 不变形绘制框在地图块内的左上角（居中放置）。 */
+  /**
+   * 绘制框左上角在地图块坐标里的位置。
+   *
+   * `y` 恒为 0（框顶贴块顶 = 填满高度）；`x` **可以为负** —— 框比画布宽时两边各伸出去
+   * `(w − blockW)/2`（竖屏常态，见上面的实测）。旧实现不允许这件事，代价就是"地图一条"。
+   */
   x: number;
   y: number;
-  /** 不变形绘制框的尺寸（`w / h === geoAspect(bounds)`）。 */
+  /** 绘制框尺寸（`w / h === geoAspect(bounds)`，**恒有 `h === blockH`**）。 */
   w: number;
   h: number;
   /**
@@ -207,7 +245,7 @@ export function frameBounds(frame: MapFrame): number[] {
 }
 
 /**
- * 按"地图块"算出里面那个不变形的绘制框（居中）。见 `MapFrame` 的说明。
+ * 按"地图块"算出绘制框：**恒填满高度**（见本节开头那段）。
  *
  * `bounds` 是**这个框的经纬度范围**，会被归一化后**存进返回的框**（`MapFrame.bounds`）——
  * 国界与照片之后都从框上读它，不再各传一份（见 `frameBounds`）。
@@ -223,58 +261,100 @@ export function mapFrame(blockW: number, blockH: number, bounds: number[]): MapF
   if (!(bw > 0) || !(bh > 0)) {
     return { blockW: bw, blockH: bh, x: 0, y: 0, w: 0, h: 0, bounds: b };
   }
-  const a: number = geoAspect(b);
-  // 1) 先按"填满高度"
-  let h: number = bh;
-  let w: number = bh * a;
-  // 2) 宽度放不下 → 改成"填满宽度"（同样不变形）
-  if (w > bw) {
-    w = bw;
-    h = bw / a;
-  }
-  // 居中：比例刚好匹配时 x/y 是 0；不匹配时两侧/上下各留一半
-  return { blockW: bw, blockH: bh, x: (bw - w) / 2, y: (bh - h) / 2, w: w, h: h, bounds: b };
+  const h: number = bh;
+  const w: number = bh * geoAspect(b);
+  // y 恒为 0；x 可以是负的（框比画布宽）—— 这一条就是"横向溢出、左右横滑"的机器可读形态
+  return { blockW: bw, blockH: bh, x: (bw - w) / 2, y: 0, w: w, h: h, bounds: b };
 }
 
 /**
- * **框底在画布里的位置**（pt）：`画布高 − 页脚`，但**不得高于绘制框底**。
+ * **视野的四个验收数字**（诊断行、预览图例与单测读的是同一个函数）。
  *
- * 本形态下已经**没有"挂载区"**（照片不再挂在钉子下面占纵向空间），这个函数保留下来
- * 只服务一件事：预览与单测要能算出"地图框之外还剩多少"这一个数字（诊断行/图例要报它）。
- * 画布高缺省 = 地图块高。
+ * ── 为什么要单独立一个函数（它是"地图铺满高度 / 需要横滑"的唯一口径）──────────────
+ *   "地图多大"这句话有两个容易被混为一谈的口径：
+ *     · **框**（`MapFrame`）—— 视野投影的那块矩形。填满高度之后它**恒等于画布**（`x = 0`），
+ *       所以它自己已经不能回答"地图铺满了吗"（框 == 画布时，画布上画的是什么才算数）。
+ *     · **中国在地图上画出来多大**（本函数）—— 中国全域 62°×36° 投到框里之后的尺寸。
+ *       它就是用户眼睛看到的"地图"：高度 == 画布高（铺满），宽度 == 画布的 2.23 倍（要横滑）。
+ *   两个口径在"视野 == 中国"时才相等（那正是 `mapFrame(blockW, blockH, CHINA_BOUNDS)`
+ *   那一档：框 840.25×624.86 = 地图本身）。分开之后就再也不会有人用"框填满"去冒充
+ *   "地图填满"，也不会有人反过来把"中国只占框的一小半"读成缺陷。
+ *
+ * ── 数字怎么算的（每一步都可复算）────────────────────────────────────────────
+ *   · `mapW` = 框宽 ×（中国经度跨度 / 视野经度跨度）—— 经度在墨卡托里是线性的。
+ *   · `mapH` = 框高 ×（中国 mercY 跨度 / 视野 mercY 跨度）—— **纬度不是线性的**，
+ *     用度数算会得到另一个数（36/13.5 = 2.67 而不是 1.00），这是最容易算错的一处。
+ *   · `westX` = 中国西缘（73°E）在画布坐标里的 x。它**就是**"当前横向偏移"：
+ *     默认视野下实测 **−365.68pt**（屏幕左外侧 365.68pt 处），滑到最西时它贴住 0。
+ *   · `panSlackX` = 经度上还能滑多少（`62 − 视野经度跨度`），换算成 pt。
+ *     真机默认视野实测 `62 − 27.744 = 34.256° = 464.25pt`（左右合起来）。
+ *
+ * 非法尺寸 / 非法 bounds 时全部字段为 0（"没有视野"时没有比值可言）——与 `mapFrame`
+ * 的退化口径一致，绝不产 NaN（NaN 会让整条 path 静默消失）。
  */
-export function frameBottomAt(frame: MapFrame, canvasH: number, footer: number): number {
-  const fb: number = frame.y + frame.h;
-  let h: number = frame.blockH > fb ? frame.blockH : fb;
-  if (Number.isFinite(canvasH) && canvasH > h) { h = canvasH; }
-  const f: number = Number.isFinite(footer) && footer > 0 ? footer : 0;
-  const limit: number = h - f;
-  return limit > fb ? limit : fb;
+export interface ViewMetrics {
+  /** 画布（地图块）宽 pt。 */
+  canvasW: number;
+  /** 画布（地图块）高 pt。 */
+  canvasH: number;
+  /** 中国全域在画布上的**绘制宽度**（pt）：> canvasW 就说明必须横滑。 */
+  mapW: number;
+  /** 中国全域在画布上的**绘制高度**（pt）：铺满高度时 == canvasH。 */
+  mapH: number;
+  /** `mapW / canvasW`。**1 = 正好一屏；> 1 = 横向溢出（必须横滑）；< 1 = 画布比地图宽**。 */
+  widthRatio: number;
+  /** `mapH / canvasH`。**铺满高度时恒为 1**（这是用户那条硬要求的机器可读形态）。 */
+  heightRatio: number;
+  /** 中国西缘在画布坐标里的 x（**负 = 在屏幕左外侧**）= 当前横向偏移。 */
+  westX: number;
+  /** 中国东缘在画布坐标里的 x（> canvasW = 在屏幕右外侧）。 */
+  eastX: number;
+  /** 中国北缘在画布坐标里的 y。 */
+  northY: number;
+  /** 横向还能滑动的总距离（pt，左右合起来）：`62 − 视野经度跨度` 换算成 pt。 */
+  panSlackX: number;
+  /** 当前视野的经度跨度（度）。 */
+  lonSpan: number;
 }
 
+/** 度量结果全 0 的那一份（非法输入 / 退化路径用它，调用方不必自己拼字面量）。 */
+const EMPTY_METRICS: ViewMetrics = {
+  canvasW: 0, canvasH: 0, mapW: 0, mapH: 0, widthRatio: 0, heightRatio: 0,
+  westX: 0, eastX: 0, northY: 0, panSlackX: 0, lonSpan: 0
+};
+
 /**
- * **地图填满度**：绘制框面积 ÷ 地图块面积（0~1）。1 = 框 == 块 = 一点信箱空白都没有。
- *
- * ── 为什么要有这个函数（它是验收里那个数字的唯一来源）────────────────────────────
- *   "地图铺满主体区"这句话如果不落成一个数，就永远只能靠肉眼吵。本函数把它定义成
- *   **一个比值**，于是设备侧诊断行、预览图例与单测报的是同一个数 —— 谁都不必"再算一遍"。
- *
- * ── 它**不**回答"中国在画面里占多大"（那是另一个数，见报告）──────────────────────
- *   两者会不一样，而且**故意不一样**：竖屏上"框 == 块"只有在放弃"视野 ⊆ 中国"时才能做到，
- *   而那会把视野拉到南半球、让中国**更小**（实测数字见 `MapFrame` 的注释）。
- *   本模块选的是"中国尽可能大 + 视野恒 ⊆ 中国"，所以有界视野下框就是块（1.0），
- *   广域视野下框填不满块（那两条带是底色，不是异色空缺）。
- *
- * `blockW/blockH` 非法（非有限数 / ≤ 0）时返回 0（"画布多大都不知道"时没有比值可言）。
+ * 算出 `frame` 的四个验收数字。见 `ViewMetrics` 的说明（含每一步的推导与真机实测值）。
  */
-export function mapFillRatio(frame: MapFrame): number {
-  if (frame === undefined || frame === null) { return 0; }
+export function viewMetrics(frame: MapFrame): ViewMetrics {
+  if (frame === undefined || frame === null) { return EMPTY_METRICS; }
   const bw: number = frame.blockW;
   const bh: number = frame.blockH;
-  if (!Number.isFinite(bw) || !Number.isFinite(bh) || !(bw > 0) || !(bh > 0)) { return 0; }
-  const a: number = frame.w * frame.h;
-  if (!Number.isFinite(a) || !(a > 0)) { return 0; }
-  return a / (bw * bh);
+  if (!Number.isFinite(bw) || !Number.isFinite(bh) || !(bw > 0) || !(bh > 0)) { return EMPTY_METRICS; }
+  if (!Number.isFinite(frame.w) || !Number.isFinite(frame.h) || !(frame.w > 0) || !(frame.h > 0)) {
+    return EMPTY_METRICS;
+  }
+  const b: number[] = frameBounds(frame);
+  const lonSpan: number = b[2] - b[0];
+  const y0: number = mercYOf(b[1]);
+  const y1: number = mercYOf(b[3]);
+  const ySpan: number = y1 - y0;
+  if (!(lonSpan > 0) || !(ySpan > 0)) { return EMPTY_METRICS; }
+  const cLonSpan: number = CHINA_BOUNDS[2] - CHINA_BOUNDS[0];
+  const mapW: number = (frame.w * cLonSpan) / lonSpan;
+  const mapH: number = (frame.h * CHINA_Y_SPAN) / ySpan;
+  // 中国西/东缘的屏幕坐标：经度线性，所以一次比例换算就够
+  const westX: number = frame.x + (frame.w * (CHINA_BOUNDS[0] - b[0])) / lonSpan;
+  const eastX: number = frame.x + (frame.w * (CHINA_BOUNDS[2] - b[0])) / lonSpan;
+  // 北缘：mercY 从北往南递减，画布顶端是北（与 projectMercator 同一取向）
+  const northY: number = frame.y + (frame.h * (y1 - mercYOf(CHINA_BOUNDS[3]))) / ySpan;
+  const slackDeg: number = cLonSpan - lonSpan;
+  const panSlackX: number = slackDeg > 0 ? (slackDeg * frame.w) / lonSpan : 0;
+  return {
+    canvasW: bw, canvasH: bh, mapW: mapW, mapH: mapH,
+    widthRatio: mapW / bw, heightRatio: mapH / bh,
+    westX: westX, eastX: eastX, northY: northY, panSlackX: panSlackX, lonSpan: lonSpan
+  };
 }
 
 // ── 数据形状 ────────────────────────────────────────────────────────────────
@@ -504,30 +584,42 @@ export function viewZoomOf(bounds: number[]): number {
   if (!(span > 0)) { return 1; }
   return base / span;
 }
-
 /**
  * Mercator 的 y **反函数**（`mercYOf` 的逆）：把一个 mercY 值还原成纬度（度）。
  *
  * 推导：`y = ln(tan(π/4 + φ/2))` → `φ = 2·atan(e^y) − π/2`。
- * 只在 `fitViewToCanvas` 撑开纬度时用得到：那里必须在 **mercY 空间**里撑开（因为
- * `geoAspect` 的分子分母就是 `经度弧度 / mercY 跨度`），撑完再换回纬度。
+ * 两处用到它，都是因为**纬度那根轴的几何必须在 mercY 空间里做**（`geoAspect` 的分母就是
+ * mercY 跨度，在度数空间平移/缩放都会改变形状）：
+ *   · `containInChina` 把纬度平移/缩放回 [18, 54]；
+ *   · `settleViewBox` 把手势算出来的 mercY 区间换回经纬度框。
  */
 function invMercYOf(y: number): number {
   return (2 * Math.atan(Math.exp(y)) - Math.PI / 2) / DEG;
 }
 
 /**
- * 纬度撑开的硬边界（度）。墨卡托在 ±85° 发散（`mercY → ±∞`），±84 之内仍然温和 ——
- * 这是"让 `fitViewToCanvas` 永远不产出 NaN/Infinity 坐标"的兜底，**不是**中国国界。
+ * 墨卡托安全带（度）：`mercYOf` 在 ±85 处夹断，±84 之内仍然温和。
+ *
+ * 它是"别产出 NaN 坐标"的**第二道防线**（第一道是 `CHINA_BOUNDS` 的纬度钳制 ——
+ * 中国 18~54 整条都在带内，所以正常路径永远碰不到它）。task-19 重新明确它的职责：
+ * **保跨度地**把方框平移回带内（跨度超过整条带时才收跨度）。
+ *
+ * ── 为什么不能省掉它（实测抓到的症状）──────────────────────────────────────────
+ *   用户在"缩到底"那一帧（纬度正好 `[18,54]`）往下猛拖一把（`fy = 5` 个画布高）：
+ *   `panViewBy` 把 mercY 区间整体北移 4.02 → `maxLat = invMercYOf(5.14) ≈ 89.99°`，
+ *   而 `mercYOf(89.99)` **被夹成 `mercYOf(85)`** → 算出来的 mercY 跨度从 `0.8047`
+ *   **虚增**到 `2.68`（是中国的 3.3 倍）。`containInChina` 看到"跨度超出中国"，
+ *   按规矩把**两根轴一起缩**（那是给"用户真的在缩小"用的）→ 结果经度跨度也被缩小，
+ *   症状是"明明已经缩到底了，往下拖一把地图自己又缩了一下"。
+ *   先在带内保跨度地平移，`containInChina` 收到的就是真实跨度（`0.8047`），
+ *   于是那一拖是**逐位恒等**的（单测 `缩到底之后纵向拖 = 逐位不动` 钉住这一条）。
  */
 const LAT_EXPAND_LIMIT = 84;
-/** 经度撑开的硬边界（度）：跨度不许超过一整个环球 —— 再大就没有地图的语义了。 */
-const LON_EXPAND_LIMIT = 360;
 
 /**
  * "跨度已经顶满中国"的判定容差（相对量）。
  *
- * 为什么需要它：跨度**恰好**等于中国跨度时（= 缩到底那一帧，`[73,18,135,54]`），
+ * 为什么需要它：跨度**恰好**等于中国跨度时（= 缩到底那一帧：纬度 `[18,54]`），
  * 用户再拖一下，平移后的两端是 `cLo + s` / `cHi + s` —— 两者相减得到的跨度会比
  * `cHi − cLo` 差一两个 ulp。于是"取整段"那一支判不出来，代码走"平移贴边"那一支，
  * 而贴边那一支的**另一端是减出来的**（`a -= b - cHi`）→ 结果是纬度
@@ -540,46 +632,51 @@ const LON_EXPAND_LIMIT = 360;
 const SNAP_SPAN_EPS = 1e-12;
 
 /**
- * 把一族视野框落进**中国范围** `CHINA_REGION.bounds` ——
- * "视野任何时候都不得跑到中国之外"这条硬规矩的**唯一执行点**
- *（`fitViewToCanvas` 与 `settleViewBox` 都调它，所以设备的两条路径口径不可能漂）。
+ * 把一族视野框落进**中国范围** —— 这条硬规矩的**唯一执行点**
+ *（`fillHeightView`、`refitViewToCanvas` 与 `settleViewBox` 都调它，所以设备与预览、
+ *  默认视野与手势视野的口径不可能漂）。
  *
- * ── 为什么需要它（真机截图逼出来的一个反转决定）──────────────────────────────────
- *   用户在真机上把地图缩到底，得到的是：
- *     `视野 数据[115.66,29.88,122.19,41.24]→铺满[67,-20.6,129,64.4] ｜ 放大 9.5×→1×`
- *   诊断行自己写着"可缩 1×"（经度跨度确实到位了），可画面上的中国只占中间一小块，
- *   视野里塞进了东南亚与印度洋，**纬度跑到了南半球（−20.6°）**。
- *   成因：`zoomViewAt` 只把**经度跨度**夹到 62°（`MAX_VIEW_SPAN_DEG`），而框的宽高比
- *   必须与画布一致（376/642.57 = 0.5852），于是纬度跨度被经度跨度**唯一决定**：
- *     `纬度跨度(mercY) = 62 × DEG / 0.5852 = 1.849` —— 是中国自己（0.805）的 **2.30 倍**。
- *   `settleViewBox` 只夹**中心**、不夹跨度，所以没人挡得住它。
+ * ── task-19 之后它**只管纬度**（这是本函数被改造的地方）──────────────────────────
+ *   旧版两根轴都收：经度也必须 ⊆ `[73,135]`。旧模型下那是必要的 —— 视野就是"整个中国"，
+ *   框 ⊆ 中国才不会露出境外。新模型下**一屏只是一段经度**（真机 27.744°），而"横向溢出"
+ *   指的是**画出来的地图比画布宽**（840.25pt vs 376pt），不是"视野比中国宽"。两件事必须
+ *   分开，否则会得出一个错误的结论："既然要横滑，就不能限制经度"。
+ *   实测：把视野经度**放开**到中国之外会得到什么 —— 那里**一条轮廓数据都没有**
+ *   （`china_outline.json` 96 条环全在中国境内），屏幕上就是一片底色。
+ *   所以新规则是：
+ *     · **纬度**：`⊆ [18,54]` 硬约束（**这是"缩到底 = 完整中国纬度"的执行点**，
+ *       也是旧模型"缩到南半球 `[67,-20.6,129,64.4]`"那个缺陷的封堵点）；
+ *     · **经度**：仍然把窗口平移进 `[73,135]`（于是**用户永远拖不到"地图完全离开屏幕"**
+ *       —— 46 行注释见 `defaultWallView` 与报告 §5）。这不是"溢出被禁止"：
+ *       溢出发生在**绘制内容**那一侧（地图 840.25pt > 画布 376pt），窗口本身只有一屏。
+ *       两者同时成立，正是用户选的形态："地图铺满高度，左右横滑"。
  *
- * ── 规则（与 `fitAxis` 第 ③ 步**同一条规矩**：越界时平移，绝不夹两端）────────────
- *   · 已经在中国之内 → **逐位原样返回**（"什么都没发生"必须是真的没发生，幂等靠这一条）；
- *   · 跨度**小于**中国跨度、只是位置越界 → **平移**进来（跨度不变 → 比例不变 → 不变形）；
- *   · 跨度**不小于**中国跨度 → 该轴取中国的整段（`[73,135]` / `[18,54]`）。
- *     两根轴都取满时结果**恒等于全国框**（`CHINA_REGION.bounds` 本身），
- *     这就是"缩到底 = 全国"的机器可读形态，也是"可缩 1×"这句话终于成立的原因。
- *   为什么不能"两端各夹一下"：那会把跨度压小甚至压成 0，而 `projectMercator` 的除数就是跨度
- *   → 整块画布 NaN → 地图与照片一起**静默消失**（同一个坑记在 `fitAxis` 的注释里）。
+ * ── 四条规则（顺序不能换：先纬度、再经度；纬度那一步可能**同时**改经度跨度）──────
+ *   ① 快路径：已经合法 → **逐位原样返回**（"什么都没发生"必须是真的没发生，幂等靠这一条）；
+ *   ② 纬度跨度 **≥** 中国跨度 → 纬度**逐位**取 `[18,54]`；若**超出**中国跨度（缩过头了），
+ *      经度跨度按**同一个比例**缩回来 —— 两根轴一起缩 = **保形**，也就是"缩小在纬度这一侧
+ *      到顶了"。这正是"缩到底"的机器可读形态：`纬度 == [18,54]`。
+ *   ③ 纬度跨度 < 中国跨度、只是位置越界 → 在 **mercY 空间**里**平移**进来（跨度不变 → 保形）；
+ *   ④ 经度：跨度 ≥ 62°（横屏画布那种"一屏比中国还宽"的情形）→ 取整段 `[73,135]`；
+ *      否则平移进 `[73,135]`（保跨度 → 保形）。
  *
- * ── ⚠️ 纬度那一根轴的平移必须在 **mercY 空间**里做（这是实现上唯一不显然的一处）──────
+ * ── ⚠️ 纬度那一根轴必须在 **mercY 空间**里做（这是实现上唯一不显然的一处）──────────
  *   经度在墨卡托里是线性的，所以"纬度用度数、经度用度数"看起来对称 —— 但**纬度不是**。
  *   在**度数**空间平移会改变 mercY 跨度，也就是**改变框的形状**（实测：把 29.88~41.24
  *   那一档往南推到贴住 18°N，mercY 跨度从 0.2446 涨到 0.2562，宽高比 0.5852 → 0.5585）。
- *   后果不只是"形状差一点"：`WallPage.rebuild()` 每次都拿 `fitViewToCanvas` 对齐画布比例，
- *   形状一变它就会**再撑一次**，症状是"抬手之后视野自己变宽了一下"。
- *   在 mercY 空间平移则**严格保形**（`geoAspect` 逐位不变），`fitViewToCanvas` 对手势产物
- *   仍然是恒等的 —— 那条"抬手不跳"的性质因此继续成立。
- *   注意"取整段"那一支仍然直接取 `CHINA_BOUNDS` 的**纬度**端点（不做 mercY 往返），
+ *   症状是"抬手之后地图自己变形了一点"。在 mercY 空间平移则**严格保形**
+ *   （`geoAspect` 逐位不变），手势产物过它是恒等的 —— "抬手不跳"因此继续成立。
+ *   注意"取整段"那一支直接取 `CHINA_BOUNDS` 的**纬度端点**（不做 mercY 往返），
  *   所以缩到底得到的是**逐位**的 `[18, 54]`，不是 17.999999999999996。
  *
- * ── 取舍（写在报告里，不藏）────────────────────────────────────────────────────
- *   中国范围之外**没有轮廓数据**（数据里只有中国的环），所以把框收进中国不会丢任何要画的东西；
- *   代价是**画布比与中国的墨卡托比不一致时会出现信箱空白** —— 见 `fitViewToCanvas` 的注释。
- *   这个代价是**故意的**：宁可上下留白看到完整的中国，也不要"填满画布但中国只剩一个小角"。
+ * ── 为什么不能"两端各夹一下"（这个坑真踩到过）──────────────────────────────────
+ *   夹两端会把**跨度压小**，压到 0 就回到了 `projectMercator` 的除零
+ *   （除数就是经度跨度）→ 整块画布 NaN → 地图与照片一起**静默消失**。
+ *   同样的理由让下面那两个"跨度非法"的分支一律退回 `CHINA_BOUNDS`：
+ *   宁可给出"整个中国"这个有意义的答案，也不产出一个 NaN 框。
  *
- * 非法输入（非有限数 / 非正跨度）→ 全国视野，与 `normalizeBounds` / `settleViewBox` 的退化口径一致。
+ * 非法输入（非有限数 / 非正跨度 / mercY 跨度被 ±85 夹断成 0）→ 全国视野，
+ * 与 `normalizeBounds` / `settleViewBox` 的退化口径一致。
  */
 function containInChina(minLon: number, minLat: number, maxLon: number, maxLat: number): number[] {
   if (!Number.isFinite(minLon) || !Number.isFinite(minLat)
@@ -593,16 +690,54 @@ function containInChina(minLon: number, minLat: number, maxLon: number, maxLat: 
   const cHiLat: number = CHINA_BOUNDS[3];
   const cLoY: number = mercYOf(cLoLat);
   const cHiY: number = mercYOf(cHiLat);
+  const cYSpan: number = cHiY - cLoY;
   const y0: number = mercYOf(minLat);
   const y1: number = mercYOf(maxLat);
-  // 快路径：已经在中国之内 → 逐位原样返回（浮点不失真、幂等、手势"没动"的那一帧不漂）。
-  // 纬度用 mercY 比（mercY 严格单调，所以与用纬度比等价）。
+  // ±85 夹断之后跨度可能塌成 0（例如 [89, 89.5]）—— 那会让 projectMercator 除零
+  if (!(y1 > y0)) { return CHINA_BOUNDS; }
+  // ① 快路径：两根轴都合法 → 逐位原样返回（浮点不失真、幂等、"没动"的那一帧不漂）。
+  //    纬度用 mercY 比（mercY 严格单调，所以与用纬度比等价）。
   if (minLon >= cLoLon && maxLon <= cHiLon && y0 >= cLoY && y1 <= cHiY) {
     return [minLon, minLat, maxLon, maxLat];
   }
-  // 经度：跨度够大就取整段（== 全国），否则平移进来（保跨度）
   let lo: number = minLon;
   let hi: number = maxLon;
+  let latLo: number = minLat;
+  let latHi: number = maxLat;
+  // ②③ 纬度：**唯一被硬约束的那根轴**
+  if (y1 - y0 >= cYSpan * (1 - SNAP_SPAN_EPS)) {
+    // 顶满（或超出）→ 纬度逐位取中国全域。
+    // ⚠️ "超出"的判据也带 `SNAP_SPAN_EPS` 容差（**对称的死区**）：跨度只比中国大
+    // 一两个 ulp 时**不许**去缩经度 —— 否则"缩到底之后往下拖一把"会因为 k ≈ 1−1e-16
+    // 把经度重算一遍（差 1 ulp），"逐位恒等"这条性质就没了。
+    // 真·缩过头（相对量 > 1e-12）才按比例收两根轴。
+    if (y1 - y0 > cYSpan * (1 + SNAP_SPAN_EPS)) {
+      // 缩过头了：经度按同一比例缩回来（两根轴一起缩 = 保形 = "缩到底"）
+      const k: number = cYSpan / (y1 - y0);
+      const mid: number = (lo + hi) / 2;
+      const half: number = ((hi - lo) / 2) * k;
+      lo = mid - half;
+      hi = mid + half;
+    }
+    latLo = cLoLat;
+    latHi = cHiLat;
+  } else {
+    let a: number = y0;
+    let b: number = y1;
+    if (a < cLoY) {
+      b += cLoY - a;
+      a = cLoY;
+    } else if (b > cHiY) {
+      a -= b - cHiY;
+      b = cHiY;
+    }
+    // 贴住边界的那一端**直接用中国的纬度端点**，不走 `invMercYOf` 往返：
+    // `mercYOf(18)` 的反函数会给出 17.999999999999996（差 1 ulp），
+    // 于是"纬度不小于 18"在**逐位**比较下就不成立了。
+    latLo = a === cLoY ? cLoLat : invMercYOf(a);
+    latHi = b === cHiY ? cHiLat : invMercYOf(b);
+  }
+  // ④ 经度：跨度比中国还宽（横屏画布）→ 取整段；否则平移进 [73,135]（**保跨度**）
   if (hi - lo >= (cHiLon - cLoLon) * (1 - SNAP_SPAN_EPS)) {
     lo = cLoLon;
     hi = cHiLon;
@@ -613,145 +748,190 @@ function containInChina(minLon: number, minLat: number, maxLon: number, maxLat: 
     lo -= hi - cHiLon;
     hi = cHiLon;
   }
-  // 纬度：同一条规矩，但在 **mercY 空间**里做（见上面那段"为什么"）。
-  // "取整段"直接给 CHINA_BOUNDS 的纬度端点 —— 逐位精确，不做 mercY 往返。
-  if (y1 - y0 >= (cHiY - cLoY) * (1 - SNAP_SPAN_EPS)) {
-    return [lo, cLoLat, hi, cHiLat];
-  }
-  let a: number = y0;
-  let b: number = y1;
-  if (a < cLoY) {
-    b += cLoY - a;
-    a = cLoY;
-  } else if (b > cHiY) {
-    a -= b - cHiY;
-    b = cHiY;
-  }
-  // 贴住边界的那一端**直接用中国的纬度端点**，不走 `invMercYOf` 往返：
-  // `mercYOf(18)` 的反函数会给出 17.999999999999996（差 1 ulp，3.6e-15 度），
-  // 于是"纬度不小于 18"在**逐位**比较下就不成立了。这一支是"越界时贴边"，
-  // 贴边当然要落在边上 —— 而且 `a === cLoY` 是上面赋值出来的精确相等，不是浮点判断。
-  const latLo: number = a === cLoY ? cLoLat : invMercYOf(a);
-  const latHi: number = b === cHiY ? cHiLat : invMercYOf(b);
   return [lo, latLo, hi, latHi];
 }
 
+// ── 一屏视野（task-19）：地图铺满画布高度，横向溢出由平移消费 ────────────────
+//
+// 用户的裁决是六个字：「地图铺满高度，左右横滑」。上面 `MapFrame` 那一节负责"画得下多少"
+// （框恒填满高度、可以比画布宽），本节负责"视野取多大"（一屏的经度跨度由画布比例反推）。
+// 两者合起来才是那条裁决的完整形态。
+
+/** 画布宽高比；尺寸非法（非有限数 / ≤ 0）时返回 0（调用方据此走退化路径）。 */
+function canvasAspectOf(canvasW: number, canvasH: number): number {
+  if (!Number.isFinite(canvasW) || !Number.isFinite(canvasH)) { return 0; }
+  if (!(canvasW > 0) || !(canvasH > 0)) { return 0; }
+  return canvasW / canvasH;
+}
+
 /**
- * 把"能装下数据的视野"调整为**与画布同样比例**（默认铺满）。
+ * **一屏的经度跨度**（度）：`画布宽高比 × 中国纬度 mercY 跨度 / DEG`。
  *
- * ── 为什么需要（这就是用户的第三条反馈"默认铺满"的成因）──────────────────────
- *   `fitBounds` 只按**数据跨度**求框，不看画布。而 `mapFrame` 为了**不变形**只能
- *   在块里 contain（居中信箱式）：当 `geoAspect(数据框) != 画布宽高比` 时，
- *   框的一侧会空出一条带。设备真值（控制器在真机上量到的）正是这一档：
+ * 真机 376×624.86 上的实算（报告 §2 的复算过程）：
+ *   `0.6017347885926447 × 0.80471895621705 / (π/180) = 27.744185828688188°`
+ * 于是中国全宽的绘制宽度 = `376 × 62 / 27.744185828688188 = 840.2481205952276pt`
+ * —— 画布宽的 **2.234702448391563 倍**（要横滑），而绘制高度 = 画布高的 **1.0000 倍**（铺满）。
  *
- *     画布（地图块）376 × 663.71pt，视野 [115.66, 29.88, 122.19, 41.24]
- *     → 数据框的墨卡托宽高比 0.4671，画布宽高比 376/663.71 = 0.5665
- *     → `mapFrame` 给 309.1 × 663.71 @ (33.45, 0)，**左右各空 33.45pt**
- *
- *   本函数把框在**较短的那个轴上按比例撑开**，使"框的比例 == 画布的比例"：
- *   数据仍然全部可见（框 ⊇ 数据），但不再有信箱空白 —— 空出来的那两条带由
- *   **地图自己**（国界 / 省界 / 海岸线）填上。
- *
- * ── 撑开哪一根轴：由"框被谁限制"决定（不是随便挑一根）────────────────────────
- *   · `geoAspect(数据框) < 画布比` → 框会被**高度**限制（左右空）→ 撑开**经度**；
- *   · `geoAspect(数据框) > 画布比` → 框会被**宽度**限制（上下空）→ 撑开**纬度**。
- *   两种都是"框变大"，所以**撑开只会让框更大，不会裁掉任何数据**（本模块的第一不变量）。
- *   纬度那一支必须在 **mercY 空间**里撑（`geoAspect` 的分母就是 mercY 跨度），
- *   否则撑完比例对不上 —— 所以那里用 `invMercYOf` 换回纬度。
- *
- * ── 撑开后仍要钳制在中国范围内吗：**要**（此处与上一版相反，是真机逼出来的反转）──────
- *   上一版的判断是"不钳制、允许露出境外"，理由三条：钳制会破坏比例 / 境外只有底色 /
- *   撑开量有界。前两条**在数学上仍然成立**，但第三条在竖屏上不成立 —— 撑开量不是
- *   "信箱那一条带"，而是**整个纬度方向**。真机画布 376×642.57 下实测：
- *
- *     `fitViewToCanvas(CHINA_REGION.bounds, 376, 642.57)` = `[73,135] × [-11.54, 68.18]`
- *
- *   **全国视野自己就被撑到了南半球。** 于是"允许露出境外"的真实后果不是"边上多两条底色"，
- *   而是"中国缩成中间一小块"—— 那正是用户在截图里看到的东西。
- *   所以现在**钳制**，统一由 `containInChina` 执行（它用平移、不夹两端）。
- *   代价是**信箱空白回来了**，见下。
- *
- * ── 代价：全国视野下会有上下留白（这是"中国居中且尽量大"的唯一形态）────────────────
- *   竖屏 376×642.57 的宽高比 0.5852，而中国自己的墨卡托比是
- *   `geoAspect(CHINA_BOUNDS) = 1.3447`。两者不可能同时满足 ——
- *   "框的比例 == 画布的比例"与"框 ⊆ 中国"在 `1.3447 != 0.5852` 时**互斥**。
- *   本函数的取舍是：**框 ⊆ 中国**（用户要看到完整的中国）。此时 `mapFrame` 按 contain 走、
- *   被**宽度**限制 → 框 `376 × 279.62` 居中在 `(0, 181.48)`，上下各留 181.48pt（合计 56.5%）。
- *   为什么这就是"尽量大"：框宽已经 == 画布宽（中国的经度方向被顶满），再大就只能裁掉
- *   中国的南北两端，而"看到完整的中国"是这次的要求本身。
- *   留白那两条带里画的是**底色**（本形态下它就是地图：海 + 视野内没有轮廓数据的地方）。
- *
- *   task-18 **复核过这一条并选择保留**（用户裁决允许放宽"视野 ⊆ 中国"）：
- *   把框撑满整块画布的实测结果是 `[73.5, -12.54, 134.5, 68.44]`（**南半球**），
- *   中国陆地只占画面高度的 42.8% —— 比现在**更小**。也就是说"框填满块"与
- *   "中国尽可能大"在竖屏上互斥，而用户要的是后者。数字见 `MapFrame` 的注释与 task-18 报告。
- *   真正"看得见"的收益在**放大态**那一支：撑开经度时补进来的是**中国自己的**省界与海岸线
- *   （真机那一档正是这一支），它一点没变 —— 铺满的行为在用户认可的那张图上是**逐位不变**的。
- *
- * ── 幂等 ────────────────────────────────────────────────────────────────────
- *   比例已经匹配时**原样返回入参**（浮点容差 `1e-12` 相对量），所以重复调用不会累积漂移；
- *   设备与预览都调它，两次得到同一份数值。
- *
- * ── 退化（一律返回 `normalizeBounds(dataBounds)`，不猜、不产 NaN）───────────────
- *   · 画布宽/高非有限或 ≤ 0 → 原样返回（"画布多大都不知道"时不该改视野）；
- *   · `dataBounds` 非法（长度/NaN/零跨度）→ `normalizeBounds` 退回全国视野后再判断。
- *   每一步的返回值都要再过一次 `containInChina`（见上），所以**输出恒 ⊆ 中国范围**；
- *   ±84° / 360° 那两个兜底钳制因此在中国范围内**永不触发**，它们保留为第二道防线
- *   （防止 `CHINA_REGION.bounds` 哪天被改到安全带之外）。
- *
- * @param dataBounds `[minLon, minLat, maxLon, maxLat]`，典型来源是 `fitBounds` 的返回值
- *                   （没有有效坐标时调用方传 `CHINA_REGION.bounds`）。
- * @param canvasW 画布（地图块）宽 pt。
- * @param canvasH 画布（地图块）高 pt。
- * @returns 撑开后的 `[minLon, minLat, maxLon, maxLat]`：**恒 ⊇ 入参**（入参 ⊆ 中国时）且
- *          **恒 ⊆ `CHINA_REGION.bounds`**。两根轴都不能同时满足时才放弃比例（见上）。
+ * 画布尺寸非法 → 退回"整个中国"的经度跨度（62°）：那是唯一无歧义的答案。
  */
-export function fitViewToCanvas(dataBounds: number[], canvasW: number, canvasH: number): number[] {
-  const b: number[] = normalizeBounds(dataBounds);
-  const bw: number = Number.isFinite(canvasW) && canvasW > 0 ? canvasW : 0;
-  const bh: number = Number.isFinite(canvasH) && canvasH > 0 ? canvasH : 0;
-  if (!(bw > 0) || !(bh > 0)) { return containInChina(b[0], b[1], b[2], b[3]); }
-  const want: number = bw / bh;             // 目标：框的墨卡托宽高比 == 画布宽高比
-  const cur: number = geoAspect(b);
-  if (!(want > 0) || !(cur > 0)) { return containInChina(b[0], b[1], b[2], b[3]); }
-  // 已经一样了（含浮点以内的相等）→ 原样返回。幂等靠这一条。
-  if (Math.abs(cur - want) <= 1e-12 * want) { return containInChina(b[0], b[1], b[2], b[3]); }
+export function fillHeightLonSpan(canvasW: number, canvasH: number): number {
+  const a: number = canvasAspectOf(canvasW, canvasH);
+  if (!(a > 0)) { return CHINA_BOUNDS[2] - CHINA_BOUNDS[0]; }
+  return (a * CHINA_Y_SPAN) / DEG;
+}
 
-  const minLon: number = b[0];
-  const minLat: number = b[1];
-  const maxLon: number = b[2];
-  const maxLat: number = b[3];
-  const y0: number = mercYOf(minLat);
-  const y1: number = mercYOf(maxLat);
+/** 以 `lonCenter` 为经度中心的一屏视野（内部用；纬度恒为中国全域）。 */
+function fillHeightViewAt(lonCenter: number, canvasW: number, canvasH: number): number[] {
+  const span: number = fillHeightLonSpan(canvasW, canvasH);
+  const c: number = Number.isFinite(lonCenter) ? lonCenter : (CHINA_BOUNDS[0] + CHINA_BOUNDS[2]) / 2;
+  return containInChina(c - span / 2, CHINA_BOUNDS[1], c + span / 2, CHINA_BOUNDS[3]);
+}
 
-  if (cur < want) {
-    // 框被高度限制（左右留白）→ 撑开经度：`want = 经度弧度 / mercY跨度`
-    const needSpan: number = (want * (y1 - y0)) / DEG;      // 需要的经度跨度（度）
-    const mid: number = (minLon + maxLon) / 2;
-    let lo: number = mid - needSpan / 2;
-    let hi: number = mid + needSpan / 2;
-    if (hi - lo > LON_EXPAND_LIMIT) { lo = mid - LON_EXPAND_LIMIT / 2; hi = mid + LON_EXPAND_LIMIT / 2; }
-    // 兜底：无论如何**不许把数据关在框外**（第一不变量优先于比例）
-    if (lo > minLon) { lo = minLon; }
-    if (hi < maxLon) { hi = maxLon; }
-    // 最后一步：框 ⊆ 中国（平移优先，跨度过大才取整段）——顺序不能换，
-    // 因为"⊇ 数据"与"⊆ 中国"只有在数据本身 ⊆ 中国时才可能同时成立（`fitBounds` 保证这一点）。
-    return containInChina(lo, minLat, hi, maxLat);
+/**
+ * **让地图填满画布高度的视野框**（按画布比例反推经度跨度）。
+ *
+ * 与已删除的 `fitViewToCanvas` 的区别（那是"把框撑到画布比例、且框 ⊆ 中国"）：
+ *   · 本函数的**纬度直接用中国全域**（18~54），**不由数据决定**；
+ *   · 经度跨度由**画布宽高比**反推 `= 比 × 中国 mercY 跨度 / DEG`，于是
+ *     `geoAspect(结果) == 画布宽高比` **逐位**成立 → `mapFrame` 给出 `w == blockW`、`x == 0`
+ *     —— 框 == 画布，一点信箱空白都没有；
+ *   · 画出来的地图因此**纵向铺满**（绘制高度 == 画布高），而**横向远宽于画布**
+ *     （绘制宽度 == 画布宽 × 62/一屏跨度，真机 2.2347 倍）→ 调用方负责让用户横向平移。
+ *
+ * ── 为什么纬度取中国全域（而不是"数据所在的那一小块"）──────────────────────────
+ *   "铺满高度"是用户的**硬要求**，而"铺满"的判据只能是"画出来的地图纵向盖满画布"。
+ *   要让中国全域的绘制高度 == 画布高，纬度跨度就必须正好是中国全域的跨度
+ *   （`mapH = 框高 × 中国 mercY 跨度 / 视野 mercY 跨度`，只有分母相等时它才 == 框高）。
+ *   取更小的纬度跨度只有两种后果：① 缩小地图（纵向盖不满，出现上下留白 = 用户抱怨的现象）；
+ *   ② 让框比画布高（`frame.h > blockH`）来补偿 —— 那是**纵向裁掉中国的南北两端**，
+ *      而"缩到底要能看到完整的中国纬度"是本批的另一条硬要求。两条都不能选，所以纬度取全域。
+ *
+ * ── 经度中心：**数据的经度中心**（由 `bounds` 给出）─────────────────────────────
+ *   地图比画布宽 → 用户一眼只能看到其中一屏 → **默认必须让钉子可见**。把一屏的中心对齐到
+ *   数据框的中心，就是"把用户的数据放在可见区中央"这件事在几何上的全部内容。
+ *   数据比一屏还宽时 `defaultWallView` 会改用"钉子最多的那一屏"，见它的注释。
+ *
+ * `bounds` 只用来取**经度中心**（非法/缺失时退回中国经度中心 104°E），纬度一律忽略。
+ * 画布尺寸非法 → 返回 `CHINA_REGION.bounds`（"整个中国"，不产 NaN）。
+ */
+export function fillHeightView(bounds: number[], canvasW: number, canvasH: number): number[] {
+  const b: number[] = normalizeBounds(bounds);
+  if (!(canvasAspectOf(canvasW, canvasH) > 0)) { return CHINA_BOUNDS; }
+  return fillHeightViewAt((b[0] + b[2]) / 2, canvasW, canvasH);
+}
+
+/**
+ * 默认视野的**经度中心**：一屏装得下全部数据 → 数据中心；装不下 → **钉子最多的那一屏**。
+ *
+ * ── 为什么不是"一律数据中心"（这是本批最难的一处权衡，如实写在这里）─────────────
+ *   "铺满高度"与"全部钉子可见"在数据经度跨度大于一屏时**互斥**，而且**数学上无解**：
+ *   一屏的经度跨度被画布比例与"中国纬度全域"**唯一确定**（真机 376×624.86 → 27.744°），
+ *   想让它更宽，就只能让纬度跨度超过 18~54（露出南半球，用户上一版看到的正是那个）
+ *   或者把中国的南北两端裁掉（"缩到底要看到完整中国纬度"就不成立了）。
+ *   所以在"铺满"这条硬要求下，**"全部钉子可见"不可达**；可达的是"**尽可能多**的钉子可见"。
+ *   本函数做的就是这个最大化：在经度轴上滑一个宽度为一屏的窗口，取**覆盖钉子最多**的
+ *   那个位置；并列时取**离数据框中心最近**的那个（于是"装得下"时结果**恒等于**数据中心，
+ *   与"把数据放在可见区中央"这条更朴素的规则逐位一致）。
+ *   实测（`render.test.ts` 里的 6 城夹具：乌鲁木齐 87.62 / 拉萨 91.17 / 敦煌 94.66 /
+ *   广州 113.26 / 北京 116.41 / 上海 121.47，画布 360×720，一屏 23.053°）：
+ *     数据中心 → 窗口 `[93.02, 116.07]`，屏内 **2** 个钉子（敦煌、广州；京/沪/拉萨/乌市在屏外）；
+ *     最多覆盖 → 窗口 `[94.01, 117.06]`，屏内 **3** 个钉子（敦煌、广州、北京）。
+ *   两者都不是"全部"，差别是 2 vs 3 —— 这就是"铺满"能买到的最好结果。
+ *   另外**横向平移是用户自己选的交互**：看不到的那几个钉子靠左右拖就能找到，
+ *   而"缩到底的完整中国纬度"与"铺满"是**每一帧都成立**的。
+ *
+ * 只用 `hasPlace` 为真的照片（与 `fitBounds` / `buildScene` **同一套筛选**），
+ * 所以窗口跟着的钉子集合正好是会被画到墙上的那些。
+ */
+function defaultLonCenter(photos: WallPhoto[], dataCenter: number, spanDeg: number): number {
+  const lons: number[] = [];
+  for (let i = 0; i < photos.length; i++) {
+    const p: WallPhoto | undefined = photos[i];
+    if (p === undefined || p === null) { continue; }
+    if (!hasPlace(p)) { continue; }
+    if (!Number.isFinite(p.lon)) { continue; }
+    lons.push(p.lon);
   }
+  if (lons.length === 0) { return dataCenter; }
+  lons.sort((a: number, b: number): number => (a < b ? -1 : (a > b ? 1 : 0)));
+  const lo: number = lons[0];
+  const hi: number = lons[lons.length - 1];
+  // 装得下一屏 → 数据中心（**逐位**返回入参，于是"数据居中"在常规数据上一点没变）
+  if (!(spanDeg > 0) || hi - lo <= spanDeg) { return dataCenter; }
+  let bestCount: number = 0;
+  let bestCenter: number = dataCenter;
+  let bestDist: number = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < lons.length; i++) {
+    let j: number = i;
+    while (j + 1 < lons.length && lons[j + 1] - lons[i] <= spanDeg) { j++; }
+    const count: number = j - i + 1;
+    const center: number = (lons[i] + lons[j]) / 2;
+    const dist: number = Math.abs(center - dataCenter);
+    if (count > bestCount || (count === bestCount && dist < bestDist)) {
+      bestCount = count;
+      bestCenter = center;
+      bestDist = dist;
+    }
+  }
+  return bestCenter;
+}
 
-  // 框被宽度限制（上下留白）→ 撑开纬度：`want = 经度弧度 / mercY跨度`
-  const needY: number = ((maxLon - minLon) * DEG) / want;   // 需要的 mercY 跨度
-  const yc: number = (y0 + y1) / 2;
-  let lo2: number = yc - needY / 2;
-  let hi2: number = yc + needY / 2;
-  const yLimit: number = mercYOf(LAT_EXPAND_LIMIT);
-  if (lo2 < -yLimit) { lo2 = -yLimit; }
-  if (hi2 > yLimit) { hi2 = yLimit; }
-  // 兜底同上：数据必须仍在框内（mercY 单调，所以直接比 mercY 即可）
-  if (lo2 > y0) { lo2 = y0; }
-  if (hi2 < y1) { hi2 = y1; }
-  // 最后一步同上：全国视野走的就是**这一支**（中国比竖屏画布"宽" → 撑纬度 → 被收回中国）
-  return containInChina(minLon, invMercYOf(lo2), maxLon, invMercYOf(hi2));
+/**
+ * **设备与预览共用的默认视野**（`WallPage.rebuild` 与 `tools/render-preview.ts` 都调它）。
+ *
+ * 三步，每一步都在上面的函数里论证过：
+ *   ① `fitBounds(photos, pad)` → 数据框（没有有效坐标时退回全国视野，与设备的退化路径一致）；
+ *   ② `fillHeightView` → 铺满高度、经度中心取数据中心的那个框；
+ *   ③ 数据比一屏宽时把中心换成"钉子最多的那一屏"（`defaultLonCenter`）。
+ *
+ * 它是"默认视野"这件事的**唯一**产出者 —— 设备与预览因此不可能各算一套。
+ */
+export function defaultWallView(photos: WallPhoto[], padRatio: number, canvasW: number,
+  canvasH: number): number[] {
+  const vb: number[] | undefined = fitBounds(photos, padRatio);
+  const dataBounds: number[] = vb !== undefined ? vb : CHINA_BOUNDS;
+  const base: number[] = fillHeightView(dataBounds, canvasW, canvasH);
+  const mid: number = (dataBounds[0] + dataBounds[2]) / 2;
+  const span: number = base[2] - base[0];
+  const center: number = defaultLonCenter(photos, mid, span);
+  if (center === mid || !Number.isFinite(center)) { return base; }
+  return fillHeightViewAt(center, canvasW, canvasH);
+}
+
+/**
+ * 把**已有的视野**重新对齐到一块**新画布**的比例（画布尺寸变了：旋转 / 分屏 / 折叠屏）。
+ *
+ * 为什么需要它：视野的不变量是"墨卡托比 == 画布比"（否则地图会被拉变形，而且
+ * `mapFrame` 给出的框不再等于画布）。画布尺寸一变，旧视野的比例就不再成立 ——
+ * 设备侧必须有一处把它修正回来，否则用户旋转一次屏幕，地图就一直歪到下次重置视野。
+ *
+ * 规则（尽量少动用户的视野）：
+ *   · 比例已经匹配（`1e-12` 相对容差内）→ **原样返回**（幂等：设备每次 `rebuild` 都调它，
+ *     正常路径上必须是"什么都没发生"）；
+ *   · 不匹配 → **保持经度跨度与中心**，按新比例反推纬度跨度；纬度跨度超过中国全域时
+ *     两根轴**一起**按比例收（= 缩小，保形），于是结果仍然 ⊆ 中国、仍然铺满高度。
+ *
+ * 画布尺寸非法 → 只做中国范围钳制（不改比例，"画布多大都不知道"时不该动视野）。
+ */
+export function refitViewToCanvas(bounds: number[], canvasW: number, canvasH: number): number[] {
+  const b: number[] = normalizeBounds(bounds);
+  const a: number = canvasAspectOf(canvasW, canvasH);
+  const cur: number = geoAspect(b);
+  if (!(a > 0) || !(cur > 0) || Math.abs(cur - a) <= 1e-12 * a) {
+    return containInChina(b[0], b[1], b[2], b[3]);
+  }
+  const lonSpan0: number = b[2] - b[0];
+  const y0: number = mercYOf(b[1]);
+  const y1: number = mercYOf(b[3]);
+  // 按新比例反推纬度跨度（mercY 空间），超过中国全域就两根轴一起收
+  const yWant: number = (lonSpan0 * DEG) / a;
+  const k: number = yWant > CHINA_Y_SPAN ? CHINA_Y_SPAN / yWant : 1;
+  const lonSpan: number = lonSpan0 * k;
+  const half: number = (yWant * k) / 2;
+  const yMid: number = (y0 + y1) / 2;
+  const lonMid: number = (b[0] + b[2]) / 2;
+  return containInChina(lonMid - lonSpan / 2, invMercYOf(yMid - half),
+    lonMid + lonSpan / 2, invMercYOf(yMid + half));
 }
 
 // ── 手势视野：双指缩放 / 拖动平移（task-16 的第 3 件事）────────────────────────
@@ -775,19 +955,6 @@ export function fitViewToCanvas(dataBounds: number[], canvasW: number, canvasH: 
 //   绕中心缩放在手指偏一侧时会"地图自己往中间跑"，手感是错的。
 
 /**
- * 视野缩放的**下限**（经度跨度，度）= 全国跨度。再往外缩就没有地图可看了：
- * `CHINA_REGION.bounds` 之外没有任何轮廓数据，画出来只有底色。
- * 这个数直接由 `CHINA_BOUNDS` 算出，**不另写 62**（那迟早与 projection.ts 漂移）。
- *
- * ⚠️ 它**只管经度**（task-17 的教训）：`zoomViewAt` 用它反解 factor 时，纬度是按同一个
- * factor 搭车的，所以"经度到顶"并不等于"框到了全国" —— 真机上经度到顶、纬度还在膨胀，
- * 得到 `lat[-20.6, 64.4]`。真正把两根轴都收住的是 `containInChina`（它按 `CHINA_BOUNDS`
- * 的两根轴各自收）。这个常量现在的职责是"别让 factor 把经度缩过头"，与它配合出
- * "缩到底 == 全国"。
- */
-export const MAX_VIEW_SPAN_DEG: number = CHINA_BOUNDS[2] - CHINA_BOUNDS[0];
-
-/**
  * 视野缩放的**上限**（经度跨度，度）= 单个城市级，复用既有的 `MIN_VIEW_SPAN_DEG = 0.6°`。
  *
  * 为什么复用它而不是另取一个数：`fitBounds` 的注释里已经把 0.6° 论证过一遍
@@ -805,19 +972,26 @@ export const MIN_ZOOMED_VIEW_SPAN_DEG: number = MIN_VIEW_SPAN_DEG;
  *
  * ── 为什么它必须是一个**导出的函数**，而不是显示端自己写两遍 ─────────────────────
  *   真机诊断行上印的 `可缩 1×~103.33×` 原来是**手写**的：`'1×'` 是字符串字面量，
- *   最大值在 `WallPage` 里另算一遍。那个"1×"当时只是**显示** —— 经度跨度确实被夹在 62°，
- *   可同一个框的纬度一路膨胀到 −20.6°，用户看到的根本不是全国。
- *   "显示与行为不符"的根，就是**显示端与约束端各写各的**。
- *   现在两端读同一个函数：约束端是 `MAX_VIEW_SPAN_DEG` / `MIN_ZOOMED_VIEW_SPAN_DEG`
- *   ＋ `containInChina`（保证经度到顶那一步真的等于全国框），显示端是这个函数 ——
- *   于是单测可以**直接**断言"显示的下界 == 反复缩小实际到达的下界"
- *   （`render.test.ts` 的"可缩 N× 显示与真实界限一致"那一条）。
+ *   最大值在 `WallPage` 里另算一遍。"显示与行为不符"的根，就是**显示端与约束端各写各的**。
+ *   现在两端读同一个函数：约束端是 `containInChina`（纬度到顶那一步真的落在 `[18,54]`）
+ *   ＋ `MIN_ZOOMED_VIEW_SPAN_DEG`，显示端是这个函数 ——
+ *   于是单测可以**直接**断言"显示的下界 == 反复缩小实际到达的下界"。
  *
- * @returns `[最小倍数, 最大倍数]`：最小 = `viewZoomOf(全国框)` = 1（缩到底就是全国），
- *          最大 = `62° / 0.6°` ≈ 103.33（放到单城市级）。
+ * ── task-19：下界**不再是 1×**（这是视野模型改动的直接后果）──────────────────────
+ *   旧模型的下界是"整个中国塞进画布"（`viewZoomOf(全国框)` = 1）。新模型下画布只装得下
+ *   一小段经度，缩到底时**纬度顶满中国全域**（再缩就得露出国境之外），而经度跨度由画布
+ *   比例唯一决定：真机 376×624.86 上是 `27.744185828688188°` → 下界 = `62/27.7442`
+ *   = **2.234702448391563×**。所以下界必须**随画布比例变**，本函数因此收两个参数。
+ *
+ * @param canvasW 画布（地图块）宽 pt。
+ * @param canvasH 画布（地图块）高 pt。
+ * @returns `[最小倍数, 最大倍数]`：最小 = `viewZoomOf(铺满高度那一档)`（真机 2.2347×），
+ *          最大 = `62° / 0.6°` ≈ 103.33（放到单城市级）。画布尺寸非法时最小取
+ *          `viewZoomOf(全国框)` = 1（"画布多大都不知道"时的退化口径）。
  */
-export function viewZoomRange(): number[] {
-  const nat: number = viewZoomOf(CHINA_BOUNDS);
+export function viewZoomRange(canvasW: number, canvasH: number): number[] {
+  const floor: number[] = fillHeightView(CHINA_BOUNDS, canvasW, canvasH);
+  const nat: number = viewZoomOf(floor);
   const near: number = MIN_ZOOMED_VIEW_SPAN_DEG > 0
     ? (CHINA_BOUNDS[2] - CHINA_BOUNDS[0]) / MIN_ZOOMED_VIEW_SPAN_DEG
     : nat;
@@ -825,81 +999,52 @@ export function viewZoomRange(): number[] {
 }
 
 /**
- * 把一个刚算出来的方框落成**合法**的视野框；**已经合法时原样返回**（逐位不变）。
+ * 把一个刚算出来的方框（**mercY 空间**的纬度区间）落成**合法**的视野框；
+ * 已经合法时**原样返回**（逐位不变，靠 `containInChina` 的快路径）。
  *
- * ── 为什么需要它（这是本批真踩到的一个坑）────────────────────────────────────
+ * ── 为什么需要它（这是真踩到的一个坑）──────────────────────────────────────────
  *   手势可以把手指数到任意远：`panViewBy(b, 0, 50)` 表示"往下拖 50 个画布高"。
  *   第一版没做这一步，于是画出纬度 **-89.9999°** 的框 —— 而 `mercYOf` 内部把纬度
  *   夹在 ±85°，两条边界夹完之后 mercY 跨度**变成 0**：
  *   `projectMercator` 的除数就是那个跨度 → 整块画布 NaN → 地图与照片一起**静默消失**。
- *   这正是本模块最怕的一类失败（同 `parseBounds` / `fitAxis` 的注释）。
+ *   这正是本模块最怕的一类失败（同 `fitAxis` 的注释）。
  *   所以约束必须在**算出方框的这一层**就强加，而不是指望调用方不去算极端的数。
  *
- * ── 四条约束（顺序不能换：先保跨度，再挪中心，最后收进中国）────────────────────
- *   1. **经度跨度** ≤ 360°（环球）。再大就没有地图的语义了。
- *   2. **mercY 跨度** ≤ 墨卡托安全带（`±LAT_EXPAND_LIMIT` = ±84°）。
- *      跨度超了就收到整条带（这是"装不下"的唯一情形）；
- *      跨度本身没超、只是位置越界时**平移**回来 —— **平移不改变跨度**，
- *      与 `fitAxis` 第 ③ 步"平移而不是夹两端"是同一条规矩（夹两端会把跨度压小甚至压成 0）。
- *   3. **中心**同时被两个区间夹：中国范围 `[73,135]×[18,54]`（手势特有：不许拖到
- *      视野里完全没有中国 —— 那是一片底色，用户也不知道怎么回来），以及
- *      "整条框都不越出墨卡托安全带"给中心留下的那一段。
- *      两个区间不相交时（跨度太大、两者都要占满）取 `mercY = 0`。
- *   4. **框整个 ⊆ 中国范围**（`containInChina`，最后一步，两条返回路径都要过）。
- *      ⚠️ 这一条是 task-17 补的，**它才是"缩小的上界"**：约束 1~3 里
- *      只有第 1 条管跨度，而它只管**经度** —— 于是"经度顶到 62°（全国）之后
- *      纬度继续按画布比例搭车膨胀到 ±84°"这件事原先没人挡。
- *      真机症状：诊断行写着"可缩 1×"，画面上的中国却只剩中间一小块、纬度到了 −20.6°。
+ * ── task-19：这个函数被**掏空**成一层的转接（约束全部搬进 `containInChina`）────────
+ *   旧版这里另有一套自己的夹断逻辑（±84° 安全带、中心夹在中国范围、跨度 ≤ 360°）。
+ *   它与 `containInChina` 是**两处口径**，而新模型只认一条规矩（纬度 ⊆ 18~54、经度平移到
+ *   73~135、超跨度按比例收）。留着第二套只会让"显示与行为"重新分叉，所以删掉，
+ *   只保留它真正独占的职责：**mercY 区间 → 经纬度**的那一次换算，以及"不是数就退全国"。
  *
- * **合法性判据 = 那三个布尔量**（`lonOk && yOk && inChina`），"原样返回"的承诺靠它们，
- * 而不是靠"再算一遍看等不等" —— 后者对浮点是不成立的。
+ * 非法输入（非有限数 / 非正跨度 / mercY 跨度在 ±85 夹断后为 0）→ `CHINA_REGION.bounds`。
  */
 function settleViewBox(minLon: number, minY: number, maxLon: number, maxY: number): number[] {
-  const yLimit: number = mercYOf(LAT_EXPAND_LIMIT);
-  const lonSpanRaw: number = maxLon - minLon;
-  const ySpanRaw: number = maxY - minY;
-  // 连数字都不是 → 退回全国视野（不产 NaN 是硬契约）
   if (!Number.isFinite(minLon) || !Number.isFinite(maxLon)
     || !Number.isFinite(minY) || !Number.isFinite(maxY)) {
     return CHINA_BOUNDS;
   }
-  if (!(lonSpanRaw > 0) || !(ySpanRaw > 0)) { return CHINA_BOUNDS; }
-
-  const cLoY: number = mercYOf(CHINA_BOUNDS[1]);
-  const cHiY: number = mercYOf(CHINA_BOUNDS[3]);
-  let cLon: number = (minLon + maxLon) / 2;
-  let cY: number = (minY + maxY) / 2;
-  // **框整个落在中国范围之内**（不只是中心）。mercY 单调，所以用 mercY 比与用纬度比等价。
-  // 这是 task-17 新增的那一条：老代码只夹中心，于是"经度顶到 62° 之后纬度继续搭车膨胀"
-  // 这件事没人挡（真机缩到底得到 lat[-20.6, 64.4]）。见 `containInChina` 的长注释。
-  const inChina: boolean = minLon >= CHINA_BOUNDS[0] && maxLon <= CHINA_BOUNDS[2]
-    && minY >= cLoY && maxY <= cHiY;
-  const lonOk: boolean = lonSpanRaw <= 360 && cLon >= CHINA_BOUNDS[0] && cLon <= CHINA_BOUNDS[2];
-  const yOk: boolean = ySpanRaw <= 2 * yLimit && cY >= cLoY && cY <= cHiY
-    && minY >= -yLimit && maxY <= yLimit;
-  // 快路径：已经合法 → 逐位原样返回。手势的每一步因此都是**精确**变换（不做无谓的重新居中）。
-  if (lonOk && yOk && inChina) {
-    return [minLon, invMercYOf(minY), maxLon, invMercYOf(maxY)];
+  if (!(maxLon > minLon) || !(maxY > minY)) { return CHINA_BOUNDS; }
+  // 第二道防线：保跨度地平移进墨卡托安全带（见 `LAT_EXPAND_LIMIT` 的实测症状）。
+  // 顺序不能换 —— 必须在 containInChina **之前**，否则被 ±85 夹断虚增的跨度会被
+  // 当成"用户在缩小"，连带把经度跨度也缩掉。
+  const yLimit: number = mercYOf(LAT_EXPAND_LIMIT);
+  let a: number = minY;
+  let c: number = maxY;
+  if (c - a > 2 * yLimit) {
+    const mid: number = (a + c) / 2;
+    a = mid - yLimit;
+    c = mid + yLimit;
+  } else if (a < -yLimit) {
+    c += -yLimit - a;
+    a = -yLimit;
+  } else if (c > yLimit) {
+    a -= c - yLimit;
+    c = yLimit;
   }
-
-  let lonSpan: number = lonSpanRaw > 360 ? 360 : lonSpanRaw;
-  let ySpan: number = ySpanRaw > 2 * yLimit ? 2 * yLimit : ySpanRaw;
-  if (cLon < CHINA_BOUNDS[0]) { cLon = CHINA_BOUNDS[0]; }
-  if (cLon > CHINA_BOUNDS[2]) { cLon = CHINA_BOUNDS[2]; }
-  // 中心的 y：两个允许区间的**交集**；不相交（跨度把带占满了）时退到 0（赤道）
-  const loLimit: number = Math.max(-(yLimit - ySpan / 2), cLoY);
-  const hiLimit: number = Math.min(yLimit - ySpan / 2, cHiY);
-  if (loLimit <= hiLimit) {
-    if (cY < loLimit) { cY = loLimit; }
-    if (cY > hiLimit) { cY = hiLimit; }
-  } else {
-    cY = 0;
-  }
-  const minY2: number = cY - ySpan / 2;
-  const maxY2: number = cY + ySpan / 2;
-  // 收尾：框 ⊆ 中国（平移优先，跨度过大才取整段）。上面那些夹断都只是"别产出 NaN"的中间兜底，
-  // **中国范围这一条才是对外承诺** —— 所以它必须排在最后，且两条返回路径都要过。
-  return containInChina(cLon - lonSpan / 2, invMercYOf(minY2), cLon + lonSpan / 2, invMercYOf(maxY2));
+  const minLat: number = invMercYOf(a);
+  const maxLat: number = invMercYOf(c);
+  if (!(maxLat > minLat)) { return CHINA_BOUNDS; }
+  return containInChina(minLon, minLat, maxLon, maxLat);
 }
 
 /**
@@ -910,16 +1055,18 @@ function settleViewBox(minLon: number, minY: number, maxLon: number, maxY: numbe
  * ——因为 `projectMercator` 的纵向就是按 mercY 线性拉伸的，只有这样"不动"才真的是不动。
  *
  * ── 三条界限（都在这里强制，调用方不必自己判）────────────────────────────────
- *   · 经度跨度被夹在 `[MIN_ZOOMED_VIEW_SPAN_DEG, MAX_VIEW_SPAN_DEG]` = `[0.6°, 62°]`。
- *     实现方式是**反解出允许的 factor 范围** `[跨度/62, 跨度/0.6]` 再夹 ——
- *     这样"夹完之后仍然以同一点为不动点"，不会出现"夹到边界时地图突然横移一下"。
- *   · **框整个落在中国范围之内**（由 `settleViewBox` → `containInChina` 执行）。
- *     这一条是 task-17 补的，也是"缩到底 = 全国"的另一半：
- *     上面那条只管经度，而纬度是**搭车**的（同一 factor）。
- *   · 中心与跨度还各有一道"别产出 NaN"的中间兜底（见 `settleViewBox` 的注释）。
+ *   · **缩小的下界 = 完整的中国纬度**（task-19 改的就是这一条）。
+ *     旧版反解的是"经度跨度不许超过 62°"，而**纬度是同一个 factor 搭车的** ——
+ *     于是经度到顶之后纬度还在膨胀，真机缩到底得到 `lat[-20.6, 64.4]`（南半球）。
+ *     新版反解的是**纬度**：`f ≥ 视野 mercY 跨度 / 中国 mercY 跨度` —— 到顶时
+ *     纬度正好是 `[18,54]`，经度跨度随之等于"一屏"（`fillHeightLonSpan`）。
+ *     这一条与画布比例**天然一致**：比例不变时，纬度到顶 ⇔ 经度 == 一屏跨度。
+ *   · 经度跨度的**上界** = `MIN_ZOOMED_VIEW_SPAN_DEG`（0.6°，单城市级）。
+ *   · 结果一律 ⊆ 中国范围（由 `settleViewBox` → `containInChina` 执行；纬度到顶那一支
+ *     还会把两根轴按同一比例收，保证"缩到底"是一个**保形的**终点）。
  *
  * 非法输入（`factor` 非有限或 ≤ 0、`bounds` 非法）一律原样返回归一化后的框 ——
- * 与 `fitViewToCanvas` 的退化口径一致：**不产 NaN、不抛错**。
+ * 与 `containInChina` 的退化口径一致：**不产 NaN、不抛错**。
  */
 export function zoomViewAt(bounds: number[], factor: number, fx: number, fy: number): number[] {
   const b: number[] = normalizeBounds(bounds);
@@ -931,8 +1078,10 @@ export function zoomViewAt(bounds: number[], factor: number, fx: number, fy: num
   const y1: number = mercYOf(b[3]);
   const ySpan: number = y1 - y0;
   if (!(lonSpan > 0) || !(ySpan > 0)) { return b; }
-  // 反解允许的 factor：lonSpan / f 必须落在 [0.6, 62]
-  const fLo: number = lonSpan / MAX_VIEW_SPAN_DEG;
+  // 反解允许的 factor 区间：
+  //   缩小（f < 1）不能把纬度撑过中国全域 → f ≥ ySpan / CHINA_Y_SPAN
+  //   放大（f > 1）不能把经度收到 0.6° 以下 → f ≤ lonSpan / MIN_ZOOMED_VIEW_SPAN_DEG
+  const fLo: number = ySpan / CHINA_Y_SPAN;
   const fHi: number = lonSpan / MIN_ZOOMED_VIEW_SPAN_DEG;
   let f: number = factor;
   if (f < fLo) { f = fLo; }
@@ -972,10 +1121,19 @@ export function zoomViewAt(bounds: number[], factor: number, fx: number, fy: num
  * 纵向**必须**在 mercY 空间里平移（不是纬度空间）：屏幕上等距的拖动对应等量的 mercY，
  * 而不是等量的纬度 —— 在北纬 50° 用纬度平移会比手指走得快约 1.5 倍。
  *
- * 平移不改变跨度（也就不会改变比例），所以它不会干扰 `fitViewToCanvas` 的不变量。
- * 中心、墨卡托安全带与**中国范围**由 `settleViewBox` 统一夹住 —— 最后那一条意味着
- * **平移是"顶到边界就停"**：缩到全国（1×）之后再也拖不动（框已经等于中国，无处可去），
- * 放大态则可以一直拖到框边贴上中国边界。手感上等价于地图 App 的"拖到头"。
+ * 平移不改变跨度（也就不会改变比例），所以它不会破坏"不变形"与"铺满高度"这两条不变量 ——
+ * 这正是新模型里"左右横滑"能成立的原因：**移动的只是经纬度窗口，框的形状一点没变**。
+ *
+ * ── 边界：`containInChina`（**平移式**，不是夹两端）─────────────────────────────
+ *   · **横向**：窗口被平移进 `[73,135]`。新模型下默认视野只占中间 27.744°，
+ *     左右各有 `34.256°` 的余量可以滑（真机 464.25pt）—— 这是"横滑"真正有用的地方；
+ *     滑到最西/最东时窗口边缘贴住 73/135，再拖就**停住**（跨度不变，画面不再移动）。
+ *     为什么不让它继续滑出中国：外面**一条轮廓数据都没有**，屏幕上只剩底色，
+ *     用户还会找不到回来的路。这个边界同时兑现了两条要求：
+ *     "横向能自由移动"（默认视野下 34.256° 的自由度）与"不许拖到地图完全离开屏幕"。
+ *   · **纵向**：窗口被平移进 `[18,54]`。但默认视野的纬度**已经就是** `[18,54]`
+ *     （铺满高度那一档），所以**默认视野下纵向根本拖不动** —— 与用户"左右横滑"的
+ *     描述逐字一致（横着能滑、竖着不用滑）。放大之后纵向才真的有自由度。
  */
 export function panViewBy(bounds: number[], fx: number, fy: number): number[] {
   const b: number[] = normalizeBounds(bounds);
@@ -1446,19 +1604,19 @@ export function parseOutline(text: string): OutlineData | undefined {
  * ── 视口裁剪：整个落在**绘制框**之外的环**不产出子路径** ────────────────────────
  * 为什么需要：`china_outline.json` 的 `bounds` 与 `CHINA_REGION.bounds` 一致，
  * 而它的 `minLat = 18` —— 南海诸岛在 8~11.4°N，投影后落在绘制框**下方**。
- * 不裁的话它们会飘到挂照片的区域里，看着像脏点。数据里一条都没删（96 条环全在文件里），
+ * 不裁的话它们在放大态会飘进画面里，看着像脏点。数据里一条都没删（96 条环全在文件里），
  * 这里只是**视口剔除**：屏幕外的东西不画。
  * 放大到"几个邻近城市"那一档时，被剔除的环会明显变多（新疆/西藏/南海都在视野外）——
  * 这是**预期后果**，取舍写在报告的"放大后国界可能整条在视野外"一节。
  *
  * ⚠️ 判据是**绘制框**（`frame.x/y/w/h`），不是**地图块**（`frame.blockW/blockH`）——
- *   这是 task-17 改的一处（原来按块判）。两者的区别在框**装不满**块时才出现：
- *   框比块矮一截时（"框 ⊆ 中国"之后**全国视野就是这样**：376×279.62 居中在 376×642.57），
- *   南海诸岛投影在框下方却**仍在块内**，按块判就一条都剔不掉 ——
- *   它们会飘进框下面那条留白里，正好是这段裁剪想消灭的"脏点"。
+ *   这是 task-17 改的一处（原来按块判）。task-19 之后两者的区别**只在横向**出现：
+ *   框恒填满块高，但可以**比块宽**（`x < 0`，竖屏常态）。此时"在屏幕左侧外面、却仍在
+ *   绘制框里"的环**必须保留**（用户横向平移过去就该看见它们），而"整条在框外"的环
+ *   一律剔掉。按块判会把前者也剔掉 —— 症状是"往西滑过去，那一片地图是空的"。
  *   设备与预览都一样：设备侧的 `.clip(true)` 挂在**块**上（`WallPage` 最外层那个 Stack），
- *   不是挂在框上，所以框外的子路径是真会被画出来的。
- *   按框判之后，框 == 块的那些情形（`--flat`、比例正好匹配时）行为**逐字不变**。
+ *   不是挂在框上，所以框外的子路径是真会被画出来的（只是画在屏幕外）。
+ *   框 == 块的那些情形（本模型的默认视野、比例正好匹配时）两种口径行为**逐字相同**。
  *
  * 剔除的粒度是**整条环**：只要一条环有任何一点在框内就整条画出来。放大之后，
  * 中国轮廓那条主环会横跨整个视野（环上大多数点在框外、但少数点在框内），
