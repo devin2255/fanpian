@@ -171,6 +171,127 @@ test('目标尺寸：退化输入返回 {0,0}（含义是"给不出目标尺寸"
   assert.deepEqual(frameDecodeSize(100, 100, Number.NaN), { width: 0, height: 0 });
 });
 
+// ── 4b. 目标尺寸（补强）：预算取**生产路径**的 `framePixelBudget(真实帧数)` ─────────
+//
+// 上面 4 条尺寸用例里只有一条覆盖降采样支，而且它的预算硬编码成 `ANIM_MAX_FRAME_PIXELS`
+// （**单帧上限** 1.048 Mpx），生产路径传的却是 `framePixelBudget(count)`
+// （`data/animSource.ets`：`const budget = framePixelBudget(count)`，count 是真实帧数）。
+// 两者差一个数量级，于是下面两个**具体变异**在旧用例上完全看不见：
+//   · `Math.floor` → `Math.round`：floor 是「乘积 ≤ 预算」的唯一保证，round 会越界；
+//   · `f` 的基数从 `srcW * srcH` 换成 `Math.max(srcW, srcH)`：量纲错了，算出来的
+//     尺寸**比原图还大** → 动图被放大解码 → 整条内存预算失效。
+// 所以这一节用真实帧数驱动预算，并逐条钉死期望值（不是拿同一条公式再算一遍）。
+
+/** 一条尺寸用例：真实帧数 → 生产预算 → 期望的解码目标尺寸。 */
+interface SizeCase {
+  srcW: number;
+  srcH: number;
+  frames: number;
+  budget: number;
+  wantW: number;
+  wantH: number;
+  note: string;
+}
+
+const SIZE_CASES: SizeCase[] = [
+  // 240 = MAX_ANIM_FRAMES → 生产路径上**最小可达**的每帧预算（12 Mpx / 240 = 50000）。
+  // 这就是"真机最坏内存档"：一张 4000×3000 的 240 帧长动图。
+  { srcW: 4000, srcH: 3000, frames: 240, budget: 50000, wantW: 258, wantH: 193,
+    note: '帧数上限档（可达的最坏档）：4000×3000 的 240 帧' },
+  // 60 帧 = 常见 GIF。注意这一条的 floor 与 round **恰好同值**，见下面的反向证明。
+  { srcW: 4032, srcH: 3024, frames: 60, budget: 200000, wantW: 516, wantH: 387,
+    note: '常见 GIF 帧数：4032×3024 的 60 帧' },
+  { srcW: 1920, srcH: 1080, frames: 120, budget: 100000, wantW: 421, wantH: 237,
+    note: '1080p / 120 帧' },
+  // 1000 帧 → 12000000/1000 = 12000 < 下限 → 夹到 25600。⚠️ 这一档在生产路径上**不可达**
+  // （`shouldDecodeFrames` 把帧数锁在 ≤ 240，而 12000000/240 = 50000 > 25600），
+  // 它作为纯函数边界登记在此，用来打穿与预算绝对值无关的变异。
+  { srcW: 4000, srcH: 3000, frames: 1000, budget: 25600, wantW: 184, wantH: 138,
+    note: '预算下限档（纯函数边界，生产不可达）：4000×3000 的 1000 帧' }
+];
+
+test('目标尺寸（生产预算档）：乘积 ≤ 预算、比例偏差 < 1%、两边 ≥ 1、绝不放大（补强）', () => {
+  for (let i = 0; i < SIZE_CASES.length; i++) {
+    const c: SizeCase = SIZE_CASES[i];
+    // 预算必须由**真实帧数**算出，而不是硬编码单帧上限 —— 这正是旧用例缺的那一环。
+    const budget: number = framePixelBudget(c.frames);
+    assert.equal(budget, c.budget, `帧数 ${c.frames} 的预算应与表一致（${c.note}）`);
+    const s: FrameSize = frameDecodeSize(c.srcW, c.srcH, budget);
+    // 逐条钉死期望值：hardcode 才能拦住"公式被换掉但结果仍然自洽"的变异
+    assert.equal(s.width, c.wantW, `${c.note}：宽`);
+    assert.equal(s.height, c.wantH, `${c.note}：高`);
+    // ① 宽高比偏差 < 1%（floor 至多带来 1px 偏差；极端长宽比另有专门用例）
+    const srcR: number = c.srcW / c.srcH;
+    const outR: number = s.width / s.height;
+    assert.ok(Math.abs(outR - srcR) / srcR < 0.01,
+      `${c.note}：比例偏差 ${(Math.abs(outR - srcR) / srcR * 100).toFixed(3)}% ≥ 1%`);
+    // ② 乘积 ≤ 预算（floor 的直接后果）—— 内存预算成立的唯一算式
+    assert.ok(s.width * s.height <= budget,
+      `${c.note}：${s.width}×${s.height}=${s.width * s.height} 超过预算 ${budget}`);
+    // ③ 两条边 ≥ 1（0 是非法 desiredSize，解码会报 401）
+    assert.ok(s.width >= 1 && s.height >= 1, `${c.note}：两边都必须 ≥ 1`);
+    // 附带：绝不放大（放大只会更糊、更占内存）
+    assert.ok(s.width <= c.srcW && s.height <= c.srcH, `${c.note}：不得放大解码`);
+  }
+});
+
+/**
+ * 变异 A：把 `Math.floor` 换成 `Math.round`。**这不是源码**，只是"如果那样写会怎样"的影子函数
+ * —— 反向证明用它，是为了说明上表的 ② 不是空的。
+ */
+function variantRound(srcW: number, srcH: number, budgetPx: number): FrameSize {
+  const srcPixels: number = srcW * srcH;
+  if (srcPixels <= budgetPx) { return { width: Math.round(srcW), height: Math.round(srcH) }; }
+  const f: number = Math.sqrt(budgetPx / srcPixels);
+  return { width: Math.round(srcW * f), height: Math.round(srcH * f) };
+}
+
+/**
+ * 变异 B：把 `f` 的基数从 `srcW * srcH` 换成 `Math.max(srcW, srcH)`（量纲错了）。
+ * 它算出来的边长会**超过原图** → 放大解码 → 内存预算整条失效。
+ */
+function variantMaxBase(srcW: number, srcH: number, budgetPx: number): FrameSize {
+  const f: number = Math.sqrt(budgetPx / Math.max(srcW, srcH));
+  return { width: Math.round(srcW * f), height: Math.round(srcH * f) };
+}
+
+test('目标尺寸：反向证明 —— round 变异会越界、换基数变异会放大解码（本测试有判别力）', () => {
+  let roundOverflow: number = 0;
+  for (let i = 0; i < SIZE_CASES.length; i++) {
+    const c: SizeCase = SIZE_CASES[i];
+    const budget: number = framePixelBudget(c.frames);
+    const good: FrameSize = frameDecodeSize(c.srcW, c.srcH, budget);
+    // 真函数：不越界（与上一条用例同源，这里再算一次是为了让"反例"与"正例"并排可读）
+    assert.ok(good.width * good.height <= budget, `${c.note}：真函数不该越界`);
+    const bad: FrameSize = variantRound(c.srcW, c.srcH, budget);
+    if (bad.width * bad.height > budget) { roundOverflow = roundOverflow + 1; }
+    // 变异 B 在**每一条**用例上都必须被抓到：它把短边也算成"比原图大"
+    const mb: FrameSize = variantMaxBase(c.srcW, c.srcH, budget);
+    assert.ok(mb.width > c.srcW,
+      `${c.note}：换基数变异应放大解码（宽 ${mb.width} > 原图 ${c.srcW}），否则本用例没有判别力`);
+    assert.ok(mb.width * mb.height > budget,
+      `${c.note}：换基数变异应超出预算`);
+  }
+  // 诚实登记：4 条里有 3 条能被 round 变异打穿。剩下那条（4032×3024 / 60 帧）
+  // 的 floor 与 round **恰好同值**（516.4→516、387.3→387），所以它拦不住 round ——
+  // 它的判别力由变异 B 承担。写死 3 而不是 ≥1，是为了让"又有一条失效"必须改这里才能过。
+  assert.equal(roundOverflow, 3, 'round 变异应恰好打穿 3 条用例（第 2 条 floor/round 同值）');
+});
+
+test('目标尺寸：下限 1 在**生产帧数档**下也会被行使（旧用例只在 budget=1 上试过）', () => {
+  const b: number = framePixelBudget(1000);
+  assert.equal(b, ANIM_MIN_FRAME_PIXELS);
+  // 100000×3 配 25600：f = 0.29215，短边 3 × f = 0.876 → floor 到 **0**，
+  // 必须被下限抬成 1 —— 否则会把 height = 0 传进 desiredSize（非法参数，解码报 401）。
+  assert.deepEqual(frameDecodeSize(100000, 3, b), { width: 29211, height: 1 });
+  // 对称：竖幅同样被抬
+  assert.deepEqual(frameDecodeSize(3, 100000, b), { width: 1, height: 29211 });
+  // ⚠️ 显式登记例外：这一档下 `width * height`（29211）**大于**预算（25600）。
+  // 极端长宽比下"下限 1"与"乘积 ≤ 预算"不可兼得，仓里选了"宁可略超预算，也不传 0"
+  // （`core/anim.ts:175` 的说明）。所以上表的 ② 断言只对常规长宽比成立，这里把例外写下来。
+  assert.ok(29211 * 1 > b, '登记：极端长宽比下确实超预算，这是有意的取舍');
+});
+
 // ── 5. 释放编排：三条必须成立的性质（真机上无法单测，但编排可以）────────────
 
 /** 记帐假帧：记录自己有没有被释放，可选地按指令抛错/拒绝。 */
