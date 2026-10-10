@@ -532,7 +532,16 @@ export struct CardStack {
     //   · `getHostContext()` 的返回类型**本来就是** `Context | undefined`，
     //     于是"取不到宿主"成为一个显式分支（下面那行 warn），而不是靠 `as` 断言
     //     把一个 undefined 一路送进 SDK（那会变成一条语焉不详的失败）。
-    const host: common.Context | undefined = this.getUIContext().getHostContext();
+    // try/catch 的理由只有一个、但足够：这个函数会在 `aboutToAppear` 里被调用，
+    // 而**任何异常都会打断卡片的构建**（表现为刷卡页白掉），代价远大于"这张没有角标"。
+    // 平台若在某个时机不给 UI 上下文，这里退化成"探测不了"，绝不外溢。
+    let host: common.Context | undefined = undefined;
+    try {
+      host = this.getUIContext().getHostContext();
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, '%{public}s', `取宿主 Context 抛异常，跳过动态照片探测: ${errText(e)}`);
+      return;
+    }
     if (host === undefined) {
       // 结构上不该发生（本组件必然挂在某个 UIAbility 的页面上）。留着它的意义是：
       // 真机上"全都没有角标"这件事会有一行明确的告警可查。
