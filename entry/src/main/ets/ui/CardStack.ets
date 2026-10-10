@@ -824,6 +824,46 @@ export struct CardStack {
     Image(this.imgSource())
       .width('100%').height('100%')
       .objectFit(ImageFit.Contain)
+      // ── 本批修的就是这一行：默认插值让照片比相册里**糊** ────────────────────────
+      // `interpolation` 不设时的默认值是 `ImageInterpolation.Low`（SDK 原文见
+      // `component/image.d.ts:1076-1077`：「Default value: **ImageInterpolation.Low**」
+      // —— 注意后半句「set to **undefined** 当作 `None`（最近邻）」说的是传 undefined 的情形，
+      // 而"不调用这个属性方法"用的是默认值 Low，两者不是一回事）。Low = **双线性**。
+      //
+      // 为什么双线性在这里肉眼可见地发软（算术）：
+      //   相册原图约 4000 px 宽 → 卡片显示区约 433 pt → 手机 3× 屏约 1300 物理像素，
+      //   缩放比 ≈ 0.325（缩到 1/3）。缩图时每个目标像素要代表约 9 个源像素，
+      //   而双线性只读目标点周围 2×2 = 4 个源像素 —— 剩下 5 个像素的信息直接丢掉，
+      //   高频细节（头发、树叶、织物纹理）因此糊成一片。相册 App 用的是高质量重采样，
+      //   所以同一张照片在两边看起来清晰度不同 —— 这正是用户报的现象。
+      //
+      // 为什么是 `High` 而不是 SDK 在 `autoResize` 处推荐的 `Medium`（诚实记账）：
+      //   · `autoResize` 文档（同文件 989-994 行）按缩放方向给了**两条不同**的建议：
+      //       「When the image is scaled down: .autoResize(false) + .interpolation(.Medium)」
+      //       「When the image is scaled up:   .interpolation(.High)」
+      //     （`autoResize` 默认已是 false，所以前半条里的解码那半我们本来就满足。）
+      //   · 默认 1× 看全图时我们落在"缩图"那一档 —— 按 SDK 建议本该是 `Medium`；
+      //     但双指放大到 4× 看细节时同一个节点落在"放大"那一档，SDK 建议 `High`。
+      //     `interpolation` 是**组件属性**，在**构建期**生效、不是逐帧采样决策
+      //     （纹理一旦按属性定下采样方式，`.scale()` 只是把这个结果放大），
+      //     所以同一个节点只能有一个档位，"按 zoomScale 动态换档"不是一条可走的路 ——
+      //     那需要重建子树（`if` 分支或 key 变化），换来闪烁与一次重解码，代价高于收益。
+      //   · 两档取一，本批取 `High`：它的语义是 SDK 明说的
+      //     「produces scaled images of the **highest possible quality**」（同文件 High 的注释），
+      //     **两个方向都不比现状差**；而选 `Medium` 会在放大那一档低于 `High`，
+      //     偏偏"能放大看细节"正是这个页面的能力。真机若实测"1× 下 Medium 更锐"，
+      //     改回 `Medium` 是**一行**的事（见本批报告 §4 的对比方法）。
+      //   · 代价（不藏）：三次插值单位像素算力高于双线性。这张照片是**静态的**
+      //     —— 解码/缩放一次后由 GPU 合成，不在任何每帧重绘的热路径上
+      //     （唯一例外是手势拖动时的重合成，那里改的是 `.offset()`/`.scale()`，不是重新采样源图）。
+      //
+      // ⚠️ 这条属性对**动图**不生效，且这不是本批引入的问题：
+      //   `imgSource()` 在解出多帧时返回 `AnimatedDrawableDescriptor`，SDK 明说
+      //   「This attribute does not take effect when the parameter type of the component is
+      //   AnimatedDrawableDescriptor」（`image.d.ts:1073-1074`）。所以 GIF 那条路的清晰度
+      //   不受本行影响 —— 它播的是按像素预算解出的原始分辨率帧，**不经过图片缩放重采样**，
+      //   本来就没有这条缺陷。
+      .interpolation(ImageInterpolation.High)
       .scale({ x: this.zoomScale, y: this.zoomScale })
       .offset({ x: this.panX, y: this.panY })
       // 本批新增：把"长按被平台拖拽抢走"这条风险显式关掉。
@@ -858,6 +898,22 @@ export struct CardStack {
    * `objectFit(ImageFit.Contain)`：与静态图一致。上一批的 `Cover→Contain` 是产品决策
    *（"看到的就是全图"），播放器必须跟着它 —— 否则"长按看动态"看到的会是**被裁掉**的画面，
    * 那比不播更让人困惑。
+   *
+   * ── 本批新增的结论：**这条路的画质我们调不了，由系统决定** ──────────────────
+   * 上一段刚说"除源以外每个属性都必须一致"，那么静态图新加的 `.interpolation(High)`
+   * 是不是也该在这里补一行？**补不了 —— 这条属性在这个组件上不存在。**
+   * `@ohos.multimedia.movingphotoview.d.ts` 里 `MovingPhotoViewAttribute` 的**全部**方法只有
+   * 13 个：`muted`(113) / `objectFit`(124) / 七个回调(135-201) /
+   * `autoPlayPeriod`(214) / `autoPlay`(226) / `repeatPlay`(238) / `enableAnalyzer`(250)。
+   * **没有 `interpolation`，也没有 `sourceSize` / `renderMode` / `dynamicRangeMode`** ——
+   * 连 `Image` 那套 `autoResize` 都没有（`objectFit` 是唯一沾边的旋钮，
+   * 而它管的是"怎么摆"，不是"怎么采样"）。
+   * 所以动态照片播放时画面怎么缩放、用什么插值，**由系统播放器自己决定**，
+   * 我们这边**没有任何开关**，本批也**不假装**能改（不去瞎调一个不存在的"画质"参数）。
+   * 能做的只有"取景范围与静态图逐字一致"——`objectFit(Contain)` 已经做到，
+   * 于是长按前后**至少取景不会跳**；至于锐度，若真机上动态照片明显比静态图糊，
+   * 那是系统侧的行为，只能作为一条**平台限制**记录（见本批报告 §5），
+   * 而不是我们在这个仓库里能修的缺陷。
    */
   @Builder
   motionNode() {
