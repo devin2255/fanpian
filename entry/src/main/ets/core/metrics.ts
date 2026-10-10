@@ -275,13 +275,25 @@ export function rollbackCount(m: MetricsState): number {
 //   · 决策间隔中位数：**严格小于** 1200ms 才算达标 —— spec 原文是「< 1200 ms」，
 //     所以**恰好 1200 不达标**（1200 是"没有满足小于"的那一侧）。
 //   · 回弹率：**严格小于** 3% —— 同理，**恰好 3% 不达标**。
-//   · 上墙转化率：**闭区间** 15%~30% —— spec 原文是范围表述「15% ~ 30%」，
-//     两个端点都在范围内，所以**恰好 15% 达标、恰好 30% 也达标**。
-//   两条上界用严格小于、区间用闭区间，不是随手选的：它们逐字对应 spec 的写法。
+//   · 上墙转化率：**只剩下限**，`>= 15%` 即达标，**没有上界**（恰好 15% 达标、60% 达标、
+//     100% 也达标）。
+//   两条上界用严格小于、转化率用闭下限，不是随手选的：它们逐字对应 spec 的写法（「<」与「≥」）。
+//
+// 上墙转化率为什么**取消上界**（产品裁决，本轮唯一的口径变更）：
+//   spec §5.3 原文写的是范围「15% ~ 30%」，本文件原先据此按**闭区间**判定
+//   （恰好 15% 达标、恰好 30% 也达标、高于 30% 判未达标）。但设备真值是 **60%**
+//   （walled 33、收藏池 faved ∪ walled = 55 → 33/55 = 60%），**超出上界**，
+//   于是真机数据被自己的验收指标判成"未达标"—— 那是误报，不是发现。
+//   裁决：**去掉上界，只要求 ≥ 15%**。理由是 spec 写 15%~30% 时假设的流程是
+//   "先收藏，再从收藏里挑着上墙"（两步），这种漏斗里转化率天然低；而现在的「上墙」是
+//   卡片下方四个按钮之一（**一步直达**），上墙本身就是直接动作、不经过收藏这道闸门，
+//   转化率自然高。**60% 是行为事实，不是缺陷**，所以指标要跟着事实走。
+//   历史脉络（供后人回溯）：上界不是被"调大"到某个更宽的数，而是被**删除**；
+//   判据从"落在区间内"变成"不低于下限"。TARGET_CONVERSION_MAX 因此失去全部读者被一并删除
+//   （它原先只有两个读者：下面的 meetsConversionTarget 与 pages/StatsPage.ets 的目标文案）。
 export const TARGET_MEDIAN_MS = 1200;
 export const TARGET_ROLLBACK_RATE = 0.03;
 export const TARGET_CONVERSION_MIN = 0.15;
-export const TARGET_CONVERSION_MAX = 0.30;
 
 /** 决策间隔中位数是否达标（恰好 1200 → false） */
 export function meetsMedianTarget(ms: number): boolean {
@@ -293,9 +305,21 @@ export function meetsRollbackTarget(rate: number): boolean {
   return rate < TARGET_ROLLBACK_RATE;
 }
 
-/** 上墙转化率是否达标（恰好 0.15 / 恰好 0.30 → 都 true） */
+/**
+ * 上墙转化率是否达标（**只判下限**）：恰好 0.15 → true；0.1499 → false；
+ * 30% / 60% / 100% / 200% 等一切 `>= 15%` 的值 → **都 true**（上界已按产品裁决取消，
+ * 理由见文件上方 TARGET_CONVERSION_MIN 的注释）。旧实现是 `>= MIN && <= MAX`，
+ * 真机 60% 会在这里被读成 false —— 那个误报就是本次改动要消灭的东西。
+ *
+ * **名字为什么不改成 meetsConversionFloor**：这里的 `Target` 指的是 spec §5.3 的
+ * **验收目标**本身，而不是"双侧区间"。三条判定是同族命名
+ *（meetsMedianTarget / meetsRollbackTarget / meetsConversionTarget），族里的词义一致才可读；
+ * 而"目标"从今天起就是单侧的"不低于 15%"，名字与语义仍然对得上。
+ * 改成 floor 的收益只是把"下限"写进标识符，代价是与另外两条判定分家、并让所有调用点
+ * 为一个不含新信息的词无谓改动 —— 语义变化已经由本注释与上面的常量注释说清，故保留原名。
+ */
 export function meetsConversionTarget(rate: number): boolean {
-  return rate >= TARGET_CONVERSION_MIN && rate <= TARGET_CONVERSION_MAX;
+  return rate >= TARGET_CONVERSION_MIN;
 }
 
 /**

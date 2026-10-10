@@ -301,7 +301,7 @@ test('样本量：混合事件时精确计数（wall 出局，fav/archive/none �
   assert.equal(medianDecisionMs(m), 1000);
 });
 
-// ── 达标判定的边界值（恰好 1200 / 3% / 15% / 30%）────────────────────────────
+// ── 达标判定的边界值（1200 / 3% / 15%；转化率**只有下限**，无上界）─────────────
 
 test('边界：恰好 1200ms 不达标（spec 是「< 1200 ms」）', () => {
   assert.equal(meetsMedianTarget(1199), true);
@@ -317,14 +317,77 @@ test('边界：恰好 3% 不达标（spec 是「< 3%」）', () => {
   assert.equal(meetsRollbackTarget(0.0301), false);
 });
 
-test('边界：恰好 15% 与恰好 30% 都达标（spec 是范围「15% ~ 30%」，含端点）', () => {
+// ── 转化率的边界（**产品裁决：只有下限，无上界**）──────────────────────────────
+// 旧口径是 spec §5.3 的闭区间 15%~30%；设备真值 60% 超出上界被判"未达标"，
+// 于是裁决去掉上界、只要求 ≥ 15%。以下 6 条把新口径的每一侧都钉死。
+// 注意：谓词（meetsConversionTarget）与判定（computeStats 的 conversionVerdict）
+// 是两层，两条都要钉 —— 谓词管"数值够不够"，判定还额外管"有没有样本"。
+
+test('边界：恰好 15% 达标（下限是闭的）', () => {
+  // 15/100 与字面量 0.15 在 IEEE754 下是同一个双精度数，所以这里的相等是精确的
   assert.equal(15 / 100, 0.15);
+  assert.equal(meetsConversionTarget(15 / 100), true, '恰好 15% 落在下限上 → 达标（闭下限）');
+  assert.equal(meetsConversionTarget(0.1501), true);
+  assert.equal(meetsConversionTarget(0.2), true, '20%（原区间中段）新旧口径都达标');
+});
+
+test('边界：14.9% 不达标（下限之下）', () => {
+  assert.equal(meetsConversionTarget(0.1499), false, '14.99% 差一点点也算不达标');
+  assert.equal(meetsConversionTarget(14.9 / 100), false, '14.9% → 不达标');
+  assert.equal(meetsConversionTarget(0), false, '0% 更在下限之下');
+});
+
+test('边界：30% 仍达标 —— 但**理由变了**：不再是"含在区间里"，而是"高于下限"', () => {
+  // 本用例是"改判据不改结论"的那一条：30% 在旧口径下达标是因为它等于上界（含端点），
+  // 在新口径下达标是因为**任何 ≥ 15% 的值都达标**、上界已不存在。意图写在断言消息里。
   assert.equal(30 / 100, 0.30);
-  assert.equal(meetsConversionTarget(0.1499), false, '低于下限不达标');
-  assert.equal(meetsConversionTarget(15 / 100), true, '恰好 15% 含在范围内');
-  assert.equal(meetsConversionTarget(0.2), true);
-  assert.equal(meetsConversionTarget(30 / 100), true, '恰好 30% 含在范围内');
-  assert.equal(meetsConversionTarget(0.3001), false, '高于上限不达标');
+  assert.equal(meetsConversionTarget(30 / 100), true, '30% ≥ 15% → 达标（不是因为"含端点"）');
+  // 旧口径里 > 30% 判未达标；新口径下"高于上界"这个概念已经不存在，故 30.01% 也达标
+  assert.equal(meetsConversionTarget(0.3001), true, '旧口径下它"高于上限"→未达标；上界取消后无此判据');
+});
+
+test('边界：60% 达标 —— **设备真值**（walled 33 / 收藏池 55），取消上界的直接原因', () => {
+  // fixture 就是真机现状：walled 33、faved 22 → 收藏池 = 22 + 33 = 55（口径见 computeStats）
+  const rate = wallConversion(22 + 33, 33);
+  assert.ok(Math.abs(rate - 0.6) < 1e-9, '设备真值 = 33/55 = 60%');
+  // 这一条就是本次修改的核心：旧口径（<= 0.30）下它是 false（真机被自己的验收指标误判）
+  assert.equal(meetsConversionTarget(rate), true, '60% ≥ 15% → 达标：行为事实，不是缺陷');
+  // 判定层同样要翻过来（原来这里断言的是"未达标"）
+  const s = computeStats(emptyMetrics(), 55, 33, 0);
+  assert.equal(s.conversionVerdict.hasSample, true);
+  assert.equal(s.conversionVerdict.met, true);
+  assert.equal(verdictText(s.conversionVerdict), '达标');
+});
+
+test('边界：100% / 200% 仍达标 —— 上界取消后高值不再算失败', () => {
+  // 这两个值在旧口径下都因"高于上界 30%"而失败；上界删除后，判据里根本没有可以让高值失败的分支。
+  // 保留这条断言是为了防止有人日后"顺手"再加回一个上界而不改测试。
+  assert.equal(meetsConversionTarget(1.0), true, '100%（收藏的每一张都上了墙）达标');
+  assert.equal(meetsConversionTarget(2.0), true, '200%（异常高值）也达标：判据里已无上界');
+  // 判定层一致（100% 且收藏池 > 0 → 达标）
+  const s = computeStats(emptyMetrics(), 10, 10, 0);
+  assert.ok(Math.abs(s.conversion - 1.0) < 1e-9);
+  assert.equal(s.conversionVerdict.met, true);
+  assert.equal(verdictText(s.conversionVerdict), '达标');
+});
+
+test('边界：0% 不达标，且"空 ≠ 达标"不受下限口径影响（三层保证逐层钉死）', () => {
+  // 第 1 层（谓词）：0 不满足 >= 15% —— 改口径没有把它变成 true
+  assert.equal(meetsConversionTarget(0), false);
+  // 第 2 层（判定类型）：无样本（收藏池 0）时 hasSample=false 且 met=false
+  const empty = computeStats(emptyMetrics(), 0, 0, 0);
+  assert.equal(empty.conversion, 0, '空的分母 → wallConversion 返回 0');
+  assert.equal(empty.conversionVerdict.hasSample, false);
+  assert.equal(empty.conversionVerdict.met, false, 'verdictOf 强制 met = hasSample && met');
+  // 第 3 层（唯一文案）：无样本说"还没有数据"，**不许**说"未达标"/"达标"
+  assert.equal(verdictText(empty.conversionVerdict), '还没有数据');
+  assert.notEqual(verdictText(empty.conversionVerdict), '达标');
+  assert.notEqual(verdictText(empty.conversionVerdict), '未达标');
+  // 对照：**有**样本且为 0% → 这才是真正的"未达标"（与"不可判定"是两个词）
+  const zero = computeStats(emptyMetrics(), 10, 0, 0);
+  assert.equal(zero.conversionVerdict.hasSample, true);
+  assert.equal(zero.conversionVerdict.met, false);
+  assert.equal(verdictText(zero.conversionVerdict), '未达标');
 });
 
 // ── 「空数据 ≠ 达标」：把这条钉死 ─────────────────────────────────────────────
@@ -424,9 +487,11 @@ test('computeStats：全是 wall —— 滑动指标无样本，转化率照常�
   assert.equal(s.walled, 33);
   assert.ok(Math.abs(s.conversion - 0.6) < 1e-9);
   assert.equal(s.conversionVerdict.hasSample, true);
-  // 60% 高于 30% 上限 → 未达标（真机现状就会读到这个数，见 computeStats 注释）
-  assert.equal(s.conversionVerdict.met, false);
-  assert.equal(verdictText(s.conversionVerdict), '未达标');
+  // 60% ≥ 15% → **达标**。这是本次产品裁决的核心：旧口径（闭区间 15%~30%）在这里读出
+  // 「未达标」，而真机 33/55 = 60% 是行为事实（「上墙」是一步直达的按钮，不必先收藏），
+  // 不是缺陷 —— 上界被删除后，这个数不再是"失败"。
+  assert.equal(s.conversionVerdict.met, true);
+  assert.equal(verdictText(s.conversionVerdict), '达标');
 });
 
 test('computeStats：混合 —— 三条读数同时可判定', () => {

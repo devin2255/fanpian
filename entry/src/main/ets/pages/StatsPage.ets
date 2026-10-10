@@ -23,7 +23,7 @@ import { MetricsStore, MetricsLoad } from '../data/metricsStore';
 import { DecisionStore } from '../data/decisionStore';
 import {
   emptyMetrics, computeStats, StatsSnapshot, TargetVerdict, verdictText,
-  TARGET_MEDIAN_MS, TARGET_ROLLBACK_RATE, TARGET_CONVERSION_MIN, TARGET_CONVERSION_MAX,
+  TARGET_MEDIAN_MS, TARGET_ROLLBACK_RATE, TARGET_CONVERSION_MIN,
   MAX_METRIC_EVENTS
 } from '../core/metrics';
 
@@ -126,8 +126,10 @@ struct StatsPage {
             `< ${TARGET_MEDIAN_MS} ms`, this.stats.medianVerdict)
           this.metricCard('回弹率', this.pct(this.stats.rollbackRate),
             `< ${this.pct(TARGET_ROLLBACK_RATE)}`, this.stats.rollbackVerdict)
+          // 转化率的目标文案只有下限：上界已按产品裁决取消（理由见 core/metrics.ts 的常量注释）。
+          // 这里**不许**再拼出「15.0% ~ 30.0%」—— 那会把一个已被删除的判据说成现行目标。
           this.metricCard('上墙转化率', this.pct(this.stats.conversion),
-            `${this.pct(TARGET_CONVERSION_MIN)} ~ ${this.pct(TARGET_CONVERSION_MAX)}`,
+            `≥ ${this.pct(TARGET_CONVERSION_MIN)}`,
             this.stats.conversionVerdict)
 
           // ── 样本量：每一条都列出"参与计算的样本数" ──────────────────────────
@@ -157,7 +159,9 @@ struct StatsPage {
               + '移入「已上墙」，所以分母必须含已上墙的，否则每上墙一张分母就少一张。')
             this.note('· 判定按**原始值**（未舍入），显示值四舍五入到 0.1%。')
             this.note('· 边界：中位数恰好 1200ms 算**不达标**、回弹率恰好 3% 算**不达标**'
-              + '（spec 是「<」）；转化率恰好 15% / 30% 都算**达标**（spec 是范围，含端点）。')
+              + '（spec 是「<」）；转化率**只有下限**，≥ 15% 即达标（恰好 15% 算达标），'
+              + '**没有上界** —— 上界已按产品裁决取消：「上墙」是一步直达的动作（不必先收藏），'
+              + '转化率本来就高，设备真值 60% 是行为事实、不是缺陷。')
             this.note('· 没有样本 = 「还没有数据」，**不是**达标：空集合下读数都是 0，'
               + '而 0 < 1200ms、0 < 3% 都恰好为真 —— 只看数值会把空设备读成绿的。')
             this.note(`· 事件窗口上限 ${MAX_METRIC_EVENTS} 条，超过就淘汰最旧的（留 ${MAX_METRIC_EVENTS} - 200 条）。`
