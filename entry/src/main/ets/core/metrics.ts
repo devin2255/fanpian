@@ -16,17 +16,18 @@ export interface SwipeEvent {
    *                          翻页/滑动手势的结果**：没有方向、没有位移、也没有越过任何阈值，
    *                          只是点了一下按钮（「这张直接上墙，不必先收藏」）。
    *
-   * 'wall' 与上面几种「刷这张」的结局不同质，所以本文件里两个走"滑动口径"的指标
-   *（medianDecisionMs / rollbackRate）都必须把它过滤掉：
-   *   - 算进 rollbackRate 的分母 → 误操作率随「上墙」用得越多而越虚低
-   *     （越常上墙越显得「回弹率 < 3%」达标）；
-   *   - 混进 medianDecisionMs 的样本 → 「上墙」常常是照片刚出现就点下的即时判断，它的
-   *     "耗时"（照片显示到点按钮的间隔）会把"一次决定要多久"这个口径的中位数污染掉。
-   * 新增指标时请沿用同一口径：两个函数的判据都只是 `action !== 'wall'`，
-   * 即 **'fav' / 'archive' / 'none' 一律计入、只有 'wall' 出局**。
-   * 注：M1 改成按钮后 'fav'/'archive' 也不再由滑动产生，但这两个函数的口径**未随之变动**
-   *（本轮只改注释、不改任何判定）；口径调整属于指标语义变更，须另开一批并同步
-   * core/metrics.test.ts 的断言。
+   * 「上墙」在这一层的两个口径里处境**不同**（本文件最容易被顺手改错的一处）：
+   *   - medianDecisionMs **继续排除** wall：它的"耗时"是「照片显示到点按钮」的间隔，
+   *     与「滑向某一边犹豫了多久」不同质（按钮常常在照片刚出现时就被点，混进来会把
+   *     中位数系统性拉低）。理由完整写在它自己的注释里，本批一字未改；
+   *   - rollbackRate **从 batch-39 起计入** wall。旧口径排除它的前提是「wall 是必然成功的
+   *     动作，含它会让指标看起来更好」—— 真机数据（wall 27 / fav 17 / none 4 / archive 3）
+   *     把这个前提证伪了：wall 占 53%，而且**一次回弹完全可以发生在 wall 之前**
+   *     （真机就有一张是 none → wall）。排除 wall 等于把"最终成功上墙的那次尝试"从分母里
+   *     删掉、而分子里的那次回弹照算。完整推导见 rollbackRate 的注释。
+   *
+   * 注意 `action` **不是**判断"算不算一次尝试"的依据 —— batch-39 之后回弹率的单位是
+   * 「一张照片的一次出现」，与 action 取什么值无关（见 rollbackRate）。
    */
   action: string;
   rolledBack: boolean;
@@ -51,8 +52,24 @@ export function recordSwipe(m: MetricsState, e: SwipeEvent): MetricsState {
  * 口径：只取**滑动**事件（'fav' / 'archive' 决策 + 'none' 回弹）。
  * 必须排除 action === 'wall' —— 那是「在卡片上点一下按钮」，它的"耗时"是
  * 「照片显示到点按钮」的间隔，与「滑向某一边犹豫了多久」不同质（按钮常常在照片
- * 刚出现时就被点，混进来会把中位数系统性拉低）。这与 rollbackRate 用同一口径：
- * 点按钮的事件不参与滑动度量。
+ * 刚出现时就被点，混进来会把中位数系统性拉低）。
+ * ⚠️ batch-39 之后它与 rollbackRate **不再是同一个口径**（那边已计入 wall）：
+ * 那边问的是"一次尝试有没有手滑"（与 action 无关），这边问的是"滑动这个动作犹豫了多久"
+ *（与 action 强相关）。两者共用一句 `action !== 'wall'` 的历史在 batch-39 结束。
+ *
+ * ── batch-39 的检查结论：这里的**分母没有**回弹率那种同类缺陷 ──────────────────
+ * 被要求检查的同类缺陷形态是「分母缩水、分子照算 ⇒ 比率被放大」。中位数不是比率、
+ * 没有分子/分母，这个形态在结构上不存在。逐条对照：
+ *   1) 排除 wall 不会"分子照算"：被排除的样本同时从**读数本身**里消失，
+ *      没有任何留在分子里的量；
+ *   2) 方向相反：wall 的耗时是"照片刚出现就点按钮"的**短**间隔，
+ *      排除它会让中位数**偏高**（更难达标）—— 是保守，不是自证清白型失真。
+ *      旧注释正是把这一点写成了排除的理由（"混进来会把中位数系统性拉低"），
+ *      与回弹率那边"排除会让指标虚高"的方向正好相反，所以两处不能一起改。
+ *   3) 残留的同形问题（**有意不修**）：一次"尝试组"内的重试会给中位数贡献多个样本
+ *      （`none 1500ms` + `wall 2500ms` → 两个样本）。它与回弹率的缺陷同形，但**不是同一个量**：
+ *      改它就等于把"一次决定要多久"换成"一次意图持续多久"，那是另一个指标的语义变更。
+ *      本批的用户裁决只动回弹率口径，故此处一字不改；若将来要改，须另开一批并同步单测。
  */
 export function medianDecisionMs(m: MetricsState): number {
   const arr: number[] = [];
@@ -68,33 +85,113 @@ export function medianDecisionMs(m: MetricsState): number {
   return n % 2 === 1 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// batch-39：回弹率改为按「尝试组」计数。以下三个函数是本口径的**唯一**定义处；
+// rollbackDenominator / rollbackCount / rollbackRate 全部由它派生，不各数一遍
+//（否则页面上的样本量与读数就可能来自两份会漂移的口径）。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** countAttemptGroups 的结果：尝试组数 + 其中出现过回弹的组数 */
+export interface AttemptCounts {
+  /** 尝试组总数 = 回弹率的**分母** */
+  groups: number;
+  /** 至少出现过一次回弹的组数 = 回弹率的**分子**（同组回弹多次也只算一次） */
+  fumbled: number;
+}
+
 /**
- * 回弹率 = 回弹事件数 / **滑动尝试**事件数。
+ * 尝试组的分组键 = **同一张照片的同一次出现**（`photoId` + `shownAt`）。
  *
- * 口径说明（有意如此，勿改成"按卡片数"）：spec §5.3 的指标是**误操作率**
- * ——「滑动尝试里有多少次被中途放弃」，而不是「多少张卡片曾出现过回弹」。
- * 一张卡片若被回弹后成功滑出，会贡献 2 个事件（1 回弹 + 1 决策），
- * 这正是"该卡片消耗了 2 次尝试"的忠实反映。
+ * 分隔符用 `|`：photoId 是 media URI、shownAt 是毫秒数，两者都不含 `|`，
+ * 所以拼接不产生歧义（不会出现两张不同的卡拼出同一个键）。
+ * 为什么这两个字段足以定义"一次出现"、为什么不必新增字段 —— 论证见 rollbackRate 注释。
+ */
+function attemptKey(e: SwipeEvent): string {
+  return `${e.photoId}|${e.shownAt}`;
+}
+
+/**
+ * 按「尝试组」计数（回弹率分母与分子的**唯一**实现）。
  *
- * 分母必须排除 action === 'wall'：那是在卡片上点「上墙」按钮，不是一次滑动尝试
- * （没有方向、没有位移、没有阈值判定）。把它算进分母会让指标随「上墙」使用频率
- * 升高而虚低——越常上墙越显得达标，属自证清白型失真：
- *   真实 r/s，若刷了 w 次上墙，读数会变成 r/(s+w)。
- * 回弹事件（action 为 'none'）与滑动决策都必须留在两个计数里，只有 'wall' 出局。
+ * 单趟遍历、两个 Set：O(n)。n 的上界是 MAX_METRIC_EVENTS（2000），
+ * 而本函数在刷卡热路径上会被调一次（pages/SwipePage.ets 每张都算 rollbackRate），
+ * 所以刻意不做排序（O(n log n)）、也不为每组建对象。
+ * 顺序无关：结果只由"哪些键出现过"决定，与事件在数组里的次序无关
+ * —— capEvents 会保持原顺序、也可能按时间淘汰，两种情况下读数都一致。
+ */
+function countAttemptGroups(m: MetricsState): AttemptCounts {
+  const seen: Set<string> = new Set();
+  const fumbled: Set<string> = new Set();
+  for (let i = 0; i < m.events.length; i++) {
+    const e: SwipeEvent = m.events[i];
+    const k: string = attemptKey(e);
+    seen.add(k);
+    if (e.rolledBack) { fumbled.add(k); }
+  }
+  return { groups: seen.size, fumbled: fumbled.size };
+}
+
+/**
+ * 回弹率 = **出现过回弹的"尝试组"数** / **尝试组总数**。
  *
- * 前提：同一次回弹不得重复上报（由 ui/CardStack.ets 的 150ms 防抖保证），
- * 否则分母与分子会同时被污染，指标失真。
+ * ── 口径的精确语义（batch-39 按用户裁决改写；旧口径的历史见本节末尾）──────────────
+ *
+ * **尝试组**（attempt group）= **一张照片的一次出现**。
+ *   - 一次出现期间发生的**所有**事件（回弹 + 最终成功的那个动作）合成**一个**组；
+ *   - 于是"同一张卡的连续重试算一次"：用户对这张照片的意图是一次，
+ *     手滑不是第二次意图（用户原话：「手滑不是第二次意图」）；
+ *   - 分母 = 组数；分子 = **其中至少出现过一次回弹**的组数（同一组回弹多次也只算一次）。
+ *
+ * 分母**包含 `action === 'wall'`**（旧口径排除它）。为什么必须包含：
+ * 旧口径的前提是「wall 是必然成功的动作，算进去会让指标看起来更好」。真机数据
+ * （51 条事件：wall 27 / fav 17 / none 4 / archive 3）把这个前提证伪了 ——
+ *   - wall 占 53%，是用户一半以上的操作；
+ *   - 而且**回弹可以发生在 wall 之前**（真机 3 张有重试的照片里，有 2 张是 none → wall）。
+ * 排除 wall 于是变成"**分母缩水、分子照算**"：真机旧口径 4/(51-27) = 4/24 = 16.67%，
+ * 而按真实发生过的事 4/47 = 8.51% —— 率被放大约 2 倍，且**越常用「上墙」就越虚高**。
+ * 这正是旧注释里点名要防的"自证清白型失真"，只是方向反了：不是虚低，是虚高。
+ *
+ * ── 为什么"一次出现"可以由现有字段推出，**不需要新增字段** ────────────────────
+ * 分组键 = `(photoId, shownAt)`，两者都是 SwipeEvent 已有的字段，依据是两条代码事实：
+ *   1) `shownAt` 只在换卡时被重写一次（pages/SwipePage.ets 的 `goTo()` 末尾
+ *      `this.shownAt = Date.now()`），而**回弹在 handle() 里早退、不换卡**
+ *      （`if (rolledBack) { return; }` 在 goTo 之前）→ 回弹不会刷新 shownAt；
+ *   2) `wall` 的**事件**在 handle() 里同刻记下（用的就是当前 shownAt），但它的**推进**
+ *      在异步的 `applyWall()` 里（要先等地点索引、可能还要问用户地点）→ 这段窗口里
+ *      卡片仍是当前这张、shownAt 不变。
+ * 于是"同一张卡的一次出现"期间的全部事件**天然共享同一个 shownAt**，而任何一次换卡
+ * 都必然刷新它 —— 真机上 `wall + none + wall`（同一张）×3 条正是这样落成一个组的。
+ * 所以既不必要 sessionId/burstId 这类新字段，也不必要一个"重试时间窗"常量
+ *（窗口常量会变成第二个口径：多长算"连续"得靠调参，而 shownAt 是**由代码结构保证**的）。
+ *
+ * **同一张照片在不同时间被独立刷两次** → 两次出现、两个 shownAt → **算 2 次**：
+ * 那是两次真实意图（跨会话、或回到上一张重新决定），不该被折叠成一次。
+ * 反之，同一组内重复上报（按钮同帧被点两次等）也只是同一个键被 add 两次，计数不变
+ * —— 这层分组对重复上报是天然幂等的（旧口径下每条重复上报都会给分母 +1）。
+ *
+ * ── 历史脉络（本项目注释惯例：记下"为什么变成这样"）──────────────────────────
+ *   - `76e8690` 初版：回弹数 / 滑动事件数；
+ *   - `b49dd74` 写下「勿改成按卡片数」的判据，理由是「一张卡被回弹后成功滑出会贡献 2 个
+ *     事件，这正是它消耗了 2 次尝试的忠实反映」；
+ *   - `5c24f16` 排除 wall，理由是「点按钮不是滑动尝试，算进分母会让指标随上墙频率虚低」；
+ *   - **batch-39 反转了 `b49dd74` 的判据**：那个理由假设"重试是第二次尝试"，而真机数据
+ *     显示它是一次手滑（用户意图仍是一次），把它算成 2 次才是失真。同时反转了 `5c24f16`
+ *     的前提（wall 并非必然成功）。两处反转的**唯一依据都是真机数据**，不是口味。
+ *   - 若将来设备上出现"同一张卡在同一 shownAt 下其实是两次独立意图"的证据，
+ *     要改的是**分组键**（而不是回去按事件数算）—— 那时再加字段、并同步本注释与单测。
+ *
+ * 前提（未变）：同一次回弹不得重复上报（由 ui/CardStack.ets 的 150ms 防抖保证）。
+ * 分组对重复上报幂等，所以即便防抖失效，分母也不会再被重复上报放大 —— 这是本口径
+ * 相对旧口径的一个附带好处。
+ *
+ * 空集合：分母为 0 → 返回 0 且**不可判定**（`hasSample` 由 `rollbackDenominator > 0`
+ * 给出，见 computeStats）。"空集合 ≠ 达标"这条**没有退化**：全是 wall 时组数 > 0，
+ * 所以那是"有样本、回弹率 0%"（真的达标）；一条事件都没有时才是"还没有数据"。
  */
 export function rollbackRate(m: MetricsState): number {
-  let n = 0;
-  let rb = 0;
-  for (let i = 0; i < m.events.length; i++) {
-    if (m.events[i].action === 'wall') { continue; }   // 点按钮 ≠ 滑动尝试，不进分母
-    n++;
-    if (m.events[i].rolledBack) { rb++; }
-  }
-  if (n === 0) { return 0; }   // 全是 wall（或空）：分母为 0，不得除零
-  return rb / n;
+  const c: AttemptCounts = countAttemptGroups(m);
+  if (c.groups === 0) { return 0; }   // 空集合：分母为 0，不得除零（"不可判定"由 hasSample 表达）
+  return c.fumbled / c.groups;
 }
 
 export function wallConversion(faved: number, walled: number): number {
@@ -236,12 +333,14 @@ function isKnownAction(a: string): boolean {
   return a === 'fav' || a === 'archive' || a === 'wall' || a === 'none';
 }
 
-// ── 样本量：与上面两个口径**同源**（判据都只有一句 `action !== 'wall'`）──────────────
+// ── 样本量：与各自的口径**同源**（batch-39 之后两者口径已分家）─────────────────
 // 拆成两个导出（而不是一个共用的 swipeSampleSize）是刻意的：页面要分别写
 // 「决策间隔的样本数」与「回弹率的分母」，两个名字各自对应一个函数，
 // 将来某一个口径变了，页面上的标签会立刻跟着错、而不是被一个共用函数掩盖过去。
+// batch-39 就是这条设计的一次兑现：回弹率改了口径，medianSampleSize **不动**、
+// rollbackDenominator 跟着改 —— 若当初共用一个函数，这次就会把中位数的样本数一起改错。
 
-/** medianDecisionMs 的样本数（口径同它：排除 action === 'wall'） */
+/** medianDecisionMs 的样本数（口径同它：排除 action === 'wall'，按**事件**计） */
 export function medianSampleSize(m: MetricsState): number {
   let n = 0;
   for (let i = 0; i < m.events.length; i++) {
@@ -250,24 +349,20 @@ export function medianSampleSize(m: MetricsState): number {
   return n;
 }
 
-/** rollbackRate 的**分母**（口径同它：排除 action === 'wall'） */
+/**
+ * rollbackRate 的**分母** = 尝试组数（口径同它：含 'wall'、同卡同一次出现只算一次）。
+ * ⚠️ 这里不再是"事件数"：真机上 51 条事件只对应 47 个尝试组。
+ */
 export function rollbackDenominator(m: MetricsState): number {
-  let n = 0;
-  for (let i = 0; i < m.events.length; i++) {
-    if (m.events[i].action !== 'wall') { n++; }
-  }
-  return n;
+  return countAttemptGroups(m).groups;
 }
 
-/** rollbackRate 的**分子**（回弹事件数，同样排除 wall） */
+/**
+ * rollbackRate 的**分子** = 出现过回弹的尝试组数（口径同它：含 'wall'、组内去重）。
+ * 同一张照片在一次出现里回弹两次，这里只 +1 —— 用户的手滑只发生在一个意图上。
+ */
 export function rollbackCount(m: MetricsState): number {
-  let c = 0;
-  for (let i = 0; i < m.events.length; i++) {
-    const e = m.events[i];
-    if (e.action === 'wall') { continue; }
-    if (e.rolledBack) { c++; }
-  }
-  return c;
+  return countAttemptGroups(m).fumbled;
 }
 
 // ── spec §5.3 的三条验收目标与判定 ────────────────────────────────────────────
@@ -397,7 +492,12 @@ export interface StatsSnapshot {
  *   这里只是把它的语义写下来。
  *
  * 空数据的分界（每条指标各自判，不设"整页空态"这种粗判据）：
- *   - 中位数/回弹率：`样本数 > 0` 才有样本（全是 'wall' 也算**没有**样本，见 medianDecisionMs 注释）；
+ *   - 中位数：`medianSampleSize > 0` 才有样本（全是 'wall' 时它仍是 0 → 中位数不可判定）；
+ *   - 回弹率：`尝试组数 > 0` 才有样本 —— **含全是 'wall' 的事件**：wall 现在计入分母，
+ *     所以"一批全是上墙的事件"是"有样本、回弹率 0%"，**不是**"还没有数据"。
+ *     只有一条事件都没有（或全部被读侧丢弃）时才不可判定。这条区分是 batch-39 的口径
+ *     变更带来的**唯一**判定变化，须与"空集合 ≠ 达标"一起看：
+ *     空集合仍然不可判定（分母 0 → hasSample false），只是"全是 wall"不再属于空集合。
  *   - 转化率：`收藏池 > 0` 才有样本（一张都没收藏时分母为 0，wallConversion 返回 0 —— 那个 0 是"不可判定"）。
  */
 export function computeStats(

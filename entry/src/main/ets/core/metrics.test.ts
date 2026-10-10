@@ -16,6 +16,11 @@ const ev = (decidedAt: number, shownAt: number, rolledBack = false) =>
 const evAct = (action: string, decidedAt: number, shownAt: number, rolledBack = false) =>
   ({ photoId: 'p', shownAt, decidedAt, action, rolledBack });
 
+// batch-39 的用例用它：**尝试组 = 同一张照片的同一次出现**（`photoId` + `shownAt`），
+// 所以这四条必须都能显式指定。ev/evAct 把两者写死成 'p' / 0，只够表达"单张单次"。
+const evFull = (photoId: string, shownAt: number, decidedAt: number, action: string, rolledBack = false) =>
+  ({ photoId, shownAt, decidedAt, action, rolledBack });
+
 test('空状态中位数为 0', () => {
   assert.equal(medianDecisionMs(emptyMetrics()), 0);
 });
@@ -38,11 +43,13 @@ test('偶数个取中间两个的平均', () => {
 test('回弹率 = 回弹数 / 滑动尝试数', () => {
   let m = emptyMetrics();
   // 4 个事件全是滑动尝试（action 均为 'fav'）、没有 wall，
-  // 所以「排除 wall」的新口径不影响这个断言的期望值（仍是 1/4）。
+  // 且 4 条**互不相同**（默认 ev() 的 photoId 恒为 'p'、shownAt 恒为 0 —— 见下方
+  // batch-39 用例：那 4 条会被算成同一个尝试组。本用例只关心 1/4 这个比值，
+  // 所以逐条给出不同的 shownAt，让它们各自成为一个组。）
   m = recordSwipe(m, ev(1000, 0, true));
-  m = recordSwipe(m, ev(1000, 0, false));
-  m = recordSwipe(m, ev(1000, 0, false));
-  m = recordSwipe(m, ev(1000, 0, false));
+  m = recordSwipe(m, ev(1000, 10, false));
+  m = recordSwipe(m, ev(1000, 20, false));
+  m = recordSwipe(m, ev(1000, 30, false));
   assert.ok(Math.abs(rollbackRate(m) - 0.25) < 1e-9);
 });
 
@@ -73,25 +80,176 @@ test('脏数据被丢弃后，状态仍可继续使用', () => {
   assert.equal(medianDecisionMs(m), 1000);
 });
 
-// ── 「上墙」事件必须被排除出滑动口径（spec §5.3 的指标是「误操作率」）──────────
-// 上墙 = 在卡片上点一下按钮，不是一次滑动尝试；若算进分母，指标会随上墙用得越多
-// 而越虚低（越常上墙越显得「回弹率 < 3%」达标，属自证清白型失真）。
+// ══════════════════════════════════════════════════════════════════════════════
+// batch-39：回弹率改为「按每张照片的滑动尝试」算（用户裁决，逐字：
+//   「改口径：按"每张照片的滑动尝试"算」）
+//
+// 单位 = **尝试组** = 一张照片的一次出现（`photoId` + `shownAt`）。两条要求：
+//   · 分母 = 每次真正的尝试（**含 wall**，也含同一张卡的重试）；
+//   · 同一张卡的连续重试**算一次**（「用户对这张照片的意图是一次，手滑不是第二次意图」）。
+// 旧口径的两条前提都被真机数据（51 条事件）推翻：既不该"按事件数"（重试给分母 +1），
+// 也不该"排除 wall"（wall 占 53%，排除它 = 分母缩水、分子照算 → 率虚高近 2 倍）。
+// ══════════════════════════════════════════════════════════════════════════════
 
-test('回弹率的分母排除「上墙」事件（点按钮不是滑动尝试）', () => {
+test('batch-39：同卡 wall + none(回弹) + wall 三条事件 → 分母只算 1、分子 1', () => {
+  // 这正是真机上 IMG_20261003_184352.jpg 的形态（wall + 回弹 + wall）。
+  // 三条共享同一个 shownAt：上墙的事件在 handle() 里同刻记下、推进却在异步的 applyWall() 里，
+  // 而回弹在 handle() 里早退不换卡 —— 依据见 core/metrics.ts 的 rollbackRate 注释。
   let m = emptyMetrics();
-  m = recordSwipe(m, evAct('none', 1000, 0, true));    // 1 次回弹（回弹事件的 action 是 'none'）
-  m = recordSwipe(m, ev(1000, 0));                     // 1 次右滑收藏
-  m = recordSwipe(m, evAct('wall', 1000, 0));          // 2 次点「上墙」
-  m = recordSwipe(m, evAct('wall', 1000, 0));
-  // 1 回弹 / (1 回弹 + 1 滑动) = 0.5；含 wall 的老口径会算成 1/4 = 0.25
-  assert.ok(Math.abs(rollbackRate(m) - 0.5) < 1e-9);
+  m = recordSwipe(m, evFull('IMG_A.jpg', 5000, 5300, 'wall'));
+  m = recordSwipe(m, evFull('IMG_A.jpg', 5000, 6100, 'none', true));   // 第一次没滑够 → 弹回
+  m = recordSwipe(m, evFull('IMG_A.jpg', 5000, 6900, 'wall'));         // 再滑一次成功
+  assert.equal(m.events.length, 3, '三条事件都要留在历史里（口径变的是统计单位，不是记录）');
+  assert.equal(rollbackDenominator(m), 1, '分母 = 1 个尝试组（旧口径会算成 3）');
+  assert.equal(rollbackCount(m), 1, '分子 = 1：这一组手滑过');
+  assert.ok(Math.abs(rollbackRate(m) - 1) < 1e-9, '1/1 = 100% —— 这一次意图确实手滑了');
+  // 再补一张"只上墙、没回弹"的对照卡：只有它能把这三种口径区分开 ——
+  //   新口径（尝试组）→ 2 组、1 组手滑 → 50%；
+  //   旧口径（事件数、排除 wall）→ 分母只剩那条 'none' → 1/1 = 100%。
+  // 少了这张对照卡，"wall + none + wall"单独一组的读数在两种口径下**恰好都是 1/1**，
+  // 这条用例就会对旧口径免疫 —— 变异测试里它会活下来（实测过）。
+  m = recordSwipe(m, evFull('IMG_B.jpg', 9000, 9500, 'wall'));
+  assert.equal(rollbackDenominator(m), 2, '对照卡是第 2 个尝试组（旧口径在这里仍是 1）');
+  assert.equal(rollbackCount(m), 1);
+  assert.ok(Math.abs(rollbackRate(m) - 0.5) < 1e-9, '旧口径会算成 1/1 = 100%');
 });
 
-test('回弹率：全部事件都是「上墙」时返回 0（分母为 0，不除零）', () => {
+test('batch-39：同一组内回弹两次也只算一个分子（组内去重）', () => {
   let m = emptyMetrics();
-  m = recordSwipe(m, evAct('wall', 1000, 0));
-  m = recordSwipe(m, evAct('wall', 2000, 0));
+  m = recordSwipe(m, evFull('IMG_A.jpg', 5000, 5300, 'none', true));
+  m = recordSwipe(m, evFull('IMG_A.jpg', 5000, 6100, 'none', true));
+  m = recordSwipe(m, evFull('IMG_A.jpg', 5000, 6900, 'wall'));
+  assert.equal(rollbackDenominator(m), 1);
+  assert.equal(rollbackCount(m), 1, '用户的手滑只发生在**一个**意图上，不该算成 2');
+  assert.ok(Math.abs(rollbackRate(m) - 1) < 1e-9);
+});
+
+test('batch-39：纯 wall 序列（无回弹）→ 分子 0', () => {
+  let m = emptyMetrics();
+  m = recordSwipe(m, evFull('A.jpg', 100, 300, 'wall'));   // 三张不同的照片 = 三个尝试组
+  m = recordSwipe(m, evFull('B.jpg', 200, 400, 'wall'));
+  m = recordSwipe(m, evFull('C.jpg', 300, 500, 'wall'));
+  assert.equal(rollbackDenominator(m), 3, 'wall 计入分母');
+  assert.equal(rollbackCount(m), 0, '没有回弹 → 分子 0');
   assert.equal(rollbackRate(m), 0);
+});
+
+test('batch-39：全部是「上墙」→ **有样本**、回弹率 0%（不再判成"不可判定"）', () => {
+  let m = emptyMetrics();
+  m = recordSwipe(m, evFull('A.jpg', 100, 300, 'wall'));
+  m = recordSwipe(m, evFull('B.jpg', 200, 400, 'wall'));
+  assert.equal(rollbackDenominator(m), 2, '旧口径在这里得到 0（分母为 0 → 不可判定）');
+  assert.equal(rollbackCount(m), 0);
+  assert.equal(rollbackRate(m), 0);
+  const s = computeStats(m, 0, 2, 0);
+  assert.equal(s.rollbackVerdict.hasSample, true, '有样本 —— 旧口径下不可能出现的判定');
+  assert.equal(s.rollbackVerdict.met, true, '有样本且 0% < 3% → 真的达标');
+  assert.equal(verdictText(s.rollbackVerdict), '达标');
+  // 但**中位数**仍不可判定：wall 依旧不进它的样本 —— 两条指标的口径在 batch-39 分家了
+  assert.equal(s.medianSample, 0);
+  assert.equal(s.medianVerdict.hasSample, false);
+  assert.equal(verdictText(s.medianVerdict), '还没有数据');
+});
+
+test('batch-39：同一张照片在不同时间被独立刷两次（shownAt 相距很远）→ 分母算 2 次', () => {
+  // 本批定义的边界：尝试组 = 同一次**出现**。shownAt 只在换卡时刷新
+  //（SwipePage.goTo 末尾），所以"两次出现"必然是两个 shownAt = 两次真实意图，
+  // **不**折叠 —— 折叠它们是"按照片张数算"，那是另一个指标。
+  let m = emptyMetrics();
+  m = recordSwipe(m, evFull('IMG_X.jpg', 1000, 1500, 'fav'));              // 第一次出现：收藏
+  m = recordSwipe(m, evFull('IMG_X.jpg', 600000, 600400, 'none', true));   // 十分钟后又被刷到：手滑
+  assert.equal(rollbackDenominator(m), 2, '两次出现 = 2 次尝试（不是 1 次，也不是 3 次）');
+  assert.equal(rollbackCount(m), 1);
+  assert.ok(Math.abs(rollbackRate(m) - 0.5) < 1e-9);
+  // 对照：两条共享同一个 shownAt（= 同一次出现里的重试）→ 分母只有 1
+  let m2 = emptyMetrics();
+  m2 = recordSwipe(m2, evFull('IMG_X.jpg', 1000, 1500, 'fav'));
+  m2 = recordSwipe(m2, evFull('IMG_X.jpg', 1000, 1900, 'none', true));
+  assert.equal(rollbackDenominator(m2), 1, '同一 shownAt = 同一次出现 = 1 次意图');
+  assert.ok(Math.abs(rollbackRate(m2) - 1) < 1e-9);
+});
+
+test('batch-39：重复上报同一事件不放大分母（旧口径下每条重复都给分母 +1）', () => {
+  // CardStack 的防抖挡的是"同一次回弹重复上报"，但按钮同帧被点两次等路径仍可能重复上报
+  //（SwipePage.handle 的 recordSwipe 在去重守卫**之前**）。分组对重复上报天然幂等。
+  let m = emptyMetrics();
+  m = recordSwipe(m, evFull('A.jpg', 100, 300, 'wall'));
+  m = recordSwipe(m, evFull('A.jpg', 100, 300, 'wall'));   // 同一次出现、同一动作，重复上报
+  assert.equal(m.events.length, 2);
+  assert.equal(rollbackDenominator(m), 1, '同一个键 add 两次，组数不变');
+  assert.equal(rollbackRate(m), 0);
+});
+
+// ── 真机数据 fixture（本轮最有价值的用例）─────────────────────────────────────
+// 51 条事件，控制器已核：wall 27 / fav 17 / none(回弹) 4 / archive 3。
+// 其中 3 张有连续重试（用户要给这张上墙 → 第一次没滑够弹回 → 再滑一次成功）：
+//   IMG_20261003_184352.jpg ×3 = wall + none + wall
+//   IMG_20261003_134612.jpg ×2 = none + wall
+//   IMG_20261005_143005.jpg ×2 = none + wall
+// 旧口径：分母 = 51 - 27 = 24 → 4/24 = 16.67%；
+// 新口径：47 个尝试组 → 4/47 ≈ 8.51%。
+
+/** 真机 51 条事件（同一张重试的三/两条共享同一个 shownAt = 同一次出现） */
+const deviceEvents = () => {
+  const out = [];
+  // 3 张有重试的照片（7 条事件 → 3 个尝试组）
+  out.push(evFull('IMG_20261003_184352.jpg', 1000, 1300, 'wall'));
+  out.push(evFull('IMG_20261003_184352.jpg', 1000, 2100, 'none', true));
+  out.push(evFull('IMG_20261003_184352.jpg', 1000, 2900, 'wall'));
+  out.push(evFull('IMG_20261003_134612.jpg', 2000, 2400, 'none', true));
+  out.push(evFull('IMG_20261003_134612.jpg', 2000, 3100, 'wall'));
+  out.push(evFull('IMG_20261005_143005.jpg', 3000, 3300, 'none', true));
+  out.push(evFull('IMG_20261005_143005.jpg', 3000, 4000, 'wall'));
+  // 其余 44 条：每张一次出现（23 条 wall + 17 条 fav + 1 条 none + 3 条 archive）
+  for (let i = 0; i < 23; i++) { out.push(evFull(`w${i}.jpg`, 10000 + i * 100, 10500 + i * 100, 'wall')); }
+  for (let i = 0; i < 17; i++) { out.push(evFull(`f${i}.jpg`, 20000 + i * 100, 20500 + i * 100, 'fav')); }
+  out.push(evFull('n0.jpg', 30000, 30600, 'none', true));   // 第 4 次回弹：独立发生，后面没有再试
+  for (let i = 0; i < 3; i++) { out.push(evFull(`a${i}.jpg`, 40000 + i * 100, 40500 + i * 100, 'archive')); }
+  return out;
+};
+
+test('真机 fixture：51 条事件 → 分母 47 / 分子 4 → 8.51%（旧口径 16.67%）', () => {
+  const evs = deviceEvents();
+  const m = { events: evs };
+  // 先钉住 fixture 本身与真机一致（否则下面的换算没有意义）
+  assert.equal(evs.length, 51, '51 条事件');
+  let wallN = 0, favN = 0, noneN = 0, archiveN = 0, rbN = 0;
+  for (let i = 0; i < evs.length; i++) {
+    const e = evs[i];
+    if (e.action === 'wall') { wallN++; }
+    if (e.action === 'fav') { favN++; }
+    if (e.action === 'none') { noneN++; }
+    if (e.action === 'archive') { archiveN++; }
+    if (e.rolledBack) { rbN++; }
+  }
+  assert.equal(wallN, 27, 'wall 27');
+  assert.equal(favN, 17, 'fav 17');
+  assert.equal(noneN, 4, 'none(回弹) 4');
+  assert.equal(archiveN, 3, 'archive 3');
+  assert.equal(rbN, 4, '回弹事件 4 条');
+
+  // 旧口径（本批要消灭的那个）：分母排除 wall、按**事件**数 → 4/24 = 16.67%
+  const oldDen = evs.length - wallN;
+  assert.equal(oldDen, 24, '旧分母 = 51 - 27 = 24');
+  assert.ok(Math.abs(rbN / oldDen - 0.16666666666666666) < 1e-9, '旧读数 = 16.67%');
+
+  // 新口径：47 个尝试组，其中 4 组手滑过
+  assert.equal(rollbackDenominator(m), 47, '分母 = 47 个尝试组');
+  assert.equal(rollbackCount(m), 4, '分子 = 4 组（3 张重试 + 1 次独立回弹）');
+  const rate = rollbackRate(m);
+  assert.ok(Math.abs(rate - 4 / 47) < 1e-9, '4/47 ≈ 8.51%');
+  // 8.51% 仍然 > 3% → 未达标（本批只是修正读数，没有把失败改成通过）
+  assert.equal(meetsRollbackTarget(rate), false, '8.5% 仍高于 3% → 未达标');
+  assert.ok(rate < rbN / oldDen, '新读数必须**低于**旧读数（旧口径是虚高）');
+  // 判定层
+  const s = computeStats(m, 55, 33, 0);
+  assert.equal(s.rollbackSample, 47);
+  assert.equal(s.rollbackCount, 4);
+  assert.equal(s.rollbackVerdict.hasSample, true);
+  assert.equal(verdictText(s.rollbackVerdict), '未达标');
+  // 口径变更**不牵连**中位数与转化率：中位数样本仍是 51 - 27 = 24 条事件
+  assert.equal(s.medianSample, 24, '中位数仍按事件计、仍排除 wall（口径不许动）');
+  assert.ok(Math.abs(s.conversion - 0.6) < 1e-9, '转化率 33/55 = 60% 不受影响');
 });
 
 test('中位决策耗时排除「上墙」事件（按钮决策与滑动决策不同质）', () => {
@@ -272,32 +430,32 @@ test('样本量：单条滑动决策 → 1 / 1 / 0', () => {
   assert.equal(rollbackCount(m), 0);
 });
 
-test('样本量：全是「上墙」→ 滑动样本为 0（点按钮不是滑动尝试）', () => {
+test('样本量：全是「上墙」→ 中位数样本 0，但回弹率**有**分母（batch-39 口径分家）', () => {
   let m = emptyMetrics();
-  m = recordSwipe(m, evAct('wall', 1000, 0));
-  m = recordSwipe(m, evAct('wall', 2000, 0));
+  m = recordSwipe(m, evFull('A.jpg', 100, 1000, 'wall'));
+  m = recordSwipe(m, evFull('B.jpg', 200, 2000, 'wall'));
   assert.equal(m.events.length, 2, '事件本身是记下来的');
-  assert.equal(medianSampleSize(m), 0, '但它们不构成滑动样本');
-  assert.equal(rollbackDenominator(m), 0);
+  assert.equal(medianSampleSize(m), 0, 'wall 不进中位数样本（口径未变）');
+  assert.equal(rollbackDenominator(m), 2, 'wall **进**回弹率分母（batch-39 反转）');
   assert.equal(rollbackCount(m), 0);
-  // 与两个口径函数一致：没有样本时它们都返回 0
+  // 两个口径函数各自与自己的一致：中位数返回 0（无样本）、回弹率返回 0（有样本、0 回弹）
   assert.equal(medianDecisionMs(m), 0);
   assert.equal(rollbackRate(m), 0);
 });
 
-test('样本量：混合事件时精确计数（wall 出局，fav/archive/none 计入）', () => {
+test('样本量：混合事件时精确计数（中位数排除 wall、回弹率含 wall 且按组去重）', () => {
   let m = emptyMetrics();
-  m = recordSwipe(m, ev(1000, 0));                     // fav
-  m = recordSwipe(m, evAct('archive', 1000, 0));        // archive
-  m = recordSwipe(m, evAct('none', 1000, 0, true));     // 回弹
-  m = recordSwipe(m, evAct('none', 1000, 0, true));     // 回弹
-  m = recordSwipe(m, evAct('wall', 1000, 0));           // 上墙（出局）
+  m = recordSwipe(m, evFull('p1', 0, 1000, 'fav'));                  // 组1
+  m = recordSwipe(m, evFull('p2', 0, 1000, 'archive'));              // 组2
+  m = recordSwipe(m, evFull('p3', 0, 1000, 'none', true));           // 组3（回弹）
+  m = recordSwipe(m, evFull('p3', 0, 1200, 'none', true));           // 组3 的第二次回弹
+  m = recordSwipe(m, evFull('p4', 0, 1000, 'wall'));                 // 组4（含 wall）
   assert.equal(m.events.length, 5);
-  assert.equal(medianSampleSize(m), 4);
-  assert.equal(rollbackDenominator(m), 4);
-  assert.equal(rollbackCount(m), 2);
-  assert.ok(Math.abs(rollbackRate(m) - 0.5) < 1e-9);
-  // 中位数样本 = [1000,1000,1000,1000]，与分母一致
+  assert.equal(medianSampleSize(m), 4, '中位数：5 - 1 条 wall = 4 个样本');
+  assert.equal(rollbackDenominator(m), 4, '回弹率：5 条事件 → 4 个尝试组（含 wall 那组）');
+  assert.equal(rollbackCount(m), 1, '只有组3 手滑过（它回弹了两次，仍算 1）');
+  assert.ok(Math.abs(rollbackRate(m) - 0.25) < 1e-9);
+  // 中位数样本 = [1000,1000,1000,1200] → 中间两个的平均
   assert.equal(medianDecisionMs(m), 1000);
 });
 
@@ -415,15 +573,19 @@ test('空数据不等于达标：中位数与回弹率都不可判定，verdictT
   assert.equal(s.droppedCount, 0);
 });
 
-test('空数据不等于达标：全是「上墙」时滑动指标仍不可判定（事件数 > 0 也不算有样本）', () => {
+test('空数据不等于达标：全是「上墙」时**中位数**仍不可判定，但回弹率已有样本（batch-39）', () => {
   let m = emptyMetrics();
-  m = recordSwipe(m, evAct('wall', 1000, 0));
-  m = recordSwipe(m, evAct('wall', 1000, 0));
+  m = recordSwipe(m, evFull('A.jpg', 100, 1000, 'wall'));
+  m = recordSwipe(m, evFull('B.jpg', 200, 1000, 'wall'));
   const s = computeStats(m, 0, 0, 0);
   assert.equal(s.eventCount, 2);
+  // 中位数：wall 不进样本 → 记了事件也仍不可判定
   assert.equal(s.medianVerdict.hasSample, false);
   assert.equal(verdictText(s.medianVerdict), '还没有数据');
-  assert.equal(verdictText(s.rollbackVerdict), '还没有数据');
+  // 回弹率：wall 现在计入分母 → 有样本（0% 回弹 = 真的达标，不是"还没有数据"）
+  assert.equal(s.rollbackSample, 2);
+  assert.equal(s.rollbackVerdict.hasSample, true);
+  assert.equal(verdictText(s.rollbackVerdict), '达标');
 });
 
 test('空数据不等于达标：verdictText 只在真有样本时才可能说「达标」', () => {
@@ -473,21 +635,26 @@ test('computeStats：单条 —— 中位数就是那一条的间隔', () => {
   assert.equal(s.eventCount, 1);
 });
 
-test('computeStats：全是 wall —— 滑动指标无样本，转化率照常可测', () => {
+test('computeStats：全是 wall —— 中位数无样本，回弹率**有**样本，转化率照常可测', () => {
   let m = emptyMetrics();
-  m = recordSwipe(m, evAct('wall', 1000, 0));
-  m = recordSwipe(m, evAct('wall', 1000, 0));
+  m = recordSwipe(m, evFull('A.jpg', 100, 1000, 'wall'));
+  m = recordSwipe(m, evFull('B.jpg', 200, 1000, 'wall'));
   const s = computeStats(m, 55, 33, 0);
   assert.equal(s.medianSample, 0);
-  assert.equal(s.rollbackSample, 0);
-  assert.equal(s.medianVerdict.hasSample, false);
-  assert.equal(s.rollbackVerdict.hasSample, false);
+  assert.equal(s.medianVerdict.hasSample, false, '中位数仍不可判定（wall 不进它的样本）');
+  // batch-39：回弹率的分母含 wall → 这里有 2 个尝试组、0 次回弹
+  assert.equal(s.rollbackSample, 2);
+  assert.equal(s.rollbackCount, 0);
+  assert.equal(s.rollbackRate, 0);
+  assert.equal(s.rollbackVerdict.hasSample, true);
+  assert.equal(s.rollbackVerdict.met, true);
+  assert.equal(verdictText(s.rollbackVerdict), '达标');
   // 转化率与事件无关，只与决策表有关
   assert.equal(s.favedPool, 55);
   assert.equal(s.walled, 33);
   assert.ok(Math.abs(s.conversion - 0.6) < 1e-9);
   assert.equal(s.conversionVerdict.hasSample, true);
-  // 60% ≥ 15% → **达标**。这是本次产品裁决的核心：旧口径（闭区间 15%~30%）在这里读出
+  // 60% ≥ 15% → **达标**。这是上一批产品裁决的核心：旧口径（闭区间 15%~30%）在这里读出
   // 「未达标」，而真机 33/55 = 60% 是行为事实（「上墙」是一步直达的按钮，不必先收藏），
   // 不是缺陷 —— 上界被删除后，这个数不再是"失败"。
   assert.equal(s.conversionVerdict.met, true);
@@ -496,19 +663,20 @@ test('computeStats：全是 wall —— 滑动指标无样本，转化率照常�
 
 test('computeStats：混合 —— 三条读数同时可判定', () => {
   let m = emptyMetrics();
-  m = recordSwipe(m, ev(1000, 0));                      // fav 1000ms
-  m = recordSwipe(m, evAct('archive', 1600, 0));         // archive 1600ms
-  m = recordSwipe(m, evAct('none', 900, 0, true));       // 回弹 900ms
-  m = recordSwipe(m, evAct('wall', 50, 0));              // 上墙（不进滑动样本）
+  m = recordSwipe(m, evFull('p1', 0, 1000, 'fav'));                 // 组1：1000ms
+  m = recordSwipe(m, evFull('p2', 0, 1600, 'archive'));             // 组2：1600ms
+  m = recordSwipe(m, evFull('p3', 0, 900, 'none', true));           // 组3：回弹 900ms
+  m = recordSwipe(m, evFull('p4', 0, 50, 'wall'));                  // 组4：上墙（不进中位数样本）
   const s = computeStats(m, 20, 4, 0);                   // 收藏池 20（含已上墙 4）
   assert.equal(s.eventCount, 4);
   assert.equal(s.medianSample, 3);
   assert.equal(s.medianMs, 1000, '样本 = [1000,1600,900] → 1000；混入 wall 的 50 会变成 900');
   assert.equal(s.medianVerdict.met, true);
-  assert.equal(s.rollbackSample, 3);
+  // batch-39：回弹率分母含 wall → 4 个尝试组、其中 1 组手滑
+  assert.equal(s.rollbackSample, 4, '4 条事件 = 4 个尝试组（含 wall 那组）');
   assert.equal(s.rollbackCount, 1);
-  assert.ok(Math.abs(s.rollbackRate - 1 / 3) < 1e-9);
-  assert.equal(s.rollbackVerdict.met, false, '33% > 3%');
+  assert.ok(Math.abs(s.rollbackRate - 0.25) < 1e-9);
+  assert.equal(s.rollbackVerdict.met, false, '25% > 3%');
   assert.ok(Math.abs(s.conversion - 0.2) < 1e-9);
   assert.equal(s.conversionVerdict.met, true);
 });

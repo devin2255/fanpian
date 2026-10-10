@@ -124,7 +124,9 @@ struct StatsPage {
           // ── 三条验收指标 ────────────────────────────────────────────────────
           this.metricCard('决策间隔中位数', `${Math.round(this.stats.medianMs)} ms`,
             `< ${TARGET_MEDIAN_MS} ms`, this.stats.medianVerdict)
-          this.metricCard('回弹率', this.pct(this.stats.rollbackRate),
+          // batch-39：标题点明单位（按"尝试次数"= 一张照片的一次出现），
+          // 因为同一个 3% 目标在旧口径（按事件数、排除上墙）下与新口径下是两个不同的数。
+          this.metricCard('回弹率（按尝试次数）', this.pct(this.stats.rollbackRate),
             `< ${this.pct(TARGET_ROLLBACK_RATE)}`, this.stats.rollbackVerdict)
           // 转化率的目标文案只有下限：上界已按产品裁决取消（理由见 core/metrics.ts 的常量注释）。
           // 这里**不许**再拼出「15.0% ~ 30.0%」—— 那会把一个已被删除的判据说成现行目标。
@@ -137,8 +139,13 @@ struct StatsPage {
             Text('样本量').fontSize(13).fontWeight(FontWeight.Medium).fontColor('#333333')
               .width('100%').margin({ bottom: 4 })
             this.sampleRow('决策间隔的样本数（排除「上墙」）', `${this.stats.medianSample} 次`)
-            this.sampleRow('回弹率的分母（滑动尝试，排除「上墙」）', `${this.stats.rollbackSample} 次`)
-            this.sampleRow('回弹率的分母 / 分子', `${this.stats.rollbackSample} / ${this.stats.rollbackCount}`)
+            // batch-39：回弹率的分母不再是"事件数"，而是**尝试次数**（一张照片的一次出现算一次）。
+            // 标签必须把"含上墙"与"同卡重试只算一次"都写出来 —— 否则用户看到的 47 与
+            // 「已记录的刷卡事件 51 条」对不上，会以为页面算错了。
+            this.sampleRow('回弹率的分母（尝试次数：一张照片的一次出现算一次，**含「上墙」**）',
+              `${this.stats.rollbackSample} 次`)
+            this.sampleRow('回弹率的分母 / 其中有过回弹的',
+              `${this.stats.rollbackSample} 次 / ${this.stats.rollbackCount} 次`)
             this.sampleRow('上墙转化率的分母（收藏池 = 收藏 + 已上墙）', `${this.stats.favedPool} 张`)
             this.sampleRow('上墙转化率的分子（已上墙）', `${this.stats.walled} 张`)
             this.sampleRow('已记录的刷卡事件', `${this.stats.eventCount} 条`)
@@ -151,10 +158,17 @@ struct StatsPage {
           Column() {
             Text('口径说明').fontSize(13).fontWeight(FontWeight.Medium).fontColor('#333333')
               .width('100%').margin({ bottom: 6 })
-            this.note('· 中位数与回弹率的分母都**排除「上墙」**事件：那是在卡片上点一下按钮，'
-              + '不是一次滑动尝试（也没有越过任何阈值）。含它会让指标随「上墙」用得越多而越虚低。')
-            this.note('· 回弹率 = 回弹次数 ÷ 滑动尝试次数。同一张卡"被回弹后成功划出"会贡献 2 次尝试，'
-              + '这正是它消耗了 2 次尝试的忠实反映（不是按卡片数算）。')
+            this.note('· 回弹率 = **出现过回弹的尝试次数 ÷ 尝试次数**。'
+              + '一次「尝试」= 一张照片的**一次出现**，所以：同一张卡"第一次没滑够弹回、再滑一次成功"'
+              + '只算 **1 次**尝试（用户对这张照片的意图是一次，手滑不是第二次意图，这一组里回弹几次也只算 1）；'
+              + '而同一张照片**在不同时间被独立刷到两次**算 **2 次**（那是两次意图）。')
+            this.note('· 回弹率的**分母含「上墙」**（batch-39 改）：旧口径排除它，前提是"上墙必然成功"，'
+              + '但真机数据显示上墙占了一半以上、而且**回弹可以发生在上墙之前** —— '
+              + '排除它会让分母缩水而分子照算（真机 4/24 = 16.7% 虚高，真实是 4/47 = 8.5%）。'
+              + '该前提已作废，详见 core/metrics.ts 的 rollbackRate。')
+            this.note('· 中位数的口径**没有**跟着改，两边已分家：它仍然排除「上墙」—— '
+              + '它量的是"滑向某一边犹豫了多久"，而点按钮的"耗时"是"照片显示到点按钮"的间隔，'
+              + '不同质（按钮常在照片刚出现时就被点，混进来会把中位数拉低）。')
             this.note('· 上墙转化率 = 已上墙 ÷ 收藏池（**收藏 + 已上墙**）。上墙会把照片从「收藏」'
               + '移入「已上墙」，所以分母必须含已上墙的，否则每上墙一张分母就少一张。')
             this.note('· 判定按**原始值**（未舍入），显示值四舍五入到 0.1%。')
@@ -163,12 +177,18 @@ struct StatsPage {
               + '**没有上界** —— 上界已按产品裁决取消：「上墙」是一步直达的动作（不必先收藏），'
               + '转化率本来就高，设备真值 60% 是行为事实、不是缺陷。')
             this.note('· 没有样本 = 「还没有数据」，**不是**达标：空集合下读数都是 0，'
-              + '而 0 < 1200ms、0 < 3% 都恰好为真 —— 只看数值会把空设备读成绿的。')
+              + '而 0 < 1200ms、0 < 3% 都恰好为真 —— 只看数值会把空设备读成绿的。'
+              + '注意"一条事件都没有"才是空集合：**全是「上墙」时回弹率是有样本的**'
+              + '（0% 回弹 = 真的达标），只有中位数仍不可判定。')
             this.note(`· 事件窗口上限 ${MAX_METRIC_EVENTS} 条，超过就淘汰最旧的（留 ${MAX_METRIC_EVENTS} - 200 条）。`
               + '淘汰条数 > 0 时，中位数与回弹率只反映窗口内的样本（不是全生命周期）。')
             if (this.stats.eventCount > 0 && this.stats.medianSample === 0) {
+              // batch-39：这条提示原来把中位数与回弹率绑在一起说"都不可判定"。
+              // 回弹率的分母现已含「上墙」，所以"全部是上墙"对它是**有**样本的（0% 回弹 → 达标）。
+              // 只有中位数仍然是"不可判定"——文案必须跟着改，否则页面会把一个达标的读数说成没数据。
               this.note(`· 已记录 ${this.stats.eventCount} 次刷卡，但**全部是「上墙」**：`
-                + '按上面的口径它们不构成滑动样本，所以中位数与回弹率不可判定。')
+                + '中位数按上面的口径不可判定（它仍然排除「上墙」）；'
+                + '回弹率**有**样本（分母含「上墙」），读数为 0% —— 那是真的达标，不是"还没有数据"。')
             }
             this.note('· 本页**只读**：不做任何写入。要重置统计就删掉 files/metrics.json。')
           }
