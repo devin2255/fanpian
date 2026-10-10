@@ -5,27 +5,36 @@
  *   node --experimental-strip-types tools/wall-audit.ts tools/out/wall-preview.svg
  *   node --experimental-strip-types tools/wall-audit.ts tools/out/wall-preview.svg --json
  *
+ * ── ⚠️ task-18：本工具现在只对**旧预览**（带照片卡片的那些）有意义 ──────────────
+ *   形态改造之后墙上没有卡片了：照片是**钉子旁的一簇小圆点**（半径 1.9pt、最多 5 个），
+ *   大图在设备侧的详情面板里（Node 侧本来就看不到）。所以：
+ *     · `<rect … rx="2">` 一条都抽不到 → `cards = 0`，所有卡片度量退化成 0；
+ *     · **圆点与＋N 的计数仍然有效**（`markerDots` / `pinDots` / `halos` / `plusN`），照常报；
+ *     · 新形态的**面积口径验收**（地图填满度、标记与钉子的距离）由
+ *       `render.ts` 的 `mapFillRatio` / `pinMarkers` 直接给出，并在 `render-preview.ts`
+ *       的控制台里印出来 —— 那两件事**不需要读 SVG**（它们是纯几何量），
+ *       在这里再算一遍只会变成"用渲染结果反推几何"，比直接量那条链路更弱。
+ *
  * ── 为什么是「读 SVG」而不是「再算一遍几何」 ──────────────────────────────────
  * 这个脚本刻意**不复用 render.ts 的任何布局函数**，只做两件事：正则抽出 SVG 里的
  * 照片卡片矩形、用平面几何判定它们之间的关系。理由：
  *   · 如果它复用同一份布局代码，"布局算错了"和"度量算错了"会一起错，度量就失去了判别力；
  *   · SVG 正是**人眼看到的那张图**（控制器就是打开它看的）——度量与观感对的是同一个对象。
  * 它唯一"相信" render.ts 的地方是卡片的画法：外层矩形 `rx="2"` 就是一张照片
- *（内层白边是 `rx="1.4"`，据此区分）。这条约定写在 render.ts 的 photoCardSvg 里。
+ *（内层白边是 `rx="1.4"`，据此区分）。**卡片已经不存在了**，所以这条约定只对旧预览成立。
  *
  * ── 度量定义（报告里逐条引用） ──────────────────────────────────────────────
  *   · 出画布框数：卡片矩形与画布 [0,w]×[0,h] 的差集面积 > EPS 的卡片数。
  *     （"边界刚好贴边"不算出界；EPS 吸收浮点与 2 位小数取整的误差。）
  *   · 两两重叠对数：**任意两张卡片的矩形相交**即算一对，交集面积 > EPS_AREA 才计数。
- *     EPS_AREA = 1 pt²（约一张卡片面积的 0.07%）—— 小于它的相交在 2 倍图上不到 1px，
+ *     EPS_AREA = 1 pt²（约一张 26×34 卡片面积的 0.11%）—— 小于它的相交在 2 倍图上不到 1px，
  *     肉眼不可见；用 0 容忍会把浮点噪声当成缺陷报出来。
  *   · 重叠面积占比：所有相交对的交集面积之和 ÷（卡片数 × 单卡面积）。
- *   · 空间利用：画布面积、卡片覆盖面积、地图块高、挂载区高、空白占比。
+ *   · 空间利用：画布面积、卡片覆盖面积、地图块高、地图框高、空白占比。
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { HANG_OVERLAP_EPS } from '../entry/src/main/ets/core/render.ts';
 
 /** 一张卡片的矩形（pt，画布坐标系）。 */
 interface Card { x: number; y: number; w: number; h: number; id: string }
@@ -78,7 +87,15 @@ function readCards(svg: string): Card[] {
 // ── 几何 ────────────────────────────────────────────────────────────────────
 
 const EPS = 0.05;                      // pt：小于它的越界算贴边
-const EPS_AREA = HANG_OVERLAP_EPS;     // pt²：**与布局判据同一个常量**，见 render.ts 的注释
+/**
+ * 两张卡片算「重叠」的最小交集面积（pt²）。**本文件自己的常量**，不从 render.ts 借。
+ *
+ * task-18 之前这里 import 的是 `render.HANG_OVERLAP_EPS`（"判据与度量用同一个数"）。
+ * 那个常量随卡片几何一起删掉了 —— 而且本文件的存在意义就是**不复用布局代码**
+ * （见文件头），所以自己定一个数是更诚实的做法：1pt² 约是一张 26×34 卡片的 0.11%，
+ * 在 2 倍图上不到 1px，肉眼不可见；用 0 容忍会把浮点取整噪声当成缺陷。
+ */
+const EPS_AREA = 1;
 
 function overlapArea(a: Card, b: Card): number {
   const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
@@ -207,9 +224,11 @@ function main(): number {
   const blockMatch = /地图块 0→([\d.]+)pt/.exec(svg);
   const blockH = blockMatch === null ? canvas.h : parseFloat(blockMatch[1]);
   const mapHShown = mapH;
-  // 挂载区底：从图例里读（预览写的是 "挂载区 a→b pt"）
+  // 地图框底（= "框外面的那两条带"的起点）。task-18 之后**没有"挂载区"**了
+  //（照片不再占纵向空间），所以这里直接把框底当成分区边界；图例里如果还写着"挂载区"
+  //（旧预览），就用它给的值 —— 旧图仍然能被本工具度量。
   const hangMatch = /挂载区 [\d.]+→([\d.]+)pt/.exec(svg);
-  const hangBottom = hangMatch === null ? canvas.h : parseFloat(hangMatch[1]);
+  const hangBottom = hangMatch === null ? mapY + mapH : parseFloat(hangMatch[1]);
 
   // 出画布
   const outside: Card[] = [];
@@ -241,8 +260,13 @@ function main(): number {
   let cardInHang = 0;
   for (const c of cards) { cardInHang += bandOverlap(c, frameBottom, hangBottom, canvas.w); }
 
-  // 钉点与 +N 角标（用于报告"收成点"的数量）
-  const dots = svg.split('<circle ').length - 1;
+  // 圆点三类分开数（task-18 的形态）：**标记**是内容（`r="1.9" fill="#D9553F"`），
+  // **钉点**是锚（`r="3.4" fill="#C0392B"`），**钉点的外圈**是 halo（`fill="none"`）。
+  // 旧版这里是 `svg.split('<circle ').length - 1) / 2`（"halo 与钉点成对"），
+  // 新形态多了标记那一类，那个除法会把它们混进去（实测会报出 17.5 这种小数）。
+  const markerDots = (svg.match(/<circle [^>]*r="1.9" fill="#D9553F"/g) || []).length;
+  const pinDots = (svg.match(/<circle [^>]*fill="#C0392B"/g) || []).length;
+  const halos = (svg.match(/<circle [^>]*fill="none"/g) || []).length;
   const plusN = (svg.match(/>\+\d+</g) || []).length;
   const lines = svg.split('<line ').length - 1;
   // 轨迹折线：预览把它画在 <g id="trajectory"> 里的一条 path
@@ -287,7 +311,9 @@ function main(): number {
     overlapArea: r2(overlaps),
     overlapDetail: pairs.slice(0, 20).map((q) => `${q.a.id}×${q.b.id} ${r2(q.area)}pt²`),
     lines,
-    dots: dots / 2,
+    markerDots,
+    pinDots,
+    halos,
     plusN,
     cardArea: r2(cardArea),
     cardAreaPct: pct(cardArea, boardArea),
@@ -308,9 +334,9 @@ function main(): number {
 
   console.log(`文件：${out.file}（画布 ${out.canvas.w}×${out.canvas.h}pt → ${out.canvas.px}px）`);
   console.log(`分区：地图块 0→${out.partition.blockH}pt（地图是整块主体区的底色）`
-    + ` ｜ 地图框 ${out.partition.mapW}×${out.partition.mapH}pt@(${out.partition.mapX},${out.partition.mapY})（${out.partition.mapPct}%）`
-    + ` ｜ 挂载区 ${out.partition.hangTop}→${out.partition.hangBottom}pt（${out.partition.hangH}pt，${out.partition.hangPct}%）`);
-  console.log(`照片卡片 ${out.cards} 张 ｜ 挂线 ${out.lines} 条 ｜ 轨迹 ${out.trackPoints} 点 ｜ 钉点 ${out.dots} 个 ｜ +N 角标 ${out.plusN} 个`);
+    + ` ｜ 地图框 ${out.partition.mapW}×${out.partition.mapH}pt@(${out.partition.mapX},${out.partition.mapY})（${out.partition.mapPct}% = **地图填满度**）`
+    + ` ｜ 框底→块底 ${out.partition.hangTop}→${out.partition.hangBottom}pt（${out.partition.hangH}pt，${out.partition.hangPct}%）`);
+  console.log(`照片卡片 ${out.cards} 张 ｜ 挂线 ${out.lines} 条 ｜ 轨迹 ${out.trackPoints} 点 ｜ 标记 ${out.markerDots} 个 ｜ 钉点 ${out.pinDots} 个（halo ${out.halos}）｜ +N 角标 ${out.plusN} 个`);
   if (out.cardSpanY !== null && out.cardSpanX !== null) {
     console.log(`  卡片横向跨度 x ∈ [${out.cardSpanX[0]}, ${out.cardSpanX[1]}] ｜ 纵向跨度 y ∈ [${out.cardSpanY[0]}, ${out.cardSpanY[1]}]`);
   }
