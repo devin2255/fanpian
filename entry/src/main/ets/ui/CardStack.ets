@@ -59,12 +59,14 @@
 //   经 `@Prop` 传到本文件反而会多出一个持有者（唯一的持有者变成两个），
 //   那正好把"换卡即放手"这条唯一的释放路径弄坏。
 //   ⚠️ 与动图的一条**关键差别**：动态照片的对象是**异步**来的（探针：`requestMovingPhoto`
-//   回调），所以本文件多四个字段做"结果还算不算数"的判定：
-//   `motionSeq`（递增序号凭据）、`motionForId`（**已下结论**）、
-//   `motionInFlightId`（**有在途探测**）、`motionTries`（本次访问的重试次数）。
-//   后三个字段分开是**缺陷 D4 的修法**：旧实现把它们合成一个 `motionForId`，
+//   回调），所以"结果还算不算数"要有一整套判定：
+//   `motionSeq`（递增序号凭据，留在本文件）、以及**状态机**的三个字段
+//   「已下结论 / 有在途探测 / 本次访问的重试次数」。
+//   后三个字段分开是**缺陷 D4 的修法**：旧实现把它们合成**一个**字段，
 //   于是"这次没探到"与"确定不是动态照片"同形 → 瞬时失败被当成永久结论。
-//   而这一部分在 animSource 里是靠"解帧比换卡慢"这个事实自然覆盖的（那里也有 seq）。
+//   它们连同四道闸与三条过期判据一起住在 `core/motionProbeState.ts`（纯逻辑，有 Node 单测）——
+//   那是本批唯一的可测边界：平台那一半（本文件）依赖真机 UI 上下文，永远只能真机验。
+//   而"结果还算不算数"这一部分在 animSource 里是靠"解帧比换卡慢"这个事实自然覆盖的（那里也有 seq）。
 //   另：本文件**没有**给动态数据做"页面级"的预取或缓存 —— 缓存所有权会立刻破坏上面那条唯一性。
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -75,6 +77,15 @@ import { AnimFrames, loadAnimFrames } from '../data/animSource';
 import { MotionHandle, MotionProbeResult, loadMotion } from '../data/movingPhotoSource';
 import { clampScale, isZoomed, resolveContentSize, clampOffset, SCALE_MIN, ZoomSize, PanOffset } from '../core/zoom';
 import { MotionStartGate, shouldStartMotionPlayback, MOTION_LONG_PRESS_MS } from '../core/movingPhoto';
+// 动态照片「重试状态机」的**纯逻辑**（缺陷 D4）：闸门 / 迁移 / 过期判据全部在那边，
+// 有 Node 单测（core/motionProbeState.test.ts）。本文件只留"平台那一半"：
+// `motionSeq`（序号凭据）、`motionOwner`（句柄唯一持有者）、日志、播放器。
+import {
+  MOTION_PROBE_MAX_ATTEMPTS, MotionProbeArm, MotionProbeBegin, MotionProbeSettle,
+  MotionProbeState, MotionProbeTicket, MotionProbeVerdict,
+  armMotionProbe, beginMotionProbe, motionAttempts, newMotionProbeState,
+  releaseMotionProbe, settleMotionProbe
+} from '../core/motionProbeState';
 
 // 与 pages/SwipePage.ets 同款口径（DOMAIN / TAG 在本项目里是全局一致的）。
 const DOMAIN = 0x0000;
@@ -106,32 +117,22 @@ const MOTION_PRESS_BORDER = 2;
 /**
  * **一张卡在一次「访问」里最多发起几次动态照片探测**（缺陷 D4 的重试上界）。
  *
- * ── 为什么需要上界 ──────────────────────────────────────────────────────────
- *   D4 的修法是"瞬时失败不写结论、留一个重试触发点"。但触发点挂在**用户交互**上
- *   （`PanGesture.onActionStart` 与长按），不设上界就变成"用户每拖一次就发一次 IPC"：
- *   一次探测的代价不是本地计算 —— 它是一次 `getAssets` 查库，失败时还要挂住
- *   `requestMovingPhoto` 的回调直到 `MOTION_REQUEST_TIMEOUT_MS`（5000ms）超时。
- *
- * ── 3 这个数是怎么来的 ─────────────────────────────────────────────────────
- *   · 第 1 次：进这张卡时自动发起（`aboutToAppear` / `onItemChanged`），用户什么都不用做；
- *   · 第 2、3 次：用户**明确地又碰了这张卡两次**（拖动 ≥5vp，或长按 500ms）。
- *     这正是那两类瞬时成因的自然恢复时间：IPC 抖动下一次交互就好，
- *     授权生效往往要等用户切回来/再点一次；
- *   · 上界 3 之后仍是"没探到"，大概率是**稳定失败**（这张确实取不到对象），
- *     再试只是把一次查库 + 最长 5s 的等待摊到每一次滑动上；
- *   · **同一张卡的并发也有上界**：配合"在途标记"（`motionInFlightId`），**这张卡**任意时刻
- *     最多 1 条在途 —— 所以最坏情况是这张卡这次访问最多串行烧掉 3 × 5s 的后台等待，
- *     而不是一口气并发打出 3 条请求。
- *     ⚠️ 精确一点（别把它读成全局上界）：**跨卡换页**时旧卡那条探测可能还在跑
- *     （`requestMovingPhoto` 最长挂到超时），而新卡会各自发起自己的第 1 次。
- *     这个并发度由"用户 5s 内翻了几张卡"决定，是**旧实现就有的**行为，
- *     本批**没有改变**它（重试上界只作用在"同一张卡"这条轴上）。
- *
- * ── 为什么不是"整会话只试一次" ──────────────────────────────────────────────
- *   换走再滑回来 = 一次**新的访问**，预算重置（见 `resetMotion`）。这是有意的：
- *   重新访问是一次全新的环境（用户可见的动作），而"同一张卡上无限重试"才是要挡的东西。
+ * 常量本身与它的**全部论证**（为什么必须有上界、3 这个数是怎么来的、
+ * 为什么不是"整会话只试一次"、为什么并发上界只作用在"同一张卡"这条轴上）
+ * 都搬进了 `core/motionProbeState.ts`：那里是能被单测穷举的一侧，
+ * 本文件只把它传给 `beginMotionProbe`。**常量只留一处定义** —— 抄成两份一定会漂。
  */
-const MOTION_PROBE_MAX_ATTEMPTS = 3;
+
+/**
+ * 「这次没探到」的判决（瞬时失败）。
+ *
+ * `loadMotion` **意外** rejection 时用的就是它 —— 与 data 层那三种瞬时成因
+ *（查库 0 条 / 请求超时 / 回传空）走的是**同一条迁移**（纯模块的 `missed` 分支：
+ * 不写结论、只解除在途标记）。提成常量而不是在 `.catch` 里现拼一个字面量，理由很具体：
+ * 拼错的两种方向各自都是 D4 的死法 —— 写成结论 = 这张卡再也不重试；
+ * 忘了解除在途 = 这张卡被"同卡不并发"那道闸永久挡住。
+ */
+const MISSED_VERDICT: MotionProbeVerdict = { concluded: false, hasHandle: false };
 
 // 队列里的一张照片。定义在这里并导出：CardStack 自己要用它，
 // SwipePage 也从这里 import（不要各自定义一份）。
@@ -308,28 +309,24 @@ export struct CardStack {
   @State motionOn: boolean = false;
   // 动态照片对象的**唯一持有者**（与 animOwner 同一角色）。释放出口见 releaseMotion()。
   private motionOwner: MotionHandle | undefined = undefined;
-  // ── 「已下结论」与「没探到」在**状态上**分成两个字段（缺陷 D4 的修法）──────────
-  // 旧实现把两件事塞进一个 `motionForId`：「正在取」与「已经有结论（含'不是动态照片'）」。
-  // 于是**瞬时**失败（requestMovingPhoto 超时 / 查库命中 0 条 / 取不到宿主 Context）
+  // ── 动态照片「重试状态机」的全部状态（缺陷 D4 的修法）────────────────────────
+  // 旧实现把「正在取」与「已经有结论（含'不是动态照片'）」塞进**一个** `motionForId`
+  // 字段，于是**瞬时**失败（requestMovingPhoto 超时 / 查库命中 0 条 / 取不到宿主 Context）
   // 也被写成了"这张已经探过"，而重新触发的唯一执行者是 `@Watch onItemChanged`，
   // 它第一件事就是按 photoId 去重 → **同一张卡在本会话内再也没有机会**：
   // 角标不亮、长按无反应，用户没有任何恢复动作（静默降级）。
   //
-  // `motionForId`：**只写结论**（正：句柄到手；负：data 层给出 `concluded === true`）。
-  //               `motionForId === 当前 id` ⟺ "这张已经探明白了，不用再探"。
-  private motionForId: string = '';
-  // `motionInFlightId`：**只写"在途"**（探测已发出、结果还没回来）。
-  //   它与上面那个字段**刻意分开**，带来两条性质：
-  //     ① 瞬时失败后 `motionForId` 仍是''（不是这张），而 `motionInFlightId` 被清空
-  //        → 下一次每卡时刻的触发**能**重新发起一次探测（这正是 D4 要的凭据）；
-  //     ② 任意时刻最多 1 条在途（同 id 不并发重发），所以重试不会把 IPC 乘起来。
-  private motionInFlightId: string = '';
-  // 「这张卡在这次访问里已经发起过几次探测」——重试的上界，见 MOTION_PROBE_MAX_ATTEMPTS。
-  // 重置点**只有** resetMotion()（换卡 / 卸载 = 一次新的访问）。
-  // ⚠️ 刻意**不**在 releaseMotion() 里重置：`ensureMotionForCurrent` 每次尝试都会先调它
-  //    （"作废在途结果 + 放手旧句柄"），放在那里等于每次尝试都把上界清零。
-  private motionTries: number = 0;
+  // 现在那三个字段（结论 / 在途 / 尝试次数）连同**四道闸与三条过期判据**一起搬进了
+  // `core/motionProbeState.ts`：纯数据 + 纯函数、零 `@kit.*`、零平台对象，
+  // 于是"瞬时失败之后还能不能重试""重试有没有上界""过期结果会不会写脏新状态"
+  // 从"只能真机手滑"变成 Node 单测里可以穷举的东西（core/motionProbeState.test.ts）。
+  // 本文件保留的只有**平台那一半**：`motionSeq`（序号凭据）、`motionOwner`（句柄唯一持有者）、
+  // 日志与播放器 —— 句柄的所有权与释放路径**一个字都没动**。
+  private motionState: MotionProbeState = newMotionProbeState();
   // 取对象是异步的，换卡比它快时旧结果必须被丢弃 —— 与 animSeq 同款的递增序号凭据。
+  // ⚠️ 它**刻意留在本文件**（不进 core）：递增时机与"放手句柄"是同一件事的两面
+  //    （`releaseMotion` 会 +1），拆开就会让"换卡即作废"这条路径出现两个执行者。
+  //    纯模块把它当作**调用方注入**的不透明数字（`MotionProbeTicket.seq`），不生成也不递增。
   private motionSeq: number = 0;
   // 播放控制器：**每次起播都新建一个**（探针就是这么做的：每个 trial 全新的
   // MovingPhotoViewController + 全新的组件实例）。复用一个控制器跨多次挂载/卸载会引入
@@ -575,11 +572,14 @@ export struct CardStack {
    * 这里只负责"触发一次"与"结果回来时还算不算数"。
    *
    * ── 去重拆成**三条**互不相同的判据（缺陷 D4 的修法）──────────────────────────
-   *   ① `motionForId === id` —— **已经下过结论**（是 / 确定不是）→ 不再探。这是"结论"；
-   *   ② `motionInFlightId === id` —— **已经有一条在途** → 不并发重发。这是"在途"；
-   *   ③ `motionTries >= MOTION_PROBE_MAX_ATTEMPTS` —— 这次访问的重试预算用完了。
+   *   ① 「已下结论」（是 / 确定不是）→ 不再探。这是"结论"；
+   *   ② 「已有一条在途」→ 不并发重发。这是"在途"；
+   *   ③ 「重试预算用完了」。
    *   旧实现只有 ① 一个字段，把"在途"与"结论"合在一起，于是**瞬时失败**也落进 ①
    *   → 这张卡再也没有第二次机会。
+   *   ⚠️ 三条闸**不再写在这里**：它们连同"这次尝试记不记账"一起搬进了
+   *   `core/motionProbeState.ts::beginMotionProbe`（有单测，能穷举上界 0/1/3 的边界）。
+   *   本函数只做平台那一半：取宿主 Context → 发 IPC → 把结果交给纯模块结算。
    *
    * ── 触发点（四个，全部是"每卡已有的时刻"，没有新增计时器）───────────────────
    *   · `aboutToAppear`（进这张卡）与 `onItemChanged`（换到这张卡）—— 原有的两个；
@@ -590,16 +590,13 @@ export struct CardStack {
    */
   private ensureMotionForCurrent(): void {
     const id: string = this.item.photoId;
-    if (id === '') { return; }
-    // ① 已经**下过结论**（含"确定不是动态照片"）→ 不再探。这是"结论"与"没探到"的分界。
-    if (this.motionForId === id) { return; }
-    // ② 已有一条在途 → 不并发重发（保证任意时刻最多 1 条在途 IPC，重试不会乘起来）。
-    if (this.motionInFlightId === id) { return; }
-    // ③ 重试上界（见 MOTION_PROBE_MAX_ATTEMPTS 的说明）。
-    if (this.motionTries >= MOTION_PROBE_MAX_ATTEMPTS) { return; }
-    // 本次尝试开始。**同步失败也算一次**：上界的作用是"这张卡不会被无限重试"，
-    // 而不是"只数发出去的 IPC" —— 少一个计数器就少一处可以写错的地方。
-    this.motionTries = this.motionTries + 1;
+    // 三道闸 + 空 id。**被拒时也要接住 state**：纯函数的契约是"被拒则状态一字不动"，
+    // 接住它让"闸门拒绝 ≠ 状态被改"这件事在代码上无需推理（赋值是幂等的）。
+    const b: MotionProbeBegin = beginMotionProbe(this.motionState, id, MOTION_PROBE_MAX_ATTEMPTS);
+    this.motionState = b.state;
+    if (!b.allowed) { return; }
+    // 本次尝试已经记账（**同步失败也算一次**，见 beginMotionProbe 的说明）：
+    // `motionState.tries` 此刻就是这次的序号，下面两行日志直接读它。
     // Context 在**调用时**取，而不是构造时存一个字段：
     //   · `getContext(this)` 已 deprecated（本工程其它文件也带着这个告警），
     //     而 `this.getUIContext()` 是本工程已经在用的写法（见 SwipePage 的 toastReading）；
@@ -619,24 +616,31 @@ export struct CardStack {
     if (host === undefined) {
       // 结构上不该发生（本组件必然挂在某个 UIAbility 的页面上）。留着它的意义是：
       // 真机上"全都没有角标"这件事会有一行明确的告警可查。
-      // **不写 motionForId** → 这是一次"没探到"，不是"确定不是动态照片"；
+      // **不写结论** → 这是一次"没探到"，不是"确定不是动态照片"；
       // 下一次与这张卡的交互（拖动 / 长按）会再补一次（上限见 MOTION_PROBE_MAX_ATTEMPTS）。
       hilog.warn(DOMAIN, TAG, '%{public}s',
-        `取不到宿主 Context，跳过动态照片探测（第 ${this.motionTries}/${MOTION_PROBE_MAX_ATTEMPTS} 次，未定论）: ${id}`);
+        `取不到宿主 Context，跳过动态照片探测（第 ${motionAttempts(this.motionState)}/${MOTION_PROBE_MAX_ATTEMPTS} 次，未定论）: ${id}`);
       return;
     }
     this.releaseMotion();
-    this.motionInFlightId = id;
     this.motionSeq = this.motionSeq + 1;
     const seq: number = this.motionSeq;
+    // 「这次探测真的发出去了」：置在途标记 + 拿到凭据。它**必须**晚于 releaseMotion()
+    //（那一步刚把旧结论/旧在途清掉），也**必须**在取到 host 之后 —— 取不到 host 时置在途
+    // 会让这张卡被"同卡不并发"那道闸永久挡住，而结论又没写，那是 D4 的另一种死法。
+    const armed: MotionProbeArm = armMotionProbe(this.motionState, id, seq);
+    this.motionState = armed.state;
+    const ticket: MotionProbeTicket = armed.ticket;
     loadMotion(host, id)
-      .then((r: MotionProbeResult): void => { this.onMotionLoaded(id, seq, r); })
+      .then((r: MotionProbeResult): void => { this.onMotionLoaded(ticket, r); })
       .catch((): void => {
         // loadMotion 内部已吞掉全部异常（任何失败都返回一个 result）——
         // 这里只是不让一个意外的 rejection 变成未处理异常。
         // ⚠️ 真出到这一支也必须**解除在途标记**（且只解除自己那一条）：
         // 否则这张卡会被闸② 永久挡住，而闸① 又没写结论 —— 那就成了 D4 的另一种死法。
-        if (this.motionSeq === seq && this.motionInFlightId === id) { this.motionInFlightId = ''; }
+        // 它走的是**与"瞬时失败"同一条迁移**（`missed`：不写结论、只解在途），
+        // 所以这两条路径不可能各写一遍、各漂一次。
+        this.motionState = this.settleMotion(ticket, MISSED_VERDICT).state;
       });
   }
 
@@ -644,15 +648,25 @@ export struct CardStack {
    * 取对象的异步结果回来。**第一件事是判定它还算不算数** —— 用户完全可能在这几百毫秒里
    * 已经翻走（这正是"不阻塞刷卡"的必然代价）。不算数的那一份必须**当场放手**。
    *
-   * `motionSeq` 的作废机制**原样保留**（只是把第三个条件从业已两用的 `motionForId`
-   * 换成专职表示在途的 `motionInFlightId`）：
-   *   · `seq !== motionSeq` —— 期间又发起了一次探测 / 换过卡（releaseMotion 会 +1）；
-   *   · `motionInFlightId !== id` —— 这条结果对应的那次探测已经不是"当前在途"的那次；
+   * 判定与迁移全在纯模块里（`settleMotionProbe`，有单测）。它的三条过期判据
+   * **一条都没删**（`motionSeq` 的作废机制原样保留），只是第三条读的字段从"已下结论"
+   * 换成了"在途"：
+   *   · `ticket.seq !== motionSeq` —— 期间又发起了一次探测 / 换过卡（releaseMotion 会 +1）；
+   *   · `inFlightId !== id` —— 这条结果对应的那次探测已经不是"当前在途"的那次；
    *   · `item.photoId !== id` —— 这张卡已经被换走。
    * 三条都是"独立充分"的：任一条成立就丢弃并释放。
+   * ⚠️ **第三条为什么必须是"在途"而不是"已下结论"**：本函数在"结果被接受"时会**先写结论**，
+   *    若过期判据读的是结论字段，那么**一次成功的重试**会在写完结论之后被自己判成过期
+   *    → 到手的句柄被当场释放、角标永远不亮。纯模块的注释里有同一条论证。
    */
-  private onMotionLoaded(id: string, seq: number, r: MotionProbeResult): void {
-    if (seq !== this.motionSeq || this.motionInFlightId !== id || this.item.photoId !== id) {
+  private onMotionLoaded(ticket: MotionProbeTicket, r: MotionProbeResult): void {
+    const id: string = ticket.id;
+    const st: MotionProbeSettle = this.settleMotion(ticket, {
+      concluded: r.concluded,
+      hasHandle: r.handle !== undefined
+    });
+    if (st.outcome === 'stale') {
+      // 过期的那一份**必须当场放手**（这是 releaseMotion 之外的第三条释放出口）。
       const stale: MotionHandle | undefined = r.handle;
       if (stale !== undefined) {
         hilog.info(DOMAIN, TAG, '%{public}s',
@@ -660,27 +674,23 @@ export struct CardStack {
       }
       return;
     }
-    // 本次探测到此结束（成败都算）：解除"在途"标记，此后只看 motionForId 说话。
-    this.motionInFlightId = '';
     const h: MotionHandle | undefined = r.handle;
     if (h === undefined) {
-      if (r.concluded) {
+      if (st.outcome === 'negative') {
         // ── **已下结论**：data 层确定这张不是动态照片（`confirmedNoMotion` 已写）。
-        // 只有这一支写 motionForId —— 此后这张卡不再探测（这是真正省下查库的那一支）。
-        this.motionForId = id;
+        // 结论已经由纯模块写上 —— 此后这张卡不再探测（真正省下查库的那一支）。
         return;
       }
       // ── **没探到**（查库 0 条 / 请求超时 / 回传空 / IPC 抖动 —— 全是瞬时的）：
-      // **不写 motionForId**，于是下一次与这张卡的交互会再补一次探测（上界见常量说明）。
+      // **不写结论**（纯模块的 `missed` 分支），于是下一次与这张卡的交互会再补一次探测。
       // `motionReady` 保持 false：角标不亮、长按无所作为 —— 与"不是动态照片"观感一致，
       // 区别是**它还会自己好起来**（旧实现不会，且没有任何恢复动作）。
       hilog.info(DOMAIN, TAG, '%{public}s',
-        `动态照片未探到（第 ${this.motionTries}/${MOTION_PROBE_MAX_ATTEMPTS} 次，**不是结论**）→ 不写结论，下次交互这张卡会重试: ${id}`);
+        `动态照片未探到（第 ${motionAttempts(this.motionState)}/${MOTION_PROBE_MAX_ATTEMPTS} 次，**不是结论**）→ 不写结论，下次交互这张卡会重试: ${id}`);
       return;
     }
-    // ── 正结论：句柄到手 ────────────────────────────────────────────────────
-    this.motionForId = id;
-    // 同一张卡理论上不会再有一个 owner（闸①②去重），但换卡路径可能留下旧的：
+    // ── 正结论：句柄到手（结论已由纯模块写上）────────────────────────────────
+    // 同一张卡理论上不会再有一个 owner（三道闸去重），但换卡路径可能留下旧的：
     // 释放掉再装，保证"最多只有一个 MotionHandle 活着"这条不变量。
     if (this.motionOwner !== undefined) {
       hilog.info(DOMAIN, TAG, '%{public}s',
@@ -691,7 +701,23 @@ export struct CardStack {
     this.motionReady = true;
     // 真机核验"角标什么时候亮"的唯一直接证据：这行日志必须早于这张卡的第一次长按。
     hilog.info(DOMAIN, TAG, '%{public}s',
-      `动态照片角标点亮: ${id}（第 ${this.motionTries}/${MOTION_PROBE_MAX_ATTEMPTS} 次探测拿到）`);
+      `动态照片角标点亮: ${id}（第 ${motionAttempts(this.motionState)}/${MOTION_PROBE_MAX_ATTEMPTS} 次探测拿到）`);
+  }
+
+  /**
+   * 把一条结果交给纯模块结算，并把新状态**接住**。
+   *
+   * 存在的理由有两个，都不是"少写一行"：
+   *   · `.then` 与 `.catch` 两条路径**必须**走同一段迁移（否则 `.catch` 那一支很容易
+   *     在某次修改里被漏掉，而它的漏法正是"这张卡被永久挡住"）；
+   *   · `outcome === 'stale'` 时纯模块返回的状态与入参**逐字段相同**，赋值是幂等的 ——
+   *     于是"过期结果不得影响新状态"这条契约在调用点上**不需要**再写一次 if。
+   */
+  private settleMotion(ticket: MotionProbeTicket, v: MotionProbeVerdict): MotionProbeSettle {
+    const st: MotionProbeSettle = settleMotionProbe(
+      this.motionState, ticket, this.item.photoId, this.motionSeq, v);
+    this.motionState = st.state;
+    return st;
   }
 
   /**
@@ -709,10 +735,10 @@ export struct CardStack {
   private releaseMotion(): void {
     // 先让在途的取对象结果作废（它回来时会自己放手自己那一份），再放手当前这份。
     this.motionSeq = this.motionSeq + 1;
-    this.motionForId = '';
-    // 在途标记同样作废 —— 它与"结论"是两个字段（D4），必须一起清，
-    // 否则下一次探测会被闸② 挡在门外（"在途"永远为真）。
-    this.motionInFlightId = '';
+    // 在途标记与"已下结论"**必须一起清**（D4：它们是两个字段，只清一个就会挡住下一次探测）：
+    // 只清结论 → 闸②（"在途"永远为真）把下一次挡在门外；只清在途 → 闸① 说"这张探过了"。
+    // 这一步**刻意不动重试预算**（`tries`），理由见下。
+    this.motionState = releaseMotionProbe(this.motionState);
     if (this.motionOwner !== undefined) {
       const ok: boolean = this.motionOwner.release();
       this.motionOwner = undefined;
@@ -721,8 +747,9 @@ export struct CardStack {
       hilog.info(DOMAIN, TAG, '%{public}s', `换卡放手动态照片句柄: 真正放手=${ok}`);
     }
     this.motionReady = false;
-    // ⚠️ 刻意**不**在这里重置 `motionTries`：`ensureMotionForCurrent` 每次尝试都会先调本函数
+    // ⚠️ 刻意**不**在这里重置重试预算：`ensureMotionForCurrent` 每次尝试都会先调本函数
     //    （那是"作废在途结果 + 放手旧句柄"），在这里重置等于每次尝试都把重试上界清零。
+    //    纯模块的 `releaseMotionProbe` 把这条约定写进了函数契约（并有单测钉住）。
   }
 
   /**
@@ -732,11 +759,12 @@ export struct CardStack {
    *
    * 它同时是**一次「访问」的边界**（D4）：重试预算在这里重置。
    * 换走再滑回来是一次全新的环境（用户可见的动作），与"同一张卡上无限重试"不是一回事。
+   * `newMotionProbeState()` 是**唯一**会把 `tries` 归零的地方（纯模块里有单测钉住这一点）。
    */
   private resetMotion(): void {
     this.stopMotionPlayback();
     this.releaseMotion();
-    this.motionTries = 0;
+    this.motionState = newMotionProbeState();
   }
 
   /**
@@ -767,7 +795,7 @@ export struct CardStack {
    */
   private onMotionPress(e: GestureEvent): void {
     // ── D4：长按一张**角标没亮**的卡 = "用户以为它是动态照片，但什么都没发生" ──────
-    // 旧实现在这里什么都不做（motionForId 早被写成这张 → 再也不探），用户没有任何恢复动作。
+    // 旧实现在这里什么都不做（"已下结论"那个字段早被写成这张 → 再也不探），用户没有任何恢复动作。
     // 现在补一次探测：本次长按**来不及**（探测是异步的，长按已经识别完了），
     // 修的是**下一次** —— 用户再按一次就好了。这是工单要的"用户自己的重试入口"。
     // 它自带三条闸（已下结论 / 已有在途 / 预算用尽），所以不会变成"每按一次发一次 IPC"；
@@ -1479,7 +1507,7 @@ export struct CardStack {
           //
           // ⑦ **角标没亮时的长按 = 用户自己的重试动作**（缺陷 D4 新增的唯一行为）。
           //    旧实现里这一按什么都不发生，而且**再按多少次都不会变**：探测失败（超时 /
-          //    查库 0 条）被写进了那个两用的 `motionForId`，重新触发的唯一执行者
+          //    查库 0 条）被写进了那个两用的"已下结论"字段，重新触发的唯一执行者
           //    `@Watch onItemChanged` 又按 photoId 去重 —— 用户没有任何恢复手段。
           //    现在 `onMotionPress` 在 `!motionReady` 时补一次探测：本次长按来不及
           //    （探测是异步的），**再按一次就好了**。上界见 MOTION_PROBE_MAX_ATTEMPTS，
