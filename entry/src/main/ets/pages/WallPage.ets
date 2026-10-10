@@ -61,8 +61,8 @@ import { parseAreaData } from '../core/areaData';
 import {
   HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, TRACK_COLOR, TRACK_WIDTH, VIEW_PAD_RATIO,
   badgeRect, buildScene, dateLabel, fitBounds, fitViewToCanvas, geoAspect, hangBottom, hangOffsets, hangRects,
-  mapFrame, MIN_ZOOMED_VIEW_SPAN_DEG, outlinePath, panViewBy, parseOutline,
-  PROVINCE_STROKE, PROVINCE_WIDTH, trajectoryPath, viewZoomOf, zoomViewAt
+  mapFrame, outlinePath, panViewBy, parseOutline,
+  PROVINCE_STROKE, PROVINCE_WIDTH, trajectoryPath, viewZoomOf, viewZoomRange, zoomViewAt
 } from '../core/render';
 import type { CardRect, HangOffset, MapFrame, OutlineData, ScenePin, WallPhoto } from '../core/render';
 // MAX_HANG 只在 core/placement.ts 里定义（设计 §6.2 的阈值那儿一份），render.ts 不转手导出。
@@ -426,14 +426,20 @@ struct WallPage {
     //     —— 手势进行中诊断行会实时变，抬手后回到 `k=1 T=(0,0)`。
     const diagBounds: string = `数据[${r2(dataBounds[0])},${r2(dataBounds[1])},${r2(dataBounds[2])},${r2(dataBounds[3])}]`
       + `→铺满[${r2(bounds[0])},${r2(bounds[1])},${r2(bounds[2])},${r2(bounds[3])}]`;
-    // 缩放界限换算成"放大倍数"口径：最小 1×（= 全国跨度）、最大 = 62/0.6 ≈ 103×（= 单城市级）
-    const zoomMax: number = (CHINA_REGION.bounds[2] - CHINA_REGION.bounds[0]) / MIN_ZOOMED_VIEW_SPAN_DEG;
+    // 缩放界限换算成"放大倍数"口径：最小 1×（= 视野框恒等于全国框）、最大 62/0.6 ≈ 103×。
+    // task-17：**两个数都从 core 的 `viewZoomRange()` 读**，不再手写 `'1×'`。
+    // 手写的那个 1× 曾经只是显示：经度跨度确实被夹在 62°，而同一个框的纬度能膨胀到 −20.6°
+    // （用户看到的就是这个）。现在约束端（`containInChina`）与显示端读同一份定义，
+    // `render.test.ts` 里有一条单测直接断言"显示的下界 == 反复缩小实际到达的下界"。
+    const zoomRange: number[] = viewZoomRange();
+    const zoomMin: number = zoomRange[0];
+    const zoomMax: number = zoomRange[1];
     this.diag = `box ${r2(this.boxW)}×${r2(this.boxH)} ｜ 图框 ${this.mapW}×${this.mapH}@(${this.mapX},${this.mapY})`
       + ` ｜ 视野 ${diagBounds}${vb !== undefined ? '(数据)' : '(全国)'}`
       + ` ｜ 放大 ${r2(viewZoomOf(dataBounds))}×→${r2(viewZoomOf(bounds))}×`
       + ` ｜ pins ${pins.length} ｜ cards ${cards.length}`
       + ` ｜ 国界 ${chinaPath.length} 省界 ${provincePath.length} ｜ track ${this.trackPath.length}`
-      + ` ｜ 视野态 ${this.viewIsDefault ? '默认铺满' : '已改'}（可缩 1×~${r2(zoomMax)}×）`
+      + ` ｜ 视野态 ${this.viewIsDefault ? '默认铺满' : '已改'}（可缩 ${r2(zoomMin)}×~${r2(zoomMax)}×）`
       + ` ｜ 手势 k=${r2(this.gScale)} T=(${r2(this.gTx)},${r2(this.gTy)})`
       + ` ｜ 上墙 ${this.walledTotal} 命中 ${located} 实挂 ${shownTotal}`;
     hilog.info(DOMAIN, TAG, '%{public}s',

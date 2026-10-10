@@ -20,7 +20,7 @@ import {
   arcSpread, arcSpreadNeed, buildScene, clampRect, dateLabel, fitBounds, fitViewToCanvas, frameBounds,
   geoAspect, hangBottom, hangOffsets, hangRects, mapBoxHeight, mapFrame, normalizeBounds, outlinePath,
   panViewBy, parseOutline, pinTime, rectOverlapArea, sceneToSvg, trajectoryOrder, trajectoryPath,
-  viewZoomOf, zoomViewAt
+  viewZoomOf, viewZoomRange, zoomViewAt
 } from './render.ts';
 import type { CardRect, MapFrame, ScenePin, WallPhoto } from './render.ts';
 
@@ -517,6 +517,13 @@ test('国界与照片用**同一个** bounds：同一经纬度在国界 path 与
 const DEV_BOX_W = 376;
 const DEV_BOX_H = 663.71;
 const DEV_VIEW: number[] = [115.66, 29.88, 122.19, 41.24];
+/**
+ * 真机**图 2**（缩到底那一张）的诊断行 canvas：`376×642.57`。
+ * 与 `DEV_BOX_H = 663.71`（图 1 / task-16 那一档）**不是同一个数** —— 两张截图不是同一次布局，
+ * 谁也不许把其中一个"顺手统一"成另一个：这两个数字各自对应一条真的诊断行，
+ * task-17 的"缩到底"那一节必须用**图 2 的**这个，否则复现的不是用户看到的那一帧。
+ */
+const DEV_H_ROW2 = 642.57;
 
 test('fitViewToCanvas：设备真值那一档 —— 撑开后**框的比例 == 画布的比例**', () => {
   const ex = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_BOX_H);
@@ -606,6 +613,10 @@ test('fitViewToCanvas：数据在撑开后**仍然全部可见**（框只会变�
     [DEV_BOX_W, DEV_BOX_H], [360, 720], [720, 360], [360, 360], [100, 2000], [2000, 100], [1080, 1920]
   ];
   let checked = 0;
+  const cb0: number = CHINA_REGION.bounds[0];
+  const cb1: number = CHINA_REGION.bounds[1];
+  const cb2: number = CHINA_REGION.bounds[2];
+  const cb3: number = CHINA_REGION.bounds[3];
   for (const b of boxes) {
     for (const c of canvases) {
       const ex = fitViewToCanvas(b, c[0], c[1]);
@@ -622,14 +633,25 @@ test('fitViewToCanvas：数据在撑开后**仍然全部可见**（框只会变�
       // ③ 投影得出来（不产 NaN）
       const f: MapFrame = mapFrame(c[0], c[1], ex);
       assert.ok(!outlinePath([[ex[0], ex[1], ex[2], ex[1], ex[2], ex[3]]], f).includes('NaN'));
-      // ④ 比例匹配（除非撞到 ±84°/360° 的兜底钳制 —— 那种极端画布在下面单独测）
+      // ④ 比例匹配 —— **除非**某一边顶到了边界（顶到 = 那一边真的被收住了）。
+      //    两种顶法：±84°/360° 的墨卡托安全带（对 ⊆ 中国的输入已不可达，见下面那条测试），
+      //    或 task-17 新加的"框 ⊆ 中国"（跨度不小于中国跨度就取整段 → 必然正好贴住中国边界）。
+      //    判别力：**框严格落在中国之内（四边都不贴边）时，比例必须匹配** ——
+      //    悄悄收缩跨度却不贴边，就是算错了，这条抓得住。
       const unlimited = geoAspect(ex) > 1e-6;
       if (unlimited) {
         const want = c[0] / c[1];
         const hit = Math.abs(geoAspect(ex) - want) < 1e-9;
         const clamped = ex[1] <= -84 + 1e-9 || ex[3] >= 84 - 1e-9 || (ex[2] - ex[0]) >= 360 - 1e-9;
-        assert.ok(hit || clamped, `比例既没匹配也没撞钳制：${geoAspect(ex)} vs ${want}（框 ${b} 画布 ${c}）`);
+        const cb = CHINA_REGION.bounds;
+        const atChinaEdge = ex[0] <= cb[0] + 1e-9 || ex[2] >= cb[2] - 1e-9
+          || ex[1] <= cb[1] + 1e-9 || ex[3] >= cb[3] - 1e-9;
+        assert.ok(hit || clamped || atChinaEdge,
+          `比例既没匹配也没顶到边界：${geoAspect(ex)} vs ${want}（框 ${b} 画布 ${c}）`);
       }
+      // ⑤ task-17：**输出恒 ⊆ 中国范围**（这是"缩小的上界"那件事的第一不变量）
+      assert.ok(ex[0] >= cb0 - 1e-9 && ex[2] <= cb2 + 1e-9 && ex[1] >= cb1 - 1e-9 && ex[3] <= cb3 + 1e-9,
+        `撑开后跑出中国范围：${ex}（框 ${b} 画布 ${c}）`);
       checked++;
     }
   }
@@ -652,33 +674,66 @@ test('fitViewToCanvas：幂等；画布/bounds 非法时原样返回；极端画
   for (let i = 0; i < 4; i++) { assert.ok(Number.isFinite(bad[i])); }
   assert.ok(bad[2] > bad[0] && bad[3] > bad[1]);
   assert.ok(bad[0] <= CHINA_REGION.bounds[0] && bad[2] >= CHINA_REGION.bounds[2], '全国视野必须仍被框住');
-  // 极端画布：撑到 ±84° 的墨卡托安全边界就停 —— 此时**优先保证数据可见**，比例可以不对
+  // 极端画布（100×2000）：中国比画布"宽" → 会去撑纬度，但**中国范围把它收住** ——
+  // 结果是"整个中国"。task-17 之前这里撑到 ±84° 的墨卡托安全带，
+  // 而那正是真机上"中国缩成一个小角"的来源（→ 报告 §2.4）。
   const thin = fitViewToCanvas(CHINA_REGION.bounds, 100, 2000);
-  assert.ok(Math.abs(thin[1] - -84) < 1e-9 && Math.abs(thin[3] - 84) < 1e-9, `应当停在 ±84：${thin}`);
+  assert.deepEqual(thin, normalizeBounds(CHINA_REGION.bounds), `极端竖画布应当停在"整个中国"：${thin}`);
   assert.ok(thin[1] <= CHINA_REGION.bounds[1] && thin[3] >= CHINA_REGION.bounds[3], '撞钳制后数据仍须在框内');
   assert.ok(Number.isFinite(geoAspect(thin)) && geoAspect(thin) > 0);
-  // 极端扁画布：经度撑到 360° 封顶
+  // 第二道防线（±84° / 360°）确实被中国范围整个包住 —— 所以它在中国范围内**不可达**，
+  // 但保留着：万一 `CHINA_REGION.bounds` 被改到安全带之外，它仍然挡住 NaN。
+  assert.ok(CHINA_REGION.bounds[1] > -84 && CHINA_REGION.bounds[3] < 84, '中国必须在墨卡托安全带内');
+  assert.ok(CHINA_REGION.bounds[2] - CHINA_REGION.bounds[0] < 360, '中国经度跨度必须小于环球');
+  // 极端扁画布（2000×100）：经度撑到 360° 封顶那一支同样被中国范围收住
   const fat = fitViewToCanvas(CHINA_REGION.bounds, 2000, 100);
+  assert.deepEqual(fat, normalizeBounds(CHINA_REGION.bounds), `极端扁画布应当停在"整个中国"：${fat}`);
   assert.ok(fat[2] - fat[0] <= 360 + 1e-9, `经度跨度不许超过 360：${fat[2] - fat[0]}`);
   assert.ok(fat[0] <= CHINA_REGION.bounds[0] && fat[2] >= CHINA_REGION.bounds[2], '撞钳制后数据仍须在框内');
 });
 
-test('fitViewToCanvas：**不做中国范围钳制**（允许露出境外）—— 这是有意为之的取舍', () => {
-  // 判断与理由写在 render.ts 的 fitViewToCanvas 注释里，这里是它的**行为级**钉死：
+test('fitViewToCanvas：**做中国范围钳制**（框恒 ⊆ 中国）—— 这是 task-17 反转的取舍', () => {
+  // ⚠️ 这条测试与上一版**结论相反**，反转的理由是**真机**：上一版允许露出境外，代价写在注释里
+  // 是"边上多两条底色"；真机上那个代价实际上是"中国缩成中间一小块、纬度到了南半球"
+  //（诊断行 `→铺满[67,-20.6,129,64.4]`）。用户要的是"缩到底看到完整的中国"，所以现在钳制。
+  // 保留下来的是**数学事实**：钳制与"比例 == 画布比"不可兼得 —— 现在选前者，代价是信箱空白。
+  //
   // 黑龙江东部那种"南北长、东西窄"的数据（[130.5,45,133.5,53]，墨卡托比 0.2453 < 画布比
-  // 0.5665 → 框被**高度**限制、左右留白）撑开经度后必然越过 maxLon = 135 —— 允许
-  // （境外是底色，不是错图）。注意：不是所有东北角数据都走这一支（[126,45,134,53] 比画布
-  // 还"宽"，它走的是撑纬度的另一支，见上面那条穷举测试）。
+  // 0.5665 → 框被**高度**限制、左右留白）撑开经度后本来会越过 maxLon = 135 ——
+  // 现在被**平移**回中国：跨度一点没变（所以仍然不变形），只是整体西移。
   const ne: number[] = [130.5, 45, 133.5, 53];
   const ex = fitViewToCanvas(ne, 376, 663.71);
-  assert.ok(ex[2] > CHINA_REGION.bounds[2], `东北角撑开后应当越过 135°E：${ex[2]}`);
-  assert.ok(Math.abs(geoAspect(ex) - 376 / 663.71) < 1e-12, '越界也必须保持比例匹配');
+  assert.ok(ex[2] <= CHINA_REGION.bounds[2] + 1e-9, `东北角撑开后不得越过 135°E：${ex[2]}`);
+  assert.ok(ex[0] >= CHINA_REGION.bounds[0] - 1e-9, `不得越过 73°E：${ex[0]}`);
+  assert.ok(ex[1] >= CHINA_REGION.bounds[1] - 1e-9 && ex[3] <= CHINA_REGION.bounds[3] + 1e-9,
+    `不得越过 18/54°N：${ex}`);
+  // **平移**（不是夹两端）：跨度与"原本要撑到多大"完全一致 —— 只是整体挪回了中国。
+  // 判据：右边界正好贴住 135°E，而左边界 = 135 − 期望跨度（期望跨度由撑开规则算得）。
+  assert.ok(Math.abs(ex[2] - CHINA_REGION.bounds[2]) < 1e-9, `应当是整体西移贴住 135°E：${ex}`);
+  // 平移只动经度位置，**纬度一点不动**（这一支是"撑开经度"）
+  assert.ok(Math.abs(ex[1] - ne[1]) < 1e-12 && Math.abs(ex[3] - ne[3]) < 1e-12, `这一支不该动纬度：${ex}`);
+  assert.ok(Math.abs(geoAspect(ex) - 376 / 663.71) < 1e-12,
+    '只平移不缩放时比例**仍然**匹配（这正是"平移而不是夹两端"的收益）');
   assert.ok(ex[0] <= ne[0] && ex[2] >= ne[2] && ex[1] <= ne[1] && ex[3] >= ne[3], '数据仍须全部可见');
-  // 反证：若"钳制到中国范围"，比例就必然对不上 —— 这就是不钳制的理由 1
-  const clampedToChina: number[] = [Math.max(ex[0], CHINA_REGION.bounds[0]), Math.max(ex[1], CHINA_REGION.bounds[1]),
-    Math.min(ex[2], CHINA_REGION.bounds[2]), Math.min(ex[3], CHINA_REGION.bounds[3])];
-  assert.ok(Math.abs(geoAspect(clampedToChina) - 376 / 663.71) > 1e-6,
-    '钳制回中国之后比例**必然**不再匹配 —— 所以"钳制"与"铺满"不可兼得');
+  // 平移而不是夹两端：**跨度**必须等于"撑开规则本来要撑到的那个跨度"。
+  // 独立算一遍（不用实现里的 mercY）：`geoAspect` 的分母就是 mercY 跨度，
+  //   数据框 `ne` 的 geoAspect → 反解出它的 mercY 跨度 → 按画布比算出需要的经度跨度。
+  const ySpan: number = ((ne[2] - ne[0]) * (Math.PI / 180)) / geoAspect(ne);   // = mercY(53) − mercY(45)
+  const needSpan: number = ((376 / 663.71) * ySpan) / (Math.PI / 180);         // 撑开规则给的经度跨度
+  assert.ok(Math.abs((ex[2] - ex[0]) - needSpan) < 1e-9,
+    `跨度不是"撑开规则算出来的那个"（说明被夹两端了）：${ex[2] - ex[0]} vs ${needSpan}`);
+  // 反证（保留）：若"把两端各夹一下"，跨度会被压小、比例随之失配 —— 这就是**不许夹两端**的理由
+  const midLon: number = (ne[0] + ne[2]) / 2;
+  const unclamped: number[] = [midLon - needSpan / 2, ne[1], midLon + needSpan / 2, ne[3]];
+  const clampedBoth: number[] = [Math.max(unclamped[0], CHINA_REGION.bounds[0]), Math.max(unclamped[1], CHINA_REGION.bounds[1]),
+    Math.min(unclamped[2], CHINA_REGION.bounds[2]), Math.min(unclamped[3], CHINA_REGION.bounds[3])];
+  assert.ok((clampedBoth[2] - clampedBoth[0]) < needSpan - 1e-9,
+    `夹两端必须把跨度压小：${clampedBoth[2] - clampedBoth[0]} vs ${needSpan}`);
+  assert.ok(Math.abs(geoAspect(clampedBoth) - 376 / 663.71) > 1e-6,
+    '夹两端之后比例**必然**不再匹配（而且跨度会被压小）—— 所以只能平移');
+  // 全国视野：两根轴都取满 → **逐位等于** 中国范围（"缩到底 = 全国"的机器可读形态）
+  assert.deepEqual(fitViewToCanvas(CHINA_REGION.bounds, 376, 663.71), normalizeBounds(CHINA_REGION.bounds));
+  assert.deepEqual(fitViewToCanvas(CHINA_REGION.bounds, 376, 642.57), normalizeBounds(CHINA_REGION.bounds));
 });
 
 test('fitViewToCanvas + fitBounds 组合（真机链路）：数据可见 + 比例匹配 + 框 == 块', () => {
@@ -1270,6 +1325,164 @@ test('手势链路：连续"拖动 + 偏心缩放"之后，框仍然合法、比
   }
   assert.ok(b[2] > b[0] && b[3] > b[1] && Number.isFinite(b[0]) && Number.isFinite(b[3]), `最终框非法：${b}`);
   assert.ok((b[2] - b[0]) <= MAX_VIEW_SPAN_DEG + 1e-9, `缩过头了：${b[2] - b[0]}`);
+  // task-17：不止"经度不超"，**整个框都不许出中国**（这条 200 帧里含往西南拖）
+  assert.ok(inChina(b), `缩到底之后跑出中国：${b}`);
+});
+
+// ── task-17：缩小的**上界**（真机缺陷：缩到底能看见南半球）──────────────────────
+//
+// 用户真机反馈原话：「铺满跟缩小的效果如图，每一个对的」（= 每一张都不对）。
+// 两张截图的诊断行（逐字）：
+//   图 1（想要的形态）`放大 9.5×→7.56× ｜ pins 3 ｜ 视野态 默认铺满`
+//   图 2（缩到底）    `→铺满[67,-20.6,129,64.4] ｜ 放大 9.5×→1× ｜ 可缩 1×~103.33×`
+// 图 2 里"可缩 1×"是**显示**，而同一个框的纬度跨度是 85°（−20.6 ~ 64.4）—— 显示与行为不符。
+//
+// 根因（读代码 + 真实代码复现，见报告 §2）：`zoomViewAt` 只把**经度**跨度夹到 62°，
+// 纬度按同一个 factor **搭车**；`settleViewBox` 只夹**中心**，于是纬度只剩 ±84° 的
+// 墨卡托安全带挡着（中国只要 18~54）。修法是 `containInChina`：框恒 ⊆ `CHINA_REGION.bounds`。
+//
+// 这一节钉住工单要求的四条：
+//   ① 连续缩小 N 次 → 视野恒 ⊆ 全国（缩到底**就是**全国）
+//   ② 纬度恒在 [18,54]（真机那个 −20.6° 再也不可达）
+//   ③ 全国视野下中国居中且尽量大（横向顶满、只留上下）
+//   ④ `可缩 N×` 的显示值与真实界限一致（"显示与行为不符"这件事本身）
+//
+// 这一节里的判据 `inChina` 是**独立**算的（只用 `CHINA_REGION.bounds`，不用实现里的任何
+// 中间量）—— 否则就成了"用实现验证实现"。
+
+/** 一个框是否整个落在中国范围之内（独立判据）。 */
+function inChina(b: number[]): boolean {
+  const cb: number[] = CHINA_REGION.bounds;
+  return b[0] >= cb[0] - 1e-9 && b[2] <= cb[2] + 1e-9 && b[1] >= cb[1] - 1e-9 && b[3] <= cb[3] + 1e-9;
+}
+
+test('缩小上界：连续缩小 12 次（4 个不同不动点）后，视野**恒 ⊆ 全国**且纬度恒在 [18,54]', () => {
+  const N: number = 12;
+  const foci: number[][] = [[0.5, 0.5], [0.1, 0.9], [0.9, 0.1], [0.02, 0.98]];
+  const start: number[] = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_BOX_H);
+  const lon0: number = start[2] - start[0];
+  for (let k = 0; k < foci.length; k++) {
+    let b: number[] = start.slice(0, 4);
+    for (let i = 1; i <= N; i++) {
+      b = zoomViewAt(b, 0.5, foci[k][0], foci[k][1]);
+      // ① 有限 + 正跨度（NaN 会让整条 path 静默消失）
+      for (let j = 0; j < 4; j++) { assert.ok(Number.isFinite(b[j]), `第 ${i} 次缩小非有限：${b}`); }
+      assert.ok(b[2] > b[0] && b[3] > b[1], `第 ${i} 次缩小跨度塌了：${b}`);
+      // ② **框 ⊆ 全国**
+      assert.ok(inChina(b), `第 ${i} 次缩小跑出中国：${b}（不动点 ${JSON.stringify(foci[k])}）`);
+      // ③ 纬度恒在 [18,54]（真机 −20.6° 的那条直接钉死）
+      assert.ok(b[1] >= CHINA_REGION.bounds[1] - 1e-9, `第 ${i} 次缩小纬度低于 18°N：${b[1]}`);
+      assert.ok(b[3] <= CHINA_REGION.bounds[3] + 1e-9, `第 ${i} 次缩小纬度高于 54°N：${b[3]}`);
+      // ④ 缩小是**单调**的：视野只会变大。夹断若把跨度压小，这条会抓住
+      assert.ok(b[2] - b[0] >= lon0 - 1e-9, `第 ${i} 次缩小反而变小了：${b[2] - b[0]} < ${lon0}`);
+    }
+    // ⑤ 12 次之后**恒等于全国**（不是"接近"、也不是"中国在一个角上"）
+    assert.deepEqual(b, normalizeBounds(CHINA_REGION.bounds),
+      `缩到底应当**就是全国**：${b}（不动点 ${JSON.stringify(foci[k])}）`);
+    // ⑥ 再缩也不会变（上界是**可达并且是终点**）
+    const again: number[] = zoomViewAt(b, 0.5, 0.5, 0.5);
+    assert.deepEqual(again, b, '到了全国之后继续缩小必须一动不动');
+  }
+});
+
+test('缩小上界：一次缩到底 == 全国；真机那个 `[67,-20.6,129,64.4]` 再也不可达', () => {
+  const start: number[] = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_H_ROW2);
+  const one: number[] = zoomViewAt(start, 1e-9, 0.5, 0.5);
+  assert.deepEqual(one, normalizeBounds(CHINA_REGION.bounds), `一次缩到底应当是全国：${one}`);
+  // 图 2 的真机框：纬度 −20.6°（南半球）。它必须落在"不可达"里 —— 判别力就在这条。
+  const deviceRow2: number[] = [67, -20.6, 129, 64.4];
+  assert.ok(!inChina(deviceRow2), '（自检）真机图 2 那个框本来就在中国之外');
+  assert.ok(one[1] >= CHINA_REGION.bounds[1], `缩到底不许出现南半球：${one[1]}`);
+  assert.ok(one[1] > 0, '更不许出现负纬度');
+  // 也不许"经度到顶但纬度搭车"：两根轴都要到全国
+  assert.ok(Math.abs((one[2] - one[0]) - (CHINA_REGION.bounds[2] - CHINA_REGION.bounds[0])) < 1e-9);
+  assert.ok(Math.abs((one[3] - one[1]) - (CHINA_REGION.bounds[3] - CHINA_REGION.bounds[1])) < 1e-9);
+});
+
+test('缩小上界：全国视野下 mapFrame 把中国**居中且尽量大**（横向顶满、只留上下）', () => {
+  const nat: number[] = normalizeBounds(CHINA_REGION.bounds);
+  const f: MapFrame = mapFrame(DEV_BOX_W, DEV_H_ROW2, nat);
+  // ① 横向顶满：框宽 == 画布宽。这就是"尽量大"—— 再大只能裁掉中国的南北两端，
+  //    而"看到完整的中国"正是这次的要求本身。
+  assert.ok(Math.abs(f.w - DEV_BOX_W) < 1e-9, `框宽应当顶满画布：${f.w}`);
+  assert.ok(Math.abs(f.x) < 1e-9, `横向不该有留白：${f.x}`);
+  // ② 居中：上下留白两侧相等（frame.y 就是那一半）
+  assert.ok(Math.abs(f.y - (DEV_H_ROW2 - f.h) / 2) < 1e-9, `纵向没居中：y=${f.y}`);
+  // ③ 不变形：框的宽高比 == 中国自己的墨卡托比
+  assert.ok(Math.abs(f.w / f.h - geoAspect(nat)) < 1e-9, `框变形了：${f.w}/${f.h}`);
+  // ④ "尽量大"的精确含义：框高 = 画布宽 / 中国墨卡托比（再高就必然变形或裁掉中国）
+  assert.ok(Math.abs(f.h - DEV_BOX_W / geoAspect(nat)) < 1e-9, `框高不是最大值：${f.h}`);
+  // ⑤ 竖屏下**必然**有上下留白（画布比 0.585 vs 中国比 1.345）—— 这是取舍，不是缺陷
+  assert.ok(f.h < DEV_H_ROW2 - 1, '竖屏下中国填不满高度（填满就必然变形/裁掉南北）');
+  const blankPct: number = (1 - f.h / DEV_H_ROW2) * 100;
+  assert.ok(blankPct > 40 && blankPct < 70, `留白比例应当在"大量但可接受"一档：${blankPct}%`);
+  // ⑥ 留白不是浪费：挂载区底仍在画布底部附近（卡片挂得进上下那两条带）
+  const bottom: number = hangBottom(f, { canvasH: DEV_H_ROW2, footer: 34 });
+  assert.ok(bottom > f.y + f.h, `卡片应当能挂进框下面那条留白：bottom=${bottom} 框底=${f.y + f.h}`);
+  assert.ok(bottom <= DEV_H_ROW2 - 34 + 1e-9, `挂载区底不得越过页脚：${bottom}`);
+  // ⑦ 判别力：老行为（不钳制）下中国只占画面高度的 45.2% —— 测试若抓不到这个差别就没用
+  const oldLoose: number[] = [73, -11.54, 135, 68.18];
+  const shareOld: number = (CHINA_REGION.bounds[3] - CHINA_REGION.bounds[1]) / (oldLoose[3] - oldLoose[1]);
+  assert.ok(shareOld < 0.46, `（自检）老框里中国只占 ${(shareOld * 100).toFixed(1)}% 高`);
+  assert.ok(shareOld < 0.99, `新框里中国占 100%（框 == 中国），老框 ${(shareOld * 100).toFixed(1)}% —— 这就是修复本身`);
+});
+
+test('缩小上界：`可缩 N×` 的显示值与**真实界限**一致（"显示与行为不符"这件事本身）', () => {
+  // 图 2 的诊断行写着 `可缩 1×~103.33×`，可当时的框纬度是 85°。显示端与约束端各写各的，
+  // 就是那个不符的根。现在显示端读 `viewZoomRange()`，约束端是 `containInChina` + 两个常量。
+  const zr: number[] = viewZoomRange();
+  assert.equal(zr[0], 1, `显示的下界应当是 1×：${zr[0]}`);
+  assert.ok(Math.abs(zr[1] - MAX_VIEW_SPAN_DEG / MIN_ZOOMED_VIEW_SPAN_DEG) < 1e-12,
+    `显示的上界应当是 62/0.6：${zr[1]}`);
+  assert.ok(Math.abs(zr[1] - 103.3333) < 0.001, `真机诊断行印的是 103.33×：${zr[1]}`);
+
+  // 下界：反复缩小 → 实际到达的倍数必须**正好**是显示的那个下界
+  let b: number[] = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_H_ROW2);
+  for (let i = 0; i < 40; i++) { b = zoomViewAt(b, 0.5, 0.5, 0.5); }
+  assert.equal(viewZoomOf(b), zr[0], `显示可缩到 ${zr[0]}×，实际只到 ${viewZoomOf(b)}×`);
+  // ⚠️ 光比倍数**不够** —— 老实现下 `viewZoomOf` 也是 1（它只读经度）。
+  //    必须同时钉住"到达下界时**就是全国**"，否则"1×"永远可以只是显示。
+  assert.deepEqual(b, normalizeBounds(CHINA_REGION.bounds), '1× 必须是"就是全国"，不是"经度到顶"');
+  assert.ok(Math.abs((b[3] - b[1]) - (CHINA_REGION.bounds[3] - CHINA_REGION.bounds[1])) < 1e-9,
+    '1× 时纬度跨度也必须 == 中国（老实现这里是 85°）');
+
+  // 上界：反复放大 → 实际到达的倍数 == 显示的 103.33×
+  let c: number[] = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_H_ROW2);
+  for (let i = 0; i < 60; i++) { c = zoomViewAt(c, 2, 0.5, 0.5); }
+  assert.ok(Math.abs(viewZoomOf(c) - zr[1]) < 1e-9, `显示可放到 ${zr[1]}×，实际到了 ${viewZoomOf(c)}×`);
+  assert.ok(Math.abs((c[2] - c[0]) - MIN_ZOOMED_VIEW_SPAN_DEG) < 1e-9,
+    `放到顶时经度跨度应当是单城市级 ${MIN_ZOOMED_VIEW_SPAN_DEG}°：${c[2] - c[0]}`);
+  assert.ok(inChina(c), `放到顶之后仍须在中国之内：${c}`);
+});
+
+test('缩小上界：平移到边界是"停住"（跨度不变），不是"被压扁"', () => {
+  // 这一条守的是 `containInChina` 的**平移**语义（与 `fitAxis` 第 ③ 步同一条规矩）：
+  // 两端各夹一下会把跨度压小甚至压成 0 —— 那正是"整块画布 NaN"的来源。
+  const start: number[] = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_H_ROW2);
+  const lonSpan0: number = start[2] - start[0];
+  const latSpan0: number = start[3] - start[1];
+  const p: number[] = panViewBy(start, 50, 0);          // 往西拖到头
+  assert.ok(inChina(p), `拖到头仍须在中国之内：${p}`);
+  assert.ok(Math.abs((p[2] - p[0]) - lonSpan0) < 1e-9, `平移被夹两端了（跨度变了）：${p[2] - p[0]}`);
+  assert.ok(Math.abs(p[0] - CHINA_REGION.bounds[0]) < 1e-9, `应当正好贴住 73°E：${p[0]}`);
+  const p2: number[] = panViewBy(p, 50, 0);             // 已经到头，再拖
+  assert.ok(Math.abs(p2[0] - p[0]) < 1e-9 && Math.abs(p2[2] - p[2]) < 1e-9, '到头之后不该再动');
+  const q: number[] = panViewBy(start, 0, -50);         // 往南拖到头
+  assert.ok(inChina(q), `往南拖到头仍须在中国之内：${q}`);
+  assert.ok(Math.abs(q[1] - CHINA_REGION.bounds[1]) < 1e-9, `应当正好贴住 18°N：${q[1]}`);
+  // ⚠️ 纵向的"跨度不变"是**在 mercY 空间里**说的（`panViewBy` 就是这么平移的），
+  //    所以这里断言的是**形状**（geoAspect 不变），不是"纬度度数不变"：
+  //    同一段 mercY 在低纬覆盖更多纬度 —— 拖到南边之后纬度度数**会变大**
+  //    （11.36° → 13.30°），那是墨卡托，不是被拉伸。写成"纬度度数不变"是错的。
+  assert.ok(Math.abs(geoAspect(q) - geoAspect(start)) < 1e-9,
+    `纵向平移改变了形状（mercY 跨度变了）：${geoAspect(q)} vs ${geoAspect(start)}`);
+  assert.ok((q[3] - q[1]) >= latSpan0 - 1e-9, `拖到低纬后纬度度数只应变大：${q[3] - q[1]} vs ${latSpan0}`);
+  // 放大态：中国比视野大 → 平移是**真的能走**的（不是把地图锁死）
+  let z: number[] = start.slice(0, 4);
+  for (let i = 0; i < 6; i++) { z = zoomViewAt(z, 2, 0.5, 0.5); }
+  const z1: number[] = panViewBy(z, 0.2, 0);
+  assert.ok(z1[0] < z[0] - 0.01, `放大态往西拖应当真的移动：${z1[0]} vs ${z[0]}`);
+  assert.ok(inChina(z1), `移动之后仍须在中国之内：${z1}`);
 });
 
 // ── 地图框：铺满主体区 + 不变形 + 居中（task-14 的形态改造） ─────────────────
