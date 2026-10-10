@@ -68,7 +68,7 @@ import { MIN_ZOOM_FOR_EXPAND } from '../entry/src/main/ets/core/placement.ts';
 import {
   BLOCK_FILL, HANG_GAP, HANG_PHOTO_H, HANG_PHOTO_W, PROVINCE_STROKE, PROVINCE_WIDTH, VIEW_PAD_RATIO,
   arcSpread, arcSpreadNeed, buildScene, fitBounds, fitViewToCanvas, frameBounds, geoAspect, hangBottom,
-  hangOffsets, mapFrame, outlinePath, parseOutline, sceneToSvg, trajectoryOrder, viewZoomOf
+  hangOffsets, mapFrame, outlinePath, parseOutline, sceneToSvg, trajectoryOrder, viewZoomOf, zoomViewAt
 } from '../entry/src/main/ets/core/render.ts';
 import type { MapFrame, ScenePin, WallPhoto } from '../entry/src/main/ets/core/render.ts';
 
@@ -91,6 +91,11 @@ interface Options {
   footer: number;
   pad: number;
   flat: boolean;
+  /**
+   * `--zoomout`：先算出"默认铺满"的视野，再**一路缩到最小**（模拟用户在真机上一直捏合），
+   * 然后按那一帧出图。task-17 的验收物（`tools/out/wall-preview-zoomedout.svg`）用它生成。
+   */
+  zoomout: boolean;
 }
 
 function parseArgs(argv: string[]): Options {
@@ -105,7 +110,8 @@ function parseArgs(argv: string[]): Options {
     footer: 34,
     // **与设备同一个常量**：两边各写一个数就会变成"电脑上看到的和真机上看到的不是同一张图"
     pad: VIEW_PAD_RATIO,
-    flat: false
+    flat: false,
+    zoomout: false
   };
   const positional: string[] = [];
   for (const a of argv) {
@@ -120,6 +126,14 @@ function parseArgs(argv: string[]): Options {
       continue;
     }
     if (a === '--flat') { o.flat = true; continue; }
+    if (a === '--zoomout') {
+      o.zoomout = true;
+      // 输出名**加后缀**而不是直接覆盖默认名：`--nearby --zoomout` 因此得到
+      // `wall-preview-nearby-zoomedout.svg`，**永远不会**覆盖已有的那几张预览
+      //（`--out=` 显式给了就听调用方的，与其它参数一致）。
+      o.out = o.out.replace(/\.svg$/, '-zoomedout.svg');
+      continue;
+    }
     const eq = a.indexOf('=');
     const key = eq < 0 ? a : a.substring(0, eq);
     const val = eq < 0 ? '' : a.substring(eq + 1);
@@ -230,7 +244,24 @@ function main(): number {
   // 少了这一步，`mapFrame` 只能在块里 contain（居中信箱式），框的一侧会空出一条带 ——
   // 那正是用户说的"没铺满"。撑开只作用在**没被限制**的那根轴上，所以框 ⊇ 数据
   //（照片一张都不会跑出去），而且 pt/度 不变、框绕数据长出去 → 照片在屏幕上不动。
-  const bounds: number[] = fitViewToCanvas(dataBounds, o.w, o.h);
+  const boundsFilled: number[] = fitViewToCanvas(dataBounds, o.w, o.h);
+
+  // ── `--zoomout`：把视野**缩到最小**（task-17 的验收物）──────────────────────────
+  // 模拟用户在真机上一直捏合缩小：反复调 `zoomViewAt(b, 0.5, 0.5, 0.5)`，直到**不再变化**。
+  // 本次修复的判据就在这一步的结果上：缩到底**必须**是"整个中国"（`CHINA_REGION.bounds`），
+  // 而不是"经度到顶 62°、纬度按画布比例搭车到 −20.6°"（用户截图里那一帧）。
+  // 为什么在**铺满框**上缩而不是在数据框上缩：设备侧 `viewBounds` 就是铺满框
+  //（`rebuild` 的第 ② 步），用户的手势从那一帧开始 —— 复现要照抄这条路径。
+  let bounds: number[] = boundsFilled;
+  let zoomSteps: number = 0;
+  if (o.zoomout) {
+    for (let i = 0; i < 40; i++) {
+      const nb: number[] = zoomViewAt(bounds, 0.5, 0.5, 0.5);
+      if (nb[0] === bounds[0] && nb[1] === bounds[1] && nb[2] === bounds[2] && nb[3] === bounds[3]) { break; }
+      bounds = nb;
+      zoomSteps++;
+    }
+  }
   const zoomFactor: number = viewZoomOf(bounds);
   // 撑开前后的放大倍数（真机上诊断行印的就是这一对数字）
   const zoomData: number = viewZoomOf(dataBounds);
@@ -327,6 +358,9 @@ function main(): number {
   const track = trajectoryOrder(pins);
   const boundsText = `[${round2(fb[0])},${round2(fb[1])},${round2(fb[2])},${round2(fb[3])}]`;
   const dataText = `[${round2(dataBounds[0])},${round2(dataBounds[1])},${round2(dataBounds[2])},${round2(dataBounds[3])}]`;
+  // `--zoomout` 时图例要报的是**缩到底**那个框（`boundsText` 本来就是从 `frame` 上读的，
+  // 所以它天然跟着变）；铺满框只在控制台里与它并列印出来做对照。
+  const filledText = `[${round2(boundsFilled[0])},${round2(boundsFilled[1])},${round2(boundsFilled[2])},${round2(boundsFilled[3])}]`;
   const legend: string[] = [];
   // 图例画在**顶部**，并带一条底衬 —— **只影响这张 SVG 好不好读，不改任何几何**。
   // 为什么不放底部（老位置）：视野拉近之后地图框会**填满整块高度**（那正是本批要的效果），
@@ -345,7 +379,15 @@ function main(): number {
   // 截断的图例等于没有图例。行数不变（3 行），只是每行都改写得更短。
   legend.push(`<g id="legend" font-size="6.5" fill="#7A8577">`);
   legend.push(`<text x="8" y="${round2(legendH - 23)}">地图墙预览 ｜ ${pins.length} 钉子 ｜ 轨迹 ${track.length} 点 ｜ 挂出 ${drawn} / 上墙 ${onWall} 张 ｜ 输入 ${total} 张（无地点 ${total - onWall}）</text>`);
-  legend.push(`<text x="8" y="${round2(legendH - 12)}">视野 数据 ${dataText}${vb !== undefined ? '(数据)' : '(全国)'} → 铺满 ${boundsText} ｜ 放大 ${round2(zoomData)}×→${round2(zoomFactor)}×</text>`);
+  // 6.5 号字在 360pt 宽上会**右侧截断**（SVG 的 text 不换行，超出的部分直接看不见）——
+  // 预览是给人看的，截断的图例等于没有图例。所以 `--zoomout` 用**更短**的一行：
+  // 只报"缩到底那个框 + 捏了几步"，把"铺满框"留给控制台（那里没有宽度限制）。
+  const viewLine: string = o.zoomout
+    ? `视野 数据 ${dataText}${vb !== undefined ? '(数据)' : '(全国)'} → 缩到底 ${boundsText}`
+      + `（${zoomSteps} 步捏合，== 全国）｜ 放大 ${round2(zoomData)}×→${round2(zoomFactor)}×`
+    : `视野 数据 ${dataText}${vb !== undefined ? '(数据)' : '(全国)'} → 铺满 ${boundsText}`
+      + ` ｜ 放大 ${round2(zoomData)}×→${round2(zoomFactor)}×`;
+  legend.push(`<text x="8" y="${round2(legendH - 12)}">${viewLine}</text>`);
   legend.push(`<text x="8" y="${round2(legendH - 1)}">地图框 ${round2(frame.w)}×${round2(frame.h)}@(${round2(frame.x)},${round2(frame.y)}) 信箱 x${round2(frame.x)} y${round2(frame.y)} ｜ 卡片 ${HANG_PHOTO_W}×${HANG_PHOTO_H} ｜ 地图框外 ${outside.length} ｜ 时间未知 ${undated} ｜ ${escapeText(outlineShort)} ${escapeText(provinceNote)}</text>`);
   legend.push(`</g>`);
   svg = svg.replace('</svg>', legend.join('\n') + '\n</svg>');
@@ -365,8 +407,9 @@ function main(): number {
   console.log(`画布：${o.w}×${o.h}pt（scale=${o.scale} → ${o.w * o.scale}×${o.h * o.scale}px）`);
   console.log(`分区：地图块 0→${round2(o.h)}pt（${round2(100)}%，地图是整块主体区的底色）`);
   console.log(`视野：数据框 ${dataText}${vb !== undefined ? '(数据：fitBounds)' : '(全国：没有有效坐标的退化路径)'}`);
-  console.log(`      铺满框 ${boundsText}（fitViewToCanvas 撑到与画布同比例）`
-    + ` ｜ 放大 ${round2(zoomData)}× → ${round2(zoomFactor)}×（= 全国经度跨度 62° / 视野经度跨度）`
+  console.log(`      铺满框 ${o.zoomout ? filledText : boundsText}（fitViewToCanvas 撑到与画布同比例）`
+    + ` ｜ 放大 ${round2(zoomData)}× → ${round2(o.zoomout ? viewZoomOf(boundsFilled) : zoomFactor)}×`
+    + `（= 全国经度跨度 62° / 视野经度跨度）`
     + ` ｜ pad=${o.pad}`);
   console.log(`        经度跨度 ${round2(dataBounds[2] - dataBounds[0])}° → ${round2(fb[2] - fb[0])}°`
     + `（撑开 ${(fb[2] - fb[0]) / (dataBounds[2] - dataBounds[0]) > 1 ? ((fb[2] - fb[0]) / (dataBounds[2] - dataBounds[0])).toFixed(4) : '1.0000'} 倍）`
@@ -375,13 +418,29 @@ function main(): number {
     + ` —— 框宽高比 = 墨卡托 ${geoAspect(fb).toFixed(4)}`
     + `${o.flat ? '（**--flat：框 = 块，会变形**，只是留个对照）' : `（**不变形**＝画布比 ${(o.w / o.h).toFixed(4)}）`}`);
   console.log(`        信箱空白：x=${round2(frame.x)}pt y=${round2(frame.y)}pt`
-    + `（铺满生效时两者恒为 0 —— 这就是"默认铺满"最直接的数字）`);
+    + `（铺满生效时两者恒为 0 —— 这就是"默认铺满"最直接的数字）`
+    + `${o.zoomout ? '　⚠️ 本次是 --zoomout：y 的留白是**预期的**（全国视野装不满竖屏，见下面那三行）' : ''}`);
   const fillH: number = o.h * geoAspect(fb);
   console.log(`        先按"填满高度"算宽 = ${round2(o.h)}×${geoAspect(fb).toFixed(4)} = ${round2(fillH)}pt`
     + ` ${fillH > o.w + 1e-6 ? `> 画布宽 ${o.w} → 改成"填满宽度"`
       : (Math.abs(fillH - o.w) <= 1e-6 ? '== 画布宽 → **两条同时成立**（框 == 块，信箱空白 0）'
         : '≤ 画布宽 → **填满高度成功**（地图铺满屏幕）')}`);
   console.log(`      挂载区 ${round2(hangTop)}→${round2(hangBottomPt)}pt（${round2(hangBottomPt - hangTop)}pt，${round2(((hangBottomPt - hangTop) / o.h) * 100)}%） ｜ 图例 ${o.footer}pt  zoom=${o.zoom}${o.zoom < MIN_ZOOM_FOR_EXPAND ? '（< 展开阈值，全部收成点）' : ''}`);
+  if (o.zoomout) {
+    // task-17 的判据：缩到底**必须**是"整个中国"，且纬度必须落在 [18,54]（不许有南半球）
+    const cb: number[] = CHINA_REGION.bounds;
+    const isNation: boolean = Math.abs(bounds[0] - cb[0]) < 1e-9 && Math.abs(bounds[1] - cb[1]) < 1e-9
+      && Math.abs(bounds[2] - cb[2]) < 1e-9 && Math.abs(bounds[3] - cb[3]) < 1e-9;
+    const latOk: boolean = bounds[1] >= cb[1] - 1e-9 && bounds[3] <= cb[3] + 1e-9;
+    console.log(`--zoomout：从铺满框 ${round2(boundsFilled[2] - boundsFilled[0])}° 经度跨度`
+      + ` 一路缩到最小（${zoomSteps} 步 × 0.5，绕中心）`);
+    console.log(`        缩到底 = [${round2(bounds[0])},${round2(bounds[1])},${round2(bounds[2])},${round2(bounds[3])}]`
+      + ` ｜ 放大 ${round2(zoomFactor)}× ｜ **== 全国范围** = ${isNation}`
+      + ` ｜ 纬度 ⊆ [18,54] = ${latOk}（下界 ${round2(bounds[1])}，真机旧行为是 −20.6）`);
+    console.log(`        全国视野下 mapFrame：${round2(frame.w)}×${round2(frame.h)}pt @(${round2(frame.x)},${round2(frame.y)})`
+      + ` —— 横向顶满 = ${Math.abs(frame.w - o.w) < 1e-9}，纵向居中 = ${Math.abs(frame.y - (o.h - frame.h) / 2) < 1e-9}`
+      + `，上下留白合计 ${round2(100 - (frame.h / o.h) * 100)}%（画布比 ${(o.w / o.h).toFixed(4)} vs 中国比 ${geoAspect(cb).toFixed(4)}，不可兼得）`);
+  }
   console.log(`国界：${outlineNote}`);
   console.log(`省界：${provinceNote}　（${PROVINCE_STROKE} ${PROVINCE_WIDTH}pt —— 与国界同色、线宽是它的 ${PROVINCE_WIDTH}/0.8）`);
   console.log(`卡片：${HANG_PHOTO_W}×${HANG_PHOTO_H}pt（挂线留白 ${HANG_GAP}pt）`);

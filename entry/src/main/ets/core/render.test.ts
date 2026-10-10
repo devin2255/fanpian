@@ -891,6 +891,30 @@ test('outlinePath：整个落在地图块外的环被剔除（视口剔除，不
   assert.equal(outlinePath([left], small), '');
 });
 
+test('outlinePath：视口是**绘制框**而不是地图块 —— 框装不满块时，框外的环必须被剔掉', () => {
+  // task-17 补的一条。两种口径只在"框比块小"时才分道扬镳，而"框 ⊆ 中国"之后
+  // **全国视野就是这样**：376×642.57 的块里，框只有 376×279.62 居中（上下各留 181pt）——
+  // 南海诸岛（8~11.4°N）投影在框**下方**、却仍在**块内**。
+  // 按块判（老口径）一条都剔不掉 → 它们飘进框下面那条留白里，正好是这段裁剪想消灭的"脏点"。
+  const frame: MapFrame = mapFrame(376, 642.57, CHINA_REGION.bounds);
+  assert.ok(frame.h < frame.blockH - 1, `（自检）这个块里框装不满：h=${frame.h} blockH=${frame.blockH}`);
+  assert.ok(frame.y > 1, `（自检）框纵向居中，上下都有留白：y=${frame.y}`);
+  const islets = [112, 11, 113, 11, 113, 10];   // 南海诸岛一带：框下方、块之内
+  const inside = [100, 30, 101, 30, 101, 29];   // 框内的一个环（对照）
+  const d = outlinePath([inside, islets], frame);
+  assert.equal(d.split('M').length - 1, 1, '框外的环（虽然在块内）没有被剔除');
+  assert.equal(outlinePath([islets], frame), '', '框外的东西不许画进那两条留白里');
+  // 判别力：这个点确实在**框下方**、又确实在**块之内** —— 老口径（按块判）因此漏掉它
+  const proj = projectMercator(112.5, 10.5, frame.w, frame.h, frameBounds(frame));
+  const y: number = proj.y + frame.y;
+  assert.ok(y > frame.y + frame.h + 1, `（自检）这个点应当在框下方：y=${y} 框底=${frame.y + frame.h}`);
+  assert.ok(y <= frame.blockH, `（自检）但它仍在块内：y=${y} 块高=${frame.blockH}`);
+  // 框 == 块时两种口径**逐字相同**（所有比例正好匹配的情形都不受影响）
+  const flat: MapFrame = mapFrame(W, mapBoxHeight(W, CHINA_REGION.bounds), CHINA_REGION.bounds);
+  assert.equal(outlinePath([inside, islets], flat), outlinePath([inside], flat),
+    '框 == 块时行为必须与老口径一致（这条是"改动最小"的判据）');
+});
+
 test('outlinePath：坐标在**块坐标**里 —— 框居中时轮廓跟着偏移 frame.x / frame.y', () => {
   // 一个刻意做得很高、很窄的块：框按"填满宽度"算，居中在纵向 → frame.y > 0。
   const tall: MapFrame = mapFrame(200, 900, CHINA_REGION.bounds);
@@ -1370,9 +1394,14 @@ test('缩小上界：连续缩小 12 次（4 个不同不动点）后，视野**
       assert.ok(b[2] > b[0] && b[3] > b[1], `第 ${i} 次缩小跨度塌了：${b}`);
       // ② **框 ⊆ 全国**
       assert.ok(inChina(b), `第 ${i} 次缩小跑出中国：${b}（不动点 ${JSON.stringify(foci[k])}）`);
-      // ③ 纬度恒在 [18,54]（真机 −20.6° 的那条直接钉死）
-      assert.ok(b[1] >= CHINA_REGION.bounds[1] - 1e-9, `第 ${i} 次缩小纬度低于 18°N：${b[1]}`);
-      assert.ok(b[3] <= CHINA_REGION.bounds[3] + 1e-9, `第 ${i} 次缩小纬度高于 54°N：${b[3]}`);
+      // ③ 纬度恒在 [18,54]（真机 −20.6° 的那条直接钉死）。
+      //    ⚠️ 这里是**严格不等式**，不是容差：缩到底之后再拖/再缩时，贴边那一端
+      //    必须**正好**落在 18/54 上（靠 `containInChina` 的 `SNAP_SPAN_EPS` 与
+      //    "贴边直接用中国端点"两条保证），不许出现 17.999999999999996 这种"差一 ulp 的越界"。
+      assert.ok(b[1] >= CHINA_REGION.bounds[1], `第 ${i} 次缩小纬度低于 18°N：${b[1]}`);
+      assert.ok(b[3] <= CHINA_REGION.bounds[3], `第 ${i} 次缩小纬度高于 54°N：${b[3]}`);
+      assert.ok(b[0] >= CHINA_REGION.bounds[0], `第 ${i} 次缩小经度低于 73°E：${b[0]}`);
+      assert.ok(b[2] <= CHINA_REGION.bounds[2], `第 ${i} 次缩小经度高于 135°E：${b[2]}`);
       // ④ 缩小是**单调**的：视野只会变大。夹断若把跨度压小，这条会抓住
       assert.ok(b[2] - b[0] >= lon0 - 1e-9, `第 ${i} 次缩小反而变小了：${b[2] - b[0]} < ${lon0}`);
     }
@@ -1397,6 +1426,35 @@ test('缩小上界：一次缩到底 == 全国；真机那个 `[67,-20.6,129,64.
   // 也不许"经度到顶但纬度搭车"：两根轴都要到全国
   assert.ok(Math.abs((one[2] - one[0]) - (CHINA_REGION.bounds[2] - CHINA_REGION.bounds[0])) < 1e-9);
   assert.ok(Math.abs((one[3] - one[1]) - (CHINA_REGION.bounds[3] - CHINA_REGION.bounds[1])) < 1e-9);
+});
+
+test('缩小上界：到达全国之后，再拖 / 再缩都是**逐位恒等**（边界值不漂）', () => {
+  // 缩到底那一帧是 `[73,18,135,54]`（**逐位**）。此时：
+  //   · 再缩小 → `zoomViewAt` 里 factor 被反解夹到 1 → 直接逐位返回；
+  //   · 再拖动 → `settleViewBox` 慢路径 → `containInChina` 的"顶满中国"那一支 → 逐位回到同四个数。
+  // 这条守的是 `SNAP_SPAN_EPS` 与"贴边直接用中国端点"这两处实现细节：
+  // 没有它们，"顶满"在浮点下判不出来（平移后的两端相减差一两个 ulp），
+  // 代码会走"平移贴边"那一支，而那一支的另一端是**减出来的** →
+  // 纬度变成 18.000000000000114，缩到底就不再是一个稳定的终点。
+  let b: number[] = fitViewToCanvas(DEV_VIEW, DEV_BOX_W, DEV_H_ROW2);
+  for (let i = 0; i < 12; i++) { b = zoomViewAt(b, 0.5, 0.5, 0.5); }
+  assert.deepEqual(b, normalizeBounds(CHINA_REGION.bounds), '缩到底必须是逐位的全国框');
+  // 严格不等式（不是容差）：纬度**不出现** < 18 或 > 54
+  assert.ok(b[1] >= CHINA_REGION.bounds[1] && b[3] <= CHINA_REGION.bounds[3], `纬度越界：${b[1]}~${b[3]}`);
+  const dirs: number[][] = [[0.5, 0], [-0.5, 0], [0, 0.5], [0, -0.5], [0.3, 0.3], [-0.3, -0.3], [2, -2]];
+  for (let k = 0; k < dirs.length; k++) {
+    assert.deepEqual(panViewBy(b, dirs[k][0], dirs[k][1]), normalizeBounds(CHINA_REGION.bounds),
+      `缩到底之后拖 ${JSON.stringify(dirs[k])} 不该改变视野`);
+    assert.deepEqual(zoomViewAt(b, 0.25, 0.3, 0.7), normalizeBounds(CHINA_REGION.bounds),
+      '缩到底之后再缩不该改变视野');
+  }
+  // 40 轮混合（往各个方向拖 + 缩），仍然逐位恒等 —— "上界是终点"的机器可读含义
+  let s: number[] = b.slice(0, 4);
+  for (let i = 0; i < 40; i++) {
+    s = panViewBy(s, (i % 7 - 3) * 0.4, (i % 5 - 2) * 0.4);
+    s = zoomViewAt(s, 0.9, 0.2, 0.8);
+  }
+  assert.deepEqual(s, normalizeBounds(CHINA_REGION.bounds), `缩到底之后 40 轮混合手势漂了：${s}`);
 });
 
 test('缩小上界：全国视野下 mapFrame 把中国**居中且尽量大**（横向顶满、只留上下）', () => {

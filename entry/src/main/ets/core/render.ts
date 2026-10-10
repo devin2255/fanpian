@@ -492,6 +492,21 @@ const LAT_EXPAND_LIMIT = 84;
 const LON_EXPAND_LIMIT = 360;
 
 /**
+ * "跨度已经顶满中国"的判定容差（相对量）。
+ *
+ * 为什么需要它：跨度**恰好**等于中国跨度时（= 缩到底那一帧，`[73,18,135,54]`），
+ * 用户再拖一下，平移后的两端是 `cLo + s` / `cHi + s` —— 两者相减得到的跨度会比
+ * `cHi − cLo` 差一两个 ulp。于是"取整段"那一支判不出来，代码走"平移贴边"那一支，
+ * 而贴边那一支的**另一端是减出来的**（`a -= b - cHi`）→ 结果是纬度
+ * `18.000000000000114` 而不是 18：虽然仍然 ≥ 18（安全方向），但
+ * "缩到底之后再拖/再缩"就不再是逐位恒等，边界值会漂 1e-13。
+ * 用相对容差 1e-12 认下这一两个 ulp，让"顶满中国"这件事**可判定**，
+ * 于是缩到底之后的任何拖动都是**逐位不动**的（单测里钉住这一条）。
+ * 1e-12 对应 62° 上的 6e-11 度（约 6 微米）—— 比数据本身的精度低若干量级。
+ */
+const SNAP_SPAN_EPS = 1e-12;
+
+/**
  * 把一族视野框落进**中国范围** `CHINA_REGION.bounds` ——
  * "视野任何时候都不得跑到中国之外"这条硬规矩的**唯一执行点**
  *（`fitViewToCanvas` 与 `settleViewBox` 都调它，所以设备的两条路径口径不可能漂）。
@@ -555,7 +570,7 @@ function containInChina(minLon: number, minLat: number, maxLon: number, maxLat: 
   // 经度：跨度够大就取整段（== 全国），否则平移进来（保跨度）
   let lo: number = minLon;
   let hi: number = maxLon;
-  if (hi - lo >= cHiLon - cLoLon) {
+  if (hi - lo >= (cHiLon - cLoLon) * (1 - SNAP_SPAN_EPS)) {
     lo = cLoLon;
     hi = cHiLon;
   } else if (lo < cLoLon) {
@@ -567,7 +582,7 @@ function containInChina(minLon: number, minLat: number, maxLon: number, maxLat: 
   }
   // 纬度：同一条规矩，但在 **mercY 空间**里做（见上面那段"为什么"）。
   // "取整段"直接给 CHINA_BOUNDS 的纬度端点 —— 逐位精确，不做 mercY 往返。
-  if (y1 - y0 >= cHiY - cLoY) {
+  if (y1 - y0 >= (cHiY - cLoY) * (1 - SNAP_SPAN_EPS)) {
     return [lo, cLoLat, hi, cHiLat];
   }
   let a: number = y0;
@@ -579,7 +594,13 @@ function containInChina(minLon: number, minLat: number, maxLon: number, maxLat: 
     a -= b - cHiY;
     b = cHiY;
   }
-  return [lo, invMercYOf(a), hi, invMercYOf(b)];
+  // 贴住边界的那一端**直接用中国的纬度端点**，不走 `invMercYOf` 往返：
+  // `mercYOf(18)` 的反函数会给出 17.999999999999996（差 1 ulp，3.6e-15 度），
+  // 于是"纬度不小于 18"在**逐位**比较下就不成立了。这一支是"越界时贴边"，
+  // 贴边当然要落在边上 —— 而且 `a === cLoY` 是上面赋值出来的精确相等，不是浮点判断。
+  const latLo: number = a === cLoY ? cLoLat : invMercYOf(a);
+  const latHi: number = b === cHiY ? cHiLat : invMercYOf(b);
+  return [lo, latLo, hi, latHi];
 }
 
 /**
@@ -1649,7 +1670,7 @@ export function parseOutline(text: string): OutlineData | undefined {
  * 现在签名里根本没有这个参数：`frameBounds(frame)` 是唯一读法，
  * "国界与照片用同一个 bounds"因此在类型层面就成立，不靠调用方守规矩。
  *
- * ── 视口裁剪：整个落在地图块之外的环**不产出子路径** ──────────────────────────
+ * ── 视口裁剪：整个落在**绘制框**之外的环**不产出子路径** ────────────────────────
  * 为什么需要：`china_outline.json` 的 `bounds` 与 `CHINA_REGION.bounds` 一致，
  * 而它的 `minLat = 18` —— 南海诸岛在 8~11.4°N，投影后落在绘制框**下方**。
  * 不裁的话它们会飘到挂照片的区域里，看着像脏点。数据里一条都没删（96 条环全在文件里），
@@ -1657,16 +1678,28 @@ export function parseOutline(text: string): OutlineData | undefined {
  * 放大到"几个邻近城市"那一档时，被剔除的环会明显变多（新疆/西藏/南海都在视野外）——
  * 这是**预期后果**，取舍写在报告的"放大后国界可能整条在视野外"一节。
  *
- * 剔除的粒度是**整条环**：只要一条环有任何一点在块内就整条画出来。放大之后，
- * 中国轮廓那条主环会横跨整个视野（环上大多数点在块外、但少数点在块内），
+ * ⚠️ 判据是**绘制框**（`frame.x/y/w/h`），不是**地图块**（`frame.blockW/blockH`）——
+ *   这是 task-17 改的一处（原来按块判）。两者的区别在框**装不满**块时才出现：
+ *   框比块矮一截时（"框 ⊆ 中国"之后**全国视野就是这样**：376×279.62 居中在 376×642.57），
+ *   南海诸岛投影在框下方却**仍在块内**，按块判就一条都剔不掉 ——
+ *   它们会飘进框下面那条留白里，正好是这段裁剪想消灭的"脏点"。
+ *   设备与预览都一样：设备侧的 `.clip(true)` 挂在**块**上（`WallPage` 最外层那个 Stack），
+ *   不是挂在框上，所以框外的子路径是真会被画出来的。
+ *   按框判之后，框 == 块的那些情形（`--flat`、比例正好匹配时）行为**逐字不变**。
+ *
+ * 剔除的粒度是**整条环**：只要一条环有任何一点在框内就整条画出来。放大之后，
+ * 中国轮廓那条主环会横跨整个视野（环上大多数点在框外、但少数点在框内），
  * 于是它的子路径被保留、由调用方按框裁剪（设备侧是容器的 `.clip(true)`）——
  * 结果是"视野附近的海岸线会露出来"，这是好事，不是缺陷。
  */
 export function outlinePath(rings: number[][], frame: MapFrame): string {
   if (rings === undefined || rings === null || rings.length === 0) { return ''; }
   const b: number[] = frameBounds(frame);
-  const boxW: number = frame.blockW;
-  const boxH: number = frame.blockH;
+  // 视口 = 绘制框在**块坐标**里的矩形（子路径的坐标已经按 frame.x/frame.y 平移过，同一坐标系）
+  const vx0: number = frame.x;
+  const vy0: number = frame.y;
+  const vx1: number = frame.x + frame.w;
+  const vy1: number = frame.y + frame.h;
   const parts: string[] = [];
   for (let i = 0; i < rings.length; i++) {
     const ring: number[] = rings[i];
@@ -1692,8 +1725,8 @@ export function outlinePath(rings: number[][], frame: MapFrame): string {
       d += (d.length === 0 ? 'M' : 'L') + x + ' ' + y;
     }
     if (d.length === 0) { continue; }
-    // 整条在地图块外 → 丢掉这条子路径（视口剔除，不是删数据）
-    if (maxX < 0 || minX > boxW || maxY < 0 || minY > boxH) { continue; }
+    // 整条在**绘制框**外 → 丢掉这条子路径（视口剔除，不是删数据）
+    if (maxX < vx0 || minX > vx1 || maxY < vy0 || minY > vy1) { continue; }
     parts.push(d + 'Z');
   }
   return parts.join('');
