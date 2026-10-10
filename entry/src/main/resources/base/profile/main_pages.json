@@ -3,6 +3,7 @@
     "pages/ClaimPage",
     "pages/SwipePage",
     "pages/FavPage",
-    "pages/WallPage"
+    "pages/WallPage",
+    "pages/StatsPage"
   ]
 }

@@ -3,13 +3,14 @@ import { router } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { DecisionStore } from '../data/decisionStore';
 import { SessionStore, takeSession } from '../data/sessionStore';
+import { MetricsStore, MetricsLoad } from '../data/metricsStore';
 import { LocationEntry } from '../data/locationIndex';
 import { PlaceStore } from '../data/placeStore';
 import { CardStack, QueueItem, CardEvent, SwipeRollback } from '../ui/CardStack';
 import { PlaceOutcome, pickPlace, toastReading } from '../ui/PlacePicker';
 import { Decision, emptyDecision, applyDecision } from '../core/queue';
 import { hasPlace, formatPlace } from '../core/placePick';
-import { MetricsState, emptyMetrics, recordSwipe, medianDecisionMs, rollbackRate } from '../core/metrics';
+import { MetricsState, emptyMetrics, recordSwipe, medianDecisionMs, rollbackRate, capEvents, MetricsCap } from '../core/metrics';
 // 会话模型（product：没有认领动作，改为"指定张数 → 抽样 → 刷完问是否继续"）。
 // 本页**消费**上一页存下的会话：cursor 是位置的唯一真相，advance 是唯一的"刷过一张"操作，
 // isSessionDone 定义完成态，currentPhotoId 回答"当前该刷哪张"。
@@ -54,6 +55,11 @@ struct SwipePage {
   // 手动选地点（本批新增）：上墙时若这张照片没有地点，问用户省→市→县并记下来。
   // 同样声明在 ctx 之后 —— 它内部也会 new LocationIndex(ctx)。
   private pStore: PlaceStore = new PlaceStore(this.ctx);
+  // 指标落盘（Task 22）。它必须声明在 ctx 之后，理由同上。
+  // 「已淘汰条数」单独存：它是"这份统计覆盖了多少历史"的答案，页面要显示它
+  //（淘汰会改变统计口径，见 core/metrics.ts 的 MAX_METRIC_EVENTS）。
+  private mStore: MetricsStore = new MetricsStore(this.ctx);
+  private metricsDropped: number = 0;
   // ── 进行中的上墙请求（见 beginWall）─────────────────────────────────────────
   // 上墙流程是**异步**的（要先 awaitIdle 确认这张到底有没有 GPS），而卡片按钮在等待期间
   // 仍可点。若不管，同一张被点两次「上墙」就会弹两个选择器（第二个叠在第一个上），
@@ -67,6 +73,9 @@ struct SwipePage {
   // Task 7 的「手感挺好」是在无落盘时测的，加落盘后必须把 I/O 从每决策 2 次压到每秒至多 1 次。
   private saveTimer: number = -1;
   private pendingSave: boolean = false;
+  // 指标自己的脏标记（**不复用** pendingSave）：一次纯回弹/纯翻页没有决策要写，
+  // 不该让 flushSave 去全量重写 decisions.json（与 scheduleSeenSave 同理）。
+  private metricsDirty: boolean = false;
   private readonly SAVE_DEBOUNCE_MS: number = 1000;
 
   aboutToAppear(): void {
@@ -101,6 +110,16 @@ struct SwipePage {
     //   2) handle() 要拿 already 里的 deferCount / decidedAt 才保得住既有状态；
     //   3) navigate(1)（返回上一张）会 decisions.delete + dStore.remove，内存与盘必须同源。
     this.decisions = this.dStore.loadAll();
+    // 指标也必须从**盘上的历史**起步（Task 22），理由与上一行完全一致：
+    //   1) flushSave() 的指标落盘是**全量写**，空数组起步会把之前刷过的全部事件在首次落盘时抹掉
+    //      —— 那正是本批要修的问题（指标要能从历史数据算，而不是只能当场看）；
+    //   2) 顶部那行读数（中位 / 回弹）本来就是这个状态的派生量，不一起恢复的话，
+    //      进页面时会先显示 0，与本页内存里真实的历史不一致。
+    const loadedMetrics: MetricsLoad = this.mStore.load();
+    this.metrics = loadedMetrics.state;
+    this.metricsDropped = loadedMetrics.dropped;
+    this.medianMs = Math.round(medianDecisionMs(this.metrics));
+    this.rollbackPct = Math.round(rollbackRate(this.metrics) * 100);
     this.shownAt = Date.now();
   }
 
@@ -133,6 +152,20 @@ struct SwipePage {
   }
 
   /**
+   * 指标的落盘也挂**同一个** 1 秒窗口（Task 22），同样**不**置 pendingSave（理由同上）。
+   *
+   * 本方法是"指标不在热路径上做 IO"的全部实现，两行都不碰盘：
+   *   · `metricsDirty = true` 只置一个布尔；
+   *   · `armSaveTimer()` 里 `if (this.saveTimer === -1)` 才 `setTimeout` —— 已有排程时不重置，
+   *     所以它是**合并窗口**（连滑期间每秒正好落一次盘），而不是会把落盘无限推迟的尾部防抖。
+   * 真正的 `mStore.save()` 只在 flushSave() 里调用（全项目唯一调用点，见那里的注释）。
+   */
+  private scheduleMetricsSave(): void {
+    this.metricsDirty = true;
+    this.armSaveTimer();
+  }
+
+  /**
    * 开表。关键：只在「还没有排程」时才开 —— 这是合并窗口（throttle），不是纯尾部防抖。
    * 若每次都 clearTimeout 再重开（纯尾部防抖），连续快滑（间隔 < 1s）会把落盘无限推迟：
    * 一路连滑 30 张期间一次都不写，此刻被杀丢的就不是「1 秒内的决策」而是整段连滑，
@@ -156,6 +189,15 @@ struct SwipePage {
     // 「看过」有自己的脏标记与独立文件（seen.json），只是共用这个窗口与页面退出的时机。
     // 它未脏时内部直接返回，所以这里不必再判一次。
     this.sStore.flush();
+    // 指标同理（自己一个文件 metrics.json、自己一个脏标记）。这段是**全项目唯一**的指标写盘点：
+    // 它只被 armSaveTimer 的定时器回调、aboutToDisappear、onPageHide 三条收尾路径触达，
+    // 刷卡热路径（handle / goTo / putDecision）一次都到不了这里 —— 这就是"不每张都写盘"的证据。
+    if (this.metricsDirty) {
+      this.metricsDirty = false;
+      // 前提：this.metrics 自 aboutToAppear 起就持有盘上原有的全部事件（那里是整体赋值），
+      // 否则这次「全量写」会把之前刷过的指标抹掉。
+      this.mStore.save(this.metrics, this.metricsDropped);
+    }
   }
 
   build() {
@@ -324,6 +366,17 @@ struct SwipePage {
       photoId: photoId, shownAt: this.shownAt, decidedAt: now,
       action: action, rolledBack: rolledBack
     });
+    // 容量上限（Task 22）：只在**真的淘汰了**的时候才换引用 —— 未超上限时 capEvents 原样返回
+    // **同一个数组**（不拷贝），所以这一行在热路径上的成本就是一次比较。
+    // 淘汰把窗口向前滚动，淘汰条数累加后在「使用统计」页如实显示（见 core/metrics.ts）。
+    const capped: MetricsCap = capEvents(this.metrics.events);
+    if (capped.dropped > 0) {
+      this.metrics = { events: capped.events };
+      this.metricsDropped = this.metricsDropped + capped.dropped;
+    }
+    // 只置脏 + 开表，**不落盘**（每张都写盘是 UI 线程上的全量同步 I/O）。
+    // 放在回弹早退**之前**：回弹事件是回弹率的分子，它同样必须被记下来。
+    this.scheduleMetricsSave();
     this.medianMs = Math.round(medianDecisionMs(this.metrics));
     this.rollbackPct = Math.round(rollbackRate(this.metrics) * 100);
 

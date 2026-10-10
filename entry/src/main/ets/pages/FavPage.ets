@@ -29,6 +29,20 @@ struct FavPage {
         .margin({ bottom: 12 })
         .onClick(() => { router.pushUrl({ url: 'pages/WallPage' }); })
 
+      // 使用统计（spec §5.3 的三条验收指标）。入口选在本页的理由：
+      //   1) 语义同类 —— 本页是"回头看看我攒下的东西"（收藏 / 地图墙），统计是同一类只读看板，
+      //      放进首页（那是"开一局"的动作页）会让主流程的按钮越堆越多；
+      //   2) **读数最新** —— 本页只能从刷照片页的顶部「收藏」按钮进来，而 router 跳转会让
+      //      SwipePage 触发 onPageHide → flushSave()，指标在跳转的同一刻落盘，
+      //      所以从这里进统计页读到的一定包含当前这一局刚刷出来的全部事件（不会差一个 1 秒窗口）。
+      // 只读看板放在收藏页、与"看地图墙"并列，也免得用户以为它是个会改数据的开关。
+      Button('使用统计')
+        .fontSize(14)
+        .backgroundColor('#5B6673')
+        .width('90%')
+        .margin({ bottom: 12 })
+        .onClick(() => { router.pushUrl({ url: 'pages/StatsPage' }); })
+
       if (this.faved.length === 0) {
         // 空状态：一张都没收藏时不留一片空白，顺便说明收藏从哪来
         Text('还没有收藏。右滑一张照片就会把它收进这里，收藏后可以挂上墙。')
