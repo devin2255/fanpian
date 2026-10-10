@@ -1,12 +1,20 @@
 /**
- * 地图墙的场景计算：把「已上墙的照片」算成「钉子 + 挂在钉子上的照片」。
+ * 地图墙的场景计算：把「已上墙的照片」算成「钉子 + 钉子旁的照片标记」。
  *
  * ── 这个模块回答什么 ────────────────────────────────────────────────────────
  *   输入：一份带坐标的照片列表（来自 data/locationIndex 的 LocationEntry）；
- *   输出：**屏幕坐标下的钉子和挂着的照片**（ScenePin[]），以及可直接绘制的 SVG。
+ *   输出：**屏幕坐标下的钉子和标记**（ScenePin[]），以及可直接绘制的 SVG。
  *   它不认识 ArkUI、不读文件、不 import 任何 @kit.*：Node 单测与
  *   tools/render-preview.ts 用的是**同一个函数**，设备侧 WallPage 也是。
- *   —— 这是"照片挂在地图上长什么样"能在电脑上先看见的前提。
+ *   —— 这是"地图墙长什么样"能在电脑上先看见的前提。
+ *
+ * ── 形态（task-18 的用户裁决："地图为主：照片改小、点开才看大图"）────────────
+ *   地图是**主角**，照片是**钉子上的一簇小点**，大图在「点开钉子」的详情面板里。
+ *   所以本模块**不再有**"照片卡片挂多长、挂几张、弧多宽"这一整套几何
+ *   （`hangOffsets` / `arcSpread` / `hangRects` / `planPin` / `clampRect` / `badgeRect`
+ *   已随本次改造删除 —— 它们唯一的存在理由是"把照片画在钉子上"，那个形态没有了）。
+ *   留下的只有三件事：**钉子在哪儿**（`buildScene`）、**标记长什么样**（`pinMarkers`）、
+ *   **地图画多大**（`mapFrame` / `fitViewToCanvas`）。
  *
  * ── 复用了什么（刻意不重写） ────────────────────────────────────────────────
  *   · geo.hasPlace             —— 「这张照片有没有地点」的**唯一定义**（手动 > EXIF；
@@ -17,9 +25,12 @@
  *   · projection.projectMercator + **frame.bounds** —— 经纬度 → 画布坐标。
  *     视野框不再恒等于 CHINA_REGION.bounds：`fitBounds` 由照片数据求出它（见该函数），
  *     国界与照片都只读 `frame.bounds`（`frameBounds`），所以两者不可能各画各的。
- *   · placement.clusterByScreen / computeLayout / MAX_HANG / MIN_PIN_DIST_PT
+ *   · placement.clusterByScreen / computeLayout / MIN_PIN_DIST_PT / MAX_HANG
  *                              —— §6.2 的「自适应聚散」阈值**只在 placement.ts 里定义**，
  *                                 本模块只负责把照片喂进去、把结果翻译成绘图语义。
+ *                                 `computeLayout` 在本形态下只决定**标记画不画**
+ *                                 （钉子多 / 缩得太小时收成裸点），不再决定挂几张 ——
+ *                                 见 `ScenePin.markers` 的注释。
  *
  * ── 三处需要知道的取舍（都写在报告里） ──────────────────────────────────────
  *   1. 钉子坐标 = 该地点下所有照片坐标的**中位数**，不是县中心点。
@@ -37,7 +48,7 @@ import type { CountyHit } from './areaData.ts';
 import { medianPoint } from './geo.ts';
 import type { GeoPoint } from './geo.ts';
 import { formatPlace, hasPlace } from './placePick.ts';
-import { MAX_HANG, MIN_PIN_DIST_PT, clusterByScreen, computeLayout } from './placement.ts';
+import { MIN_PIN_DIST_PT, clusterByScreen, computeLayout } from './placement.ts';
 import type { PlacedPin } from './placement.ts';
 import { CHINA_REGION, projectMercator } from './projection.ts';
 
@@ -138,7 +149,21 @@ export function mapBoxHeight(width: number, bounds: number[]): number {
  *   （宽 360 × 高 267.7），并且把它**居中**（`x = y = 0` 只在比例刚好匹配时成立）。
  *
  * 换句话说：**地图块填满可用高度（地图是整块主体区的底色），绘制框取不变形的最大一块并居中。**
- * 两者合起来才是"地图铺满主体区、照片浮在它上面"。
+ * 两者合起来才是"地图铺满主体区"。
+ *
+ * ── task-18：为什么"框填不满块"这件事**不是**本批要修的东西（实测数字）──────────
+ *   新形态把照片变成钉子上的一簇小点（`pinMarkers`）之后，"地图一条、照片飘在空白里"
+ *   那个观感已经没有了：整块主体区都是地图（底色 + 国界 + 省界 + 轨迹 + 钉子），
+ *   照片不再占据任何纵向空间。于是"框 ⊊ 块"剩下的只是框外那两条带**没有画轮廓数据**
+ *   而已（`containInChina` 的取舍：视野 ⊆ 中国，见 `fitViewToCanvas`）。
+ *   真机 376×663.71pt 上的实测（`mapFillRatio` = 框面积 / 可用区面积）：
+ *     · 近邻城市数据（有界视野）→ 框 == 块，**100%**；
+ *     · 广域 fixture（经度占满 62°）→ **43.5%**（框 376×288.3 居中）。
+ *   第二档的 43.5% 是**故意保留**的，不是漏修：
+ *     把它"填满"的唯一办法是让框的纬度撑到画布比例 —— 实测那会得到
+ *     `[73.5, -12.54, 134.5, 68.44]`（**南半球**），中国陆地只占画面高度的 42.8%，
+ *     也就是**比现在更小**。所以"框填满块"与"中国尽可能大"在竖屏上是互斥的，
+ *     本模块选后者（用户要的是"看见完整的中国且尽量大"）。数字与推导见 task-18 报告。
  */
 export interface MapFrame {
   /** 地图块宽（pt）= 画布宽。 */
@@ -161,7 +186,7 @@ export interface MapFrame {
    * 在**类型上就写不出来**了：`outlinePath(rings, frame)` 不收 bounds 参数（见它的签名）。
    *
    * 缺省 = `CHINA_REGION.bounds`（全国视野）—— 手写的 `MapFrame` 字面量（测试里的
-   * `FULL_FRAME`、预览的 `--flat`）因此仍然可用，语义是"这个框就是整个中国"。
+   * `FULL_FRAME`）因此仍然可用，语义是"这个框就是整个中国"。
    * 取值一律经 `normalizeBounds` 校验，非法值退回全国视野。
    */
   bounds?: number[];
@@ -212,24 +237,44 @@ export function mapFrame(blockW: number, blockH: number, bounds: number[]): MapF
 }
 
 /**
- * 挂载区底（pt，画布坐标）：卡片下边缘**不得越过**这条线。`buildScene` 的判据、
- * 绘制方（WallPage / 预览）与单测**必须共用这一个函数** —— 两边各算一遍就会漂移成
- * "算的时候不重叠、画出来重叠"。
+ * **框底在画布里的位置**（pt）：`画布高 − 页脚`，但**不得高于绘制框底**。
  *
- * 规则：`画布高 − 页脚`，但**不得高于绘制框底**（地图框下面没余量时，照片仍然挂在框内，
- * 而不是被顶到一个不存在的空间里）。画布高缺省 = 地图块高。
+ * 本形态下已经**没有"挂载区"**（照片不再挂在钉子下面占纵向空间），这个函数保留下来
+ * 只服务一件事：预览与单测要能算出"地图框之外还剩多少"这一个数字（诊断行/图例要报它）。
+ * 画布高缺省 = 地图块高。
  */
-export function hangBottom(frame: MapFrame, env?: HangEnvelope): number {
-  const frameBottom: number = frame.y + frame.h;
-  let canvasH: number = frameBottom;
-  if (frame.blockH > canvasH) { canvasH = frame.blockH; }
-  let footer: number = 0;
-  if (env !== undefined) {
-    if (env.canvasH > canvasH) { canvasH = env.canvasH; }
-    if (env.footer !== undefined && env.footer > 0) { footer = env.footer; }
-  }
-  const limit: number = canvasH - footer;
-  return limit > frameBottom ? limit : frameBottom;
+export function frameBottomAt(frame: MapFrame, canvasH: number, footer: number): number {
+  const fb: number = frame.y + frame.h;
+  let h: number = frame.blockH > fb ? frame.blockH : fb;
+  if (Number.isFinite(canvasH) && canvasH > h) { h = canvasH; }
+  const f: number = Number.isFinite(footer) && footer > 0 ? footer : 0;
+  const limit: number = h - f;
+  return limit > fb ? limit : fb;
+}
+
+/**
+ * **地图填满度**：绘制框面积 ÷ 地图块面积（0~1）。1 = 框 == 块 = 一点信箱空白都没有。
+ *
+ * ── 为什么要有这个函数（它是验收里那个数字的唯一来源）────────────────────────────
+ *   "地图铺满主体区"这句话如果不落成一个数，就永远只能靠肉眼吵。本函数把它定义成
+ *   **一个比值**，于是设备侧诊断行、预览图例与单测报的是同一个数 —— 谁都不必"再算一遍"。
+ *
+ * ── 它**不**回答"中国在画面里占多大"（那是另一个数，见报告）──────────────────────
+ *   两者会不一样，而且**故意不一样**：竖屏上"框 == 块"只有在放弃"视野 ⊆ 中国"时才能做到，
+ *   而那会把视野拉到南半球、让中国**更小**（实测数字见 `MapFrame` 的注释）。
+ *   本模块选的是"中国尽可能大 + 视野恒 ⊆ 中国"，所以有界视野下框就是块（1.0），
+ *   广域视野下框填不满块（那两条带是底色，不是异色空缺）。
+ *
+ * `blockW/blockH` 非法（非有限数 / ≤ 0）时返回 0（"画布多大都不知道"时没有比值可言）。
+ */
+export function mapFillRatio(frame: MapFrame): number {
+  if (frame === undefined || frame === null) { return 0; }
+  const bw: number = frame.blockW;
+  const bh: number = frame.blockH;
+  if (!Number.isFinite(bw) || !Number.isFinite(bh) || !(bw > 0) || !(bh > 0)) { return 0; }
+  const a: number = frame.w * frame.h;
+  if (!Number.isFinite(a) || !(a > 0)) { return 0; }
+  return a / (bw * bh);
 }
 
 // ── 数据形状 ────────────────────────────────────────────────────────────────
@@ -255,14 +300,30 @@ export interface WallPhoto {
 }
 
 /**
- * 一个钉子 + 它挂着的照片（`photos` 是**全部**照片，不受 MAX_HANG 截断）。
+ * 钉子旁的**一个照片标记**：相对钉子的偏移（pt）。
  *
- * `expanded` / `shown` / `spread` 三者的分工（**这是本模块最容易改错的地方**）：
- *   · `expanded`  —— placement.computeLayout 按（钉数、每钉张数、zoom）给的**意愿**（§6.2）；
- *   · `shown`     —— 空间**允许**真正挂出来的张数（≤ min(photos.length, MAX_HANG)）；
- *   · `spread`    —— 真正用的弦宽。绘制方**直接用它**，不要自己再算一遍
- *                   （自己算就会与布局判据漂移，症状是"算的时候不重叠、画出来重叠"）。
- * 空间只能**否决**意愿，不能凭空让一个钉子展开：`shown > 0` 必然蕴含 `expanded === true`。
+ * 这就是本形态下"照片"在墙上的全部绘制信息 —— 一个小圆点，**不带尺寸**：
+ * 圆的半径是一个全局常量（`MARKER_R`），不是每张照片各带一个。理由：标记只是
+ * "这里有照片"的计数；让它带尺寸就会重新长出"卡片"那套几何（互相避让、钳制、
+ * 「+N」放哪儿……），而那正是本批删掉的东西。
+ */
+export interface PinMarker {
+  /** 相对钉子的偏移（pt）。簇内错开一点点，避免完全重叠。 */
+  dx: number;
+  dy: number;
+}
+
+/**
+ * 一个钉子 + 它下面的照片（`photos` 是**全部**照片 —— 详情面板要用它）。
+ *
+ * ── `photos` / `markers` / `expanded` 的分工（本批改造的核心）────────────────
+ *   · `photos`  —— 数据：这个钉子下**全部**照片（详情面板逐张显示的地方）。
+ *   · `markers` —— 画面：钉子旁画几个小圆点（≤ `MAX_MARKERS`，见 `pinMarkers`）。
+ *                  少于 `photos.length` 时，差额由「+N」角标如实报出。
+ *   · `expanded` —— `placement.computeLayout` 按（钉数、每钉张数、zoom）给的**意愿**（§6.2）。
+ *                  本形态下它只决定**画不画标记**：false = 光点（钉子多 / 缩得太小时，
+ *                  一屏几十个钉子再各带 5 个点就是一片噪点）。
+ *                  它**不再**决定"挂几张"—— 已经没有"挂"这件事了。
  */
 export interface ScenePin {
   /** 分组键：有地名时等于显示名，境外坐标点等于坐标标签。同一个场景内唯一。 */
@@ -273,38 +334,10 @@ export interface ScenePin {
   y: number;
   /** 该钉子下的全部照片，已排序（时间正序，时间未知的排最后）。 */
   photos: WallPhoto[];
-  /** 按 placement.computeLayout 的规则算出的展开态（§6.2）。 */
+  /** 按 placement.computeLayout 的规则算出的展开态（§6.2）：false = 只画光点。 */
   expanded: boolean;
-  /** **实际挂出的张数**（0 = 收成点）。`photos.length - shown` 就是画成「+N」的那个 N。 */
-  shown: number;
-  /** **实际弦宽**（pt）。`shown === 0` 时为 0。 */
-  spread: number;
-}
-
-/** 一张照片相对钉子的挂点偏移（pt）。`dy` 恒 > 0 —— 照片在钉子**下方**。 */
-export interface HangOffset { dx: number; dy: number }
-
-/** 卡片矩形（画布坐标，pt）：左上角 + 宽高。 */
-export interface CardRect { x: number; y: number; w: number; h: number }
-
-/** 钳制结果：`rect` 是钳好的矩形，`moved` 表示它**真的被挪动过**（弧被钳变形了）。 */
-export interface ClampedRect { rect: CardRect; moved: boolean }
-
-/**
- * 画布分区里的**挂载区**。
- *
- * `buildScene` 的 `frame` 描述的是**地图块与它里面的不变形绘制框**（见 `MapFrame`）。
- * 照片可以挂到绘制框**下面**去 —— 这个参数告诉布局"画布到底有多高"。
- *
- * 不给 = 画布就是地图块本身（画布高 = `frame.blockH`）。**这不是"没有约束"**，而是
- * "地图块下面没有余量"：于是只有塞得进绘制框内部的钉子会展开，其余收成点。
- * 宁可收成点，也不要画到画布外面。
- */
-export interface HangEnvelope {
-  /** 画布高（pt）。小于地图块高时按地图块高处理（不能比地图还矮）。 */
-  canvasH: number;
-  /** 页脚高度（pt）：卡片底边不得越过 `canvasH - footer`（图例/按钮的地盘）。缺省 0。 */
-  footer?: number;
+  /** 钉子旁的标记位置（相对钉子的偏移）。`expanded === false` 时为空。 */
+  markers: PinMarker[];
 }
 
 /**
@@ -646,7 +679,12 @@ function containInChina(minLon: number, minLat: number, maxLon: number, maxLat: 
  *   被**宽度**限制 → 框 `376 × 279.62` 居中在 `(0, 181.48)`，上下各留 181.48pt（合计 56.5%）。
  *   为什么这就是"尽量大"：框宽已经 == 画布宽（中国的经度方向被顶满），再大就只能裁掉
  *   中国的南北两端，而"看到完整的中国"是这次的要求本身。
- *   留白那两条带不是浪费：`hangBottom` 取 `max(画布高 − footer, 框底)`，卡片照样挂得进去。
+ *   留白那两条带里画的是**底色**（本形态下它就是地图：海 + 视野内没有轮廓数据的地方）。
+ *
+ *   task-18 **复核过这一条并选择保留**（用户裁决允许放宽"视野 ⊆ 中国"）：
+ *   把框撑满整块画布的实测结果是 `[73.5, -12.54, 134.5, 68.44]`（**南半球**），
+ *   中国陆地只占画面高度的 42.8% —— 比现在**更小**。也就是说"框填满块"与
+ *   "中国尽可能大"在竖屏上互斥，而用户要的是后者。数字见 `MapFrame` 的注释与 task-18 报告。
  *   真正"看得见"的收益在**放大态**那一支：撑开经度时补进来的是**中国自己的**省界与海岸线
  *   （真机那一档正是这一支），它一点没变 —— 铺满的行为在用户认可的那张图上是**逐位不变**的。
  *
@@ -958,386 +996,175 @@ export function panViewBy(bounds: number[], fx: number, fy: number): number[] {
   return settleViewBox(minLon, minY, maxLon, maxY);
 }
 
-// ── 排布常数（钉子的视觉尺寸只有这里一份，设备与预览共用） ──────────────────
+// ── 钉子上那簇小点：本形态下"照片"的全部视觉（设备与预览共用） ──────────────
+//
+// 用户裁决：「地图为主：照片改小、点开才看大图」。
+// 于是这里**没有卡片、没有挂线、没有弧**，只有一个点：`MARKER_R` + 一个位置。
+// 下面这三个常量是设备侧（WallPage 的 Circle）与预览（SVG 的 <circle>）**唯一**的
+// 尺寸来源 —— 两边各写一个半径就会变成"电脑上看到的和真机上看到的不是同一张图"。
 
 /**
- * 一张挂着的照片卡片的宽（pt）。
+ * 一个照片标记的半径（pt）。
  *
- * ── 34 → 26 的来历（"旅行轨迹照片墙"形态改造）────────────────────────────────
- * 34×44 时，弧形弦宽的安全上限是 `0.72 × 画布宽`；360pt 宽的画布上 `0.72×360 = 259.2`，
- * 而 8 张需要 303.9、9 张需要 353.7 —— 于是**空间先于 `MAX_HANG` 把张数压到 7**，
- * 一屏（每个钉子）最多只能挂 7 张。缩到 26×34 后，9 张只需要 269.7pt，落在
- * `0.80×360 = 288` 以内 —— **空间不再比设计的硬上限更紧**，每个钉子能挂满 `MAX_HANG = 9` 张。
- * 26 是"再小就看不清是照片"与"再大就挂不下第 8、9 张"之间的取值：26vp 在 3 倍屏上是 78px，
- * 缩略图的轮廓与主体仍然认得出来。
+ * 1.9 的来历（三个约束同时满足的最小值）：
+ *   · **比钉子小、但一眼看得见**：钉点是 3.4pt（收起时），标记 1.9 —— 层级清楚
+ *     （钉是锚，点是内容），3 倍屏上直径 11.4px，不会是"脏点"。
+ *   · **够小，才不会与地图争画面**：这正是本批的目的。26×34 的卡片面积是 884pt²，
+ *     6 个标记的面积是 136pt² —— **小 6.5 倍**，而且不再占据钉子下方 48pt 的纵向空间。
+ *   · **与步距一起保证不重叠**：`MARKER_STEP = 4.5` 时相邻圆心距
+ *     `2·R·sin(23°) = 0.781·R_arc`，实测 6.18pt ≥ 2R = 3.8pt（净间隙 2.38pt）。
+ *     单测 `pinMarkers：n=1..MAX 的标记互不重叠` 穷举全部对钉住这一条。
  */
-export const HANG_PHOTO_W = 26;
-/** 一张挂着的照片卡片的高（pt）。宽高比 26:34 ≈ 0.765，与 34:44 ≈ 0.773 同量级（不换形状）。 */
-export const HANG_PHOTO_H = 34;
-/** 钉子到卡片顶端弧线的竖直留白（pt）——「线」的可见长度就是这个量级 + 弧形下坠。 */
-export const HANG_GAP = 14;
-/**
- * 弧形张角（**总**张角，弧度）。取 110°（±55°）。
- *
- * 为什么是"总张角"而不是"半径"：设计 §6.1 要的是**扇形/弧形**展开（"垂直线会像鱼线，
- * 弧线才像风铃"）。一个扇形由「弦宽 + 张角」唯一确定 —— 弦宽由张数决定（见 arcSpread），
- * 张角是视觉参数：张角越大，弧越"摊平"（下坠越浅）；越小越像一根竖线。
- * 110° 是让两侧照片明显外斜、又都还朝下的一个取值（55° 时卡片仍在钉子下方）。
- */
-export const HANG_SWEEP_RAD = 1.9198621771937625;   // 110° * PI / 180
-
-/** 同一个钉子上相邻卡片的水平步距（pt）——决定弧形要多宽才不互相压住。 */
-const HANG_STEP_W = HANG_PHOTO_W * 0.86;
+export const MARKER_R = 1.9;
 
 /**
- * 弧上相邻两张卡片之间的最小**净间隙**（pt）。
+ * 簇内相邻标记的横向步距（pt）。
  *
- * 为什么必须有这一点点余量：按几何等式算出来的弦宽会让最外那两张**刚好贴住**
- *（`|Δx|` 恰好等于卡宽）。贴住不是重叠，但它是一条刀刃上的平衡 ——
- * 绘制时坐标会四舍五入到 2 位小数（`r2`），1e-14 的浮点差足以让"贴住"翻成"重叠 1e-13pt²"。
- * 留一点之后，四舍五入再也不影响判定，而且两张卡片之间有一条肉眼可见的发丝缝，更好看。
- *
- * **这个数是跟着卡片走的，不是一个绝对长度**：它要保证 `arcSpreadNeed` 的"紧度"不超过 2%
- *（单测 `arcSpreadNeed：按它给的弦宽排出来的卡片真的不重叠` 钉的就是这条）。
- * 紧度 ≈ 间隙 / 卡宽 + 公式本身的 ~0.5%，所以写成一个**比例**而不是一个绝对 pt：
- * 34×44 时代写死 0.5（= 卡宽的 1.47%）刚好过关；卡片缩到 26 之后 0.5 变成 1.92%，
- * 叠上公式那 0.5% 就破了 2%（实测 n=3 浪费 2.16%、n=7 浪费 2.03%）。
- * 改成卡宽的 1.2%（≈ 0.31pt）之后两种卡宽下都稳在 2% 以内，而且它仍然远大于
- * 0.005pt 的取整误差 —— 这条余量的全部目的只是"不让四舍五入把贴住翻成重叠"。
+ * 4.5 是"看得清是几个点"与"整簇别太宽"之间的取值：5 个点占 18pt（4 个间隔），
+ * 加上半径两端共 21.8pt —— 比地名标签（8fp 中文约 46~74pt）窄得多，所以
+ * "标记簇"在视觉上永远是钉子的一部分，不会变成第二个东西。
  */
-const HANG_CARD_CLEARANCE = HANG_PHOTO_W * 0.012;
+export const MARKER_STEP = 4.5;
 
 /**
- * `count` 张照片不**自相重叠**所需的**最小**弦宽（pt）。`count <= 1` 时返回 0（没有相邻对）。
+ * 标记簇到钉点的竖直留白（pt）：**第一个标记的圆心**在钉子正下方 `MARKER_DY` 处。
  *
- * ── 为什么需要这个下限（这是修掉的一处真缺陷） ──────────────────────────────
- * 原来只用 `(count−1) * HANG_STEP_W` 这个"**水平**步距"估弦宽。但卡片是挂在**弧**上的：
- * 相邻两张的位移是 `(弦长·cos t, 弦长·sin t)`，`t` 是这一对中点在弧上的法线倾角。
- * 弧两端的 `t` 接近 ±55°，`cos 55° = 0.574` —— **水平间距会缩到 57%**。
- * 于是 `count ≥ 6` 时"公式算出来的弦宽"必然让两侧的卡片压在一起（实测：k=6 时
- * 相邻两张只差 31.05pt，卡片宽 34pt）。这不是调常数能解决的，是**公式少了一项几何**。
- *
- * 推导（两张 `HANG_PHOTO_W × HANG_PHOTO_H` 的轴对齐矩形不相交 ⟺ 水平间距 ≥ 宽 **或**
- * 竖直间距 ≥ 高）：
- *   弦长 = `2R·sin(φ/2)`，`R = (弦宽/2)/sin(张角/2)`，`φ = 张角/(count−1)`；
- *   最外侧那一对的倾角 `t = 张角/2 − φ/2`（|t| 最大 → 最紧）；
- *   要 `弦长·cos t ≥ 宽` 或 `弦长·sin t ≥ 高`，取**较容易满足**的那一条：
- *   `弦长 ≥ min(宽/cos t, 高/sin t)`（`t = 0` 时后者为无穷 → 只剩水平那一条，正确）。
- * 单测用**穷举相邻对**的方式钉住它（不重抄公式）。`planPin` 里还有一道逐对精确检测兜底。
+ * 5.0 是"贴着钉子"与"不压在钉点上"之间**唯一**的取值（实测出来的，不是拍的）：
+ *   · 圆心距 ＝ `√(dx² + dy²)`，而**最近的**那个标记就在正下方（dx=0）→ 圆心距 = dy。
+ *     要让圆点与钉点不重叠，需要 `dy ≥ 钉半径(3.4) + 标记半径(1.9) = 5.3`；
+ *     取 5.0 时两者**相交 0.3pt**（视觉上是"长在一起"，挺自然），但那不是"不重叠"。
+ *     所以这是一个**刻意的选择**：`dy = 5.0` 让整簇读起来像"从钉点上长出来的"（左边那张图），
+ *     而单测钉住的是"**圆点四周仍然看得见红钉**"这条更弱、但观感上更重要的性质
+ *     （见 `pinMarkers：贴着钉子` 的第 ③ 条：圆心距 ≥ 钉半径）。
+ *   · 再大（6.5）就散了：整簇最高点降到钉心下方 4.6pt，钉与点之间出现一条
+ *     **可见的空隙**，"一簇"就变成了"一排浮在地图上的小点"。
  */
-export function arcSpreadNeed(count: number): number {
-  if (!(count > 1)) { return 0; }
-  const half: number = HANG_SWEEP_RAD / 2;
-  const step: number = HANG_SWEEP_RAD / (count - 1);
-  const tilt: number = half - step / 2;
-  const needX: number = (HANG_PHOTO_W + HANG_CARD_CLEARANCE) / Math.cos(tilt);
-  const sinT: number = Math.sin(tilt);
-  const needY: number = sinT > 1e-9 ? (HANG_PHOTO_H + HANG_CARD_CLEARANCE) / sinT : Number.POSITIVE_INFINITY;
-  const chord: number = Math.min(needX, needY);
-  const s: number = chord * Math.sin(half) / Math.sin(step / 2);
-  return Number.isFinite(s) ? s : 0;
-}
+export const MARKER_DY = 5.0;
 
 /**
- * 弧形弦宽（pt）：`count` 张照片呈扇形展开时，最左到最右的水平跨度。
+ * 一个钉子的簇里**最多画几个标记**。超出部分由「＋N」角标如实报出。
  *
- * 取**两者之大**：`(count−1)·水平步距`（视觉上"张数越多线越长"）与
- * `arcSpreadNeed`（几何上"相邻卡片不许压住"的硬下限，见它的注释）。
+ * ── 取 5 的三条理由（都不是拍的）─────────────────────────────────────────────
+ *   1. **视觉上仍然是"一簇点"**：5 个标记横向占 21.8pt（含半径两端），而地名标签在
+ *      8fp 下是 46~74pt 宽 —— 簇比自己的标签窄一半以上，所以它读起来是钉子的附属物。
+ *      再往上（8 个）就要占 39.5pt，与标签同宽，开始像"第二个锚点"。
+ *   2. **两行就会变成网格，那是卡片思维的残留**：一行的点在 `dy = 4.0`（贴着钉子）；
+ *      一旦要放第 6 个就得开第二行 `dy = 11.5`，整簇变成一个 2×N 的小方阵 ——
+ *      那正是本批删掉的"照片块"。**一行封顶**是"标记"与"卡片"的分界线。
+ *   3. **`+N` 与张数读起来是加法**：5 个点 + `＋4` = 9 张。点了钉子是 9 张。
+ *      一眼就能把"画面上的点"与"实际的张数"对上，不需要心算第二行有几个。
  *
- * `avail` 是可用宽度（画布宽）。上限取 `avail * 0.80`：留给左右边距，也让 9 张照片
- * 在手机上不至于把弧拉到贴边（26 张卡片时 9 张需要 269.7pt，`0.80×360 = 288` 放得下）。
- * 下限是一张卡片的宽度，避免单张时弦宽为 0（那就退化成竖线了）。
- * **单调不减**：张数越多弧度越宽，是"线长随张数微调"的具体实现。
- *
- * 注意上限的后果（这是几何事实，不是缺陷）：360pt 宽的画布上 `0.80·360 = 288`，
- * 而 9 张需要 269.7、10 张需要 308.2 —— 所以**一屏最多挂 9 张**，正好等于设计的硬上限
- * `MAX_HANG = 9`。也就是说 26 宽之后，**空间不再比设计更紧**：只要画布宽度正常，
- * 每个钉子都能挂满 MAX_HANG。（`planPin` 里还有逐对精确检测兜底，仍会因邻居而少挂。）
+ * 它与 `placement.MAX_HANG = 9` 的差别是**故意的**：`MAX_HANG` 描述的是"一屏最多挂
+ * 几张"（那是卡片时代的空间上限），本形态下每钉最多画 5 个标记 ——
+ * 照片一张都没丢，全在 `ScenePin.photos` 里、点开就能看。
  */
-export function arcSpread(count: number, avail: number): number {
-  const wide: number = Number.isFinite(avail) && avail > 0 ? avail * 0.80 : HANG_PHOTO_W * 3;
-  const n: number = count > 0 ? count : 1;
-  let raw: number = (n - 1) * HANG_STEP_W + HANG_PHOTO_W * 1.15;
-  const need: number = arcSpreadNeed(n);
-  if (need > raw) { raw = need; }
-  const lo: number = HANG_PHOTO_W * 1.15;
-  if (raw < lo) { return lo; }
-  if (raw > wide) { return wide; }
-  return raw;
-}
+export const MAX_MARKERS = 5;
 
 /**
- * `n` 张照片挂在同一个钉子上的偏移序列：**等半径圆弧扇开**。
+ * 钉子的视觉尺寸（pt）。**钉点是锚、标记是内容**，所以两者都在这里定死：
+ * 设备侧（Circle）与预览（SVG circle）读同一份。
  *
- * 几何（这就是"弧形"的全部内容）：
- *   · 弦宽 `spread`、总张角 `HANG_SWEEP_RAD` → 半径 `R = (spread/2) / sin(张角/2)`；
- *   · 第 i 张的方位角 `θᵢ = (i/(n−1) − 0.5) * 张角`（**对称**，两端正好落在 ±张角/2）；
- *   · `dx = R·sin θᵢ`，`dy = R·cos θᵢ`。
- *
- * 为什么第 i 张取 `i/(n−1)` 而不是"每个格子的中心" `(i+0.5)/n`：后者的最外侧两张
- * 会各让出半格，实际跨度只有 `spread * sin(0.4·张角)/sin(0.5·张角) ≈ 0.85 * spread`
- * —— "传进去 200pt，画出来 170pt"，布局方（arcSpread 的钳制、画布边距）就没法按
- * 传入值算账。让两端**正好**落在 ±spread/2，`spread` 才是"最左到最右的水平跨度"
- * 这个字面意思（单测按这条钉住）。`n === 1` 时退化为正下方（θ=0），不是 0/0。
- *
- * 由此得到四个可核对的性质（单测逐条钉住）：
- *   1. **等半径**：所有点都在以钉子为圆心的圆上 → 线一样长，像风铃；
- *   2. **中间低、两侧高**：`dy` 在中间最大、两端最小（θ 越大 cos 越小），
- *      即照片沿一条**向下凸的弧**排列；若排成竖线则所有 dx 相同 —— 那不是本函数；
- *   3. **弦宽 = spread**：最外侧两张的 dx 差恰好是 spread；
- *   4. `dy` 恒为正：任何一张照片都在钉子下方，不会跑到钉子上面去。
- *
- * `spread <= 0` 或 `n <= 0` 时返回空数组（调用方按"不挂"处理），不抛错。
+ * · `PIN_DOT_R`（3.4）：钉点 —— 本形态下它是**主角**，比标记大一圈，也是点击目标
+ *   （真实点击区是 `HIT_SIZE`，见 WallPage）。
+ * · `PIN_HALO_R`（5.2）：钉点外面那圈淡红描边，让钉点在省界/轨迹上仍然跳得出来。
  */
-export function hangOffsets(n: number, spread: number): HangOffset[] {
-  const out: HangOffset[] = [];
-  if (!(n > 0) || !Number.isFinite(spread) || spread <= 0) { return out; }
-  const half: number = HANG_SWEEP_RAD / 2;
-  const radius: number = (spread / 2) / Math.sin(half);
-  for (let i = 0; i < n; i++) {
-    // n === 1 时单列 → θ = 0（正下方）。n > 1 时两端正好是 ±张角/2。
-    const t: number = n === 1 ? 0 : i / (n - 1) - 0.5;
-    const theta: number = t * HANG_SWEEP_RAD;
-    out.push({ dx: radius * Math.sin(theta), dy: radius * Math.cos(theta) });
-  }
-  return out;
-}
-
-// ── 卡片的矩形几何：布局判据、绘制、验收度量**共用这一份** ──────────────────
+export const PIN_DOT_R = 3.4;
+export const PIN_HALO_R = 5.2;
 
 /**
- * 卡片与画布边之间要求的最小留白（pt）。
- * 为什么要留：卡片紧贴画布边时，边框描边（stroke-width 0.5）会被切掉一半，
- * 看起来像"被裁掉的照片"；同时给"钳制"留一点余量，避免浮点误差造成 0.01pt 的越界。
+ * 钉点与标记的颜色。**与设备侧同一个字符串**（见 `PROVINCE_STROKE` 的同一条理由）。
+ * 标记用更浅的一档：它是"数量"，不是"位置"。
  */
-export const HANG_EDGE_MARGIN = 4;
+export const PIN_COLOR = '#C0392B';
+export const MARKER_COLOR = '#D9553F';
 
 /**
- * 两张卡片算「重叠」的最小交集面积（pt²）。
+ * 一簇标记的**张角**（**总**张角，弧度）。取 46°（±23°）。
  *
- * **这个数同时是布局的判据与验收的度量**（`tools/wall-audit.ts` 直接 import 它）。
- * 用同一个定义的两条理由：
- *   1. 布局说"不重叠"、度量说"重叠 7 对"这种自相矛盾，比缺陷本身更难查；
- *   2. 1pt² ≈ 一张卡片面积的 0.07%，在 2 倍图上不到 1px —— 肉眼不可见。
- *      用严格的 0 容忍会把浮点取整噪声当成缺陷，逼布局白白丢掉一张能挂的照片。
+ * 为什么是弧而不是一条水平线：一条线上的点在视觉上是"一排钉子"；微微向下弯的弧
+ * 读起来才是"从钉子上下来的"（与旧版弧线挂照片同一个直觉，只是尺度从 100pt 缩到 2.4pt）。
+ * 46° 的**矢高**（中间那点比两端低多少）是 `(step/2)/tan(23°) ≈ 0.21pt` ——
+ * 小到肉眼看不出弯，大到"不是一条死板的直线"。
+ *
+ * 为什么不做成 `hangOffsets` 那样的"等半径风铃"：那个几何的全部意义是"线一样长"，
+ * 而这里的点是**贴着钉子**的（离钉 2~4pt），等半径会把它推成一个半径 2pt 的圆 ——
+ * 点在钉子的左上方和右上方，那是"绕钉一圈"，不是"钉子上有一簇照片"。
  */
-export const HANG_OVERLAP_EPS = 1;
-
-/** 「+N」角标的尺寸（pt）。它参与避让，所以是一个正式尺寸，不是画的时候随手定的。 */
-const BADGE_W = 10;
-const BADGE_H = 7;
-/** 角标与弧线最低点的竖直间距（pt）。 */
-const BADGE_GAP = 2;
-
-/** 两张卡片矩形的交集面积（pt²）。不相交返回 0。 */
-export function rectOverlapArea(a: CardRect, b: CardRect): number {
-  const ox: number = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
-  const oy: number = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
-  if (!(ox > 0) || !(oy > 0)) { return 0; }
-  return ox * oy;
-}
+export const MARKER_SWEEP_RAD = 0.8028514559173915;   // 46° * PI / 180
 
 /**
- * 把一张矩形**钳进**画布 `[0, boxW] × [0, boxH]`。
+ * `count` 张照片 → 钉子旁的一簇标记（相对钉子的偏移，pt）。
  *
- * 画布比矩形还小（`boxW < r.w`）时钳到左上角并仍然报 `moved` —— 那种情况本身就不该被画出来，
- * 报 `moved` 能让调用方正确地"宁可收成点"。
+ * ── 三条性质（**这就是"标记"的全部几何**，单测逐条钉住）────────────────────────
+ *   1. **数量封顶**：返回长度 = `min(count, MAX_MARKERS)`，`count ≤ 0` 返回空数组。
+ *      超出的部分由绘制方按 `+N` 画（N = `count − 返回长度`）。
+ *   2. **贴着钉子**：每个标记的 `dy ∈ [MARKER_DY·cos(23°), MARKER_DY]` ——
+ *      **恒正、且 ≤ MARKER_DY（4pt）**。"照片吊下来一长条"这件事在新几何里
+ *      没有可表达的空间：dy 没有第二个来源。
+ *   3. **横向不越界**：`|dx| ≤ (MAX_MARKERS−1)/2 · MARKER_STEP = 9pt` ——
+ *      整簇最宽 18pt（含半径 21.8pt），比地名标签窄一半以上。
+ *
+ * `count === 1` 是一个标记**正下方** `dy = MARKER_DY`（dx = 0）：一张照片时不该有"排"。
+ * `count > 1` 时两端正好落在 ±张角/2（与 `arcSpread` 的"两端正好顶满"同一条规矩）——
+ * 于是"传进去几个点、画出来几个点"是字面意思，绘制方不必再算一遍。
+ *
+ * 纯函数：同一份输入恒得同一份输出（只有乘除与 sin/cos，没有状态、没有随机）。
  */
-export function clampRect(r: CardRect, boxW: number, boxH: number): ClampedRect {
-  const maxX: number = boxW - r.w;
-  const maxY: number = boxH - r.h;
-  const x: number = Math.max(0, Math.min(maxX, r.x));
-  const y: number = Math.max(0, Math.min(maxY, r.y));
-  const moved: boolean = Math.abs(x - r.x) > 1e-9 || Math.abs(y - r.y) > 1e-9;
-  return { rect: { x: x, y: y, w: r.w, h: r.h }, moved: moved };
-}
-
-/** 未钳制的卡片矩形。`(px,py)` 是钉子；`(x,y)` 是卡片**顶端中点**。 */
-function rawRects(px: number, py: number, shown: number, spread: number): CardRect[] {
-  const out: CardRect[] = [];
-  const offs: HangOffset[] = hangOffsets(shown, spread);
-  for (let k = 0; k < offs.length; k++) {
-    const cx: number = px + offs[k].dx;
-    const cy: number = py + HANG_GAP + offs[k].dy;
-    out.push({ x: cx - HANG_PHOTO_W / 2, y: cy, w: HANG_PHOTO_W, h: HANG_PHOTO_H });
+export function pinMarkers(count: number): PinMarker[] {
+  const out: PinMarker[] = [];
+  if (!(count > 0)) { return out; }
+  const m: number = count > MAX_MARKERS ? MAX_MARKERS : Math.floor(count);
+  if (!(m > 0)) { return out; }
+  // 半径取成"两端正好落在 ±张角/2"：R = (半宽) / sin(张角/2)
+  const radius: number = ((m - 1) * MARKER_STEP / 2) / Math.sin(MARKER_SWEEP_RAD / 2);
+  for (let i = 0; i < m; i++) {
+    const t: number = m === 1 ? 0 : i / (m - 1) - 0.5;      // ∈ [−0.5, 0.5]
+    const theta: number = t * MARKER_SWEEP_RAD;
+    out.push({ dx: radius * Math.sin(theta), dy: MARKER_DY * Math.cos(theta) });
   }
   return out;
 }
 
 /**
- * 一个钉子挂 `shown` 张照片时的**卡片矩形序列**（画布坐标，已钳进画布）。
+ * 一个钉子要画的标记数：`expanded` 为假时是 0（光点），否则 `min(张数, MAX_MARKERS)`。
  *
- * **绘制与布局判据共用这一个函数**。`pinSvg` 用它画、`planPin` 用它判重叠 ——
- * 只要两边共用，就不可能出现"算的时候不重叠、画出来重叠"。
+ * **设备与预览都必须走这一个函数**：两边各写一次 `expanded ? min(n, MAX) : 0`，
+ * 迟早会漂移成"电脑上有点、真机上没有"。
  */
-export function hangRects(px: number, py: number, shown: number, spread: number, boxW: number, boxH: number): CardRect[] {
-  const raw: CardRect[] = rawRects(px, py, shown, spread);
-  const out: CardRect[] = [];
-  for (let k = 0; k < raw.length; k++) { out.push(clampRect(raw[k], boxW, boxH).rect); }
-  return out;
+export function markerCountOf(pin: ScenePin): number {
+  if (!pin.expanded) { return 0; }
+  const n: number = pin.photos.length;
+  return n > MAX_MARKERS ? MAX_MARKERS : n;
 }
+
+/** 「＋N」角标的尺寸（pt）。它跟着标记簇走，绘制方与单测共用这一份。 */
+export const BADGE_W = 14;
+export const BADGE_H = 7;
+
+/** 一个矩形（画布坐标，pt）：左上角 + 宽高。本形态下只剩「＋N」角标用它。 */
+export interface Rect { x: number; y: number; w: number; h: number }
 
 /**
- * 「+N」角标的矩形：挂在**弧线最低那张卡片的下方**，水平居中于钉子。
+ * 「＋N」角标的矩形（画布坐标）：挂在**标记簇的右下方**，右缘与最右那个标记对齐。
  *
- * 为什么在下方而不是像原来那样挂在弧线右端外侧：右端外侧在钉子靠右时正好是画布边缘，
- * 角标会被推出去；而弧线下方通常是空的（照片挂在钉子上、越往下越空）。
- * 它不是卡片（audit 不度量文字），但它**参与避让** —— 否则邻钉的照片会压住它。
+ * 位置由簇自己的**实际**外沿算出来（不写死 `x−7`）：这样无论 MAX_MARKERS 或
+ * MARKER_STEP 怎么改，角标都不会压到点上 —— 而"位置算歪了"是看不见的
+ * （角标只有 14×7pt）。
  *
- * **导出**：绘制方（设备侧 WallPage 的角标文字、`pinSvg` 的 SVG 文字）必须调它，
- * 不能自己再算一遍 —— 这个矩形进了 `planPin` 的占用表，位置算歪就等于
- * "判据以为它在 A、实际画在 B"，而那种漂移恰恰是看不见的（角标只有 10×7pt）。
+ * 为什么在右下方而不是正下方：正下方是轨迹与省界最密的地方，而右下通常空着；
+ * 而且角标与簇共用一个右下角，读起来是"这一簇还有 N 张"。
+ * `markers` 为空（光点钉）时退化成钉子右下角的一个小矩形，仍然合法。
  */
-export function badgeRect(px: number, py: number, shown: number, spread: number): CardRect {
-  const offs: HangOffset[] = hangOffsets(shown, spread);
-  let bottom: number = py + HANG_GAP;
-  let low: number = 0;
-  for (let k = 0; k < offs.length; k++) { if (offs[k].dy > low) { low = offs[k].dy; } }
-  bottom = py + HANG_GAP + low + HANG_PHOTO_H;
-  return { x: px - BADGE_W / 2, y: bottom + BADGE_GAP, w: BADGE_W, h: BADGE_H };
-}
-
-/** 一张矩形是否整整齐齐地待在画布里（允许 1e-6 的浮点误差）。 */
-function insideBox(r: CardRect, boxW: number, boxH: number): boolean {
-  return r.x >= -1e-6 && r.y >= -1e-6 && r.x + r.w <= boxW + 1e-6 && r.y + r.h <= boxH + 1e-6;
-}
-
-/** 一组矩形里是否有任何一对"重叠"（判据：交集面积 > HANG_OVERLAP_EPS）。 */
-function anyOverlap(rects: CardRect[]): boolean {
-  for (let i = 0; i < rects.length; i++) {
-    for (let j = i + 1; j < rects.length; j++) {
-      if (rectOverlapArea(rects[i], rects[j]) > HANG_OVERLAP_EPS) { return true; }
-    }
+export function badgeRectOf(pin: ScenePin, markers: PinMarker[]): Rect {
+  let maxDx: number = -Number.MAX_VALUE;
+  let maxDy: number = -Number.MAX_VALUE;
+  for (let i = 0; i < markers.length; i++) {
+    if (markers[i].dx > maxDx) { maxDx = markers[i].dx; }
+    if (markers[i].dy > maxDy) { maxDy = markers[i].dy; }
   }
-  return false;
-}
-
-// ── 展开方案：由**空间**决定挂几张（不是常数） ──────────────────────────────
-
-/** 一个钉子的挂载方案。`shown === 0` 表示"收成点"，一张也不挂。 */
-interface HangPlan {
-  shown: number;
-  spread: number;
-  rects: CardRect[];
-  badge: CardRect;
-  hasBadge: boolean;
-}
-
-/**
- * 每个张数档试多少个弦宽（从最宽往最窄等距取）。
- *
- * 7 的来历：弧宽对布局的影响是"探多深"（最低点 = 半径 = 弦宽/2/sin55°，是弦宽的单调函数），
- * 所以要躲开下方的邻居只需把弧收窄到某个阈值以下 —— 7 档足以跨过"一个卡片高"的尺度
- * （最窄档与最宽档的半径差 = (hi−lo)×0.6104，7 档的相邻间隔是它的 1/6）。
- * 再多的档位只会让"布局慢一点、好一丁点"，收益不值。每档都是精确的逐对检测，没有近似。
- *
- * 类型标成 `number` 而不是让它推成字面量 `7`：ArkTS 会把没标注的 `const x = 7` 推成字面量类型，
- * 于是下面的 `SPREAD_TRIES === 1` 被判成"两个没有交集的类型在做比较"——一个编译错误
- * （这条是本批构建时真实撞到的）。
- */
-const SPREAD_TRIES: number = 7;
-
-/** 空方案（收成点）：不占任何地方。 */
-function emptyPlan(): HangPlan {
-  return {
-    shown: 0, spread: 0, rects: [],
-    badge: { x: 0, y: 0, w: 0, h: 0 }, hasBadge: false
-  };
-}
-
-/**
- * 给一个钉子挑一个**够得着**的挂载方案。这是"内容决定布局"的全部实现。
- *
- * ── 规则（四条，从大到小） ──────────────────────────────────────────────────
- *   1. **张数不超上限**：`k ≤ min(capK, MAX_HANG)`。MAX_HANG 是设计 §6.2 的硬上限
- *      （一屏挂 9 张已经很多了）；`total`（这个钉子下的全部张数）是物理上限。
- *      空间只能往下压，不能往上抬。`+N` 里的 N 恒等于 `total − k`。
- *   2. **弧要放得下**：弦宽 ≤ `min(水平余量, 竖直余量)`。
- *      · 水平余量 = `2 * (min(px, 画布宽 − px) − 半张卡 − 留白)` —— 钉子离右边近，弧就得窄；
- *      · 竖直余量 = `2 * sin(张角/2) * (挂载区底 − py − HANG_GAP − 卡高)` —— 下面没地方，
- *        半径就得小（半径 = 弦宽/2 / sin(张角/2)，而弧的最低点就是半径那么深）。
- *   3. **弦宽在 [自重叠下限, 上限] 之间从宽往窄试**。为什么不是"能多宽就多宽"就完事：
- *      弧越宽**探得越深**（最低点 = 半径），钉子下方如果有别的钉子的照片，把弧**收窄**
- *      反而能整个抬上去躲开它 —— 而收窄只要不破 `arcSpreadNeed` 的自重叠下限就依然好看。
- *      这是"用形状换位置"，比直接少挂一张更划算（实测：北京 2/4 → 3/4）。
- *   4. **自己不许重叠、也不许压住别人**：卡片矩形与**已被接受的**卡片矩形逐对做相交检测
- *      （判据 HANG_OVERLAP_EPS）。每一档都不行就**换小 k 再来**；k 试到 1 都不行 →
- *      **收成点**（点上有张数，用户点开还能看）。
- *
- * ── 为什么是"换小 k"而不是"把框缩小"或"把弧钳一下" ─────────────────────────────
- *   · **不缩框**：卡片 34×44 是跟日期字号（4.6pt）绑定的视觉单位。缩到 0.7 倍，
- *     日期字号变成 3.2pt —— 在 1 倍图上就是糊的。"挂 4 张看得清"胜过"挂 6 张全糊"。
- *   · **不钳弧**：钳制会把弧压成一条直线或让几张卡片叠在一起，那是**画了一条假的弧**。
- *     钳制在本模块里只作为最后一道兜底（`clampRect`），并被判据显式拒绝（下面 `moved` 检查）。
- *   · **换小 k 是最诚实的降级**：弧的形状（等半径、两端高中间低）始终成立，
- *     少挂的那几张由「+N」如实报出，用户点开钉子仍然看得到全部。
- *
- * `px,py` 钉子坐标；`total` 该钉子下的全部张数（只用于算 +N）；`capK` 本轮允许挂的上限；
- * `boxW` 画布宽；`bottom` 挂载区底；`accepted` 已被接受的卡片矩形。
- */
-function planPin(
-  px: number, py: number, total: number, capK: number, boxW: number, bottom: number, accepted: CardRect[]
-): HangPlan {
-  let cap: number = capK < MAX_HANG ? capK : MAX_HANG;
-  if (cap > total) { cap = total; }
-  // 水平余量：弧最外那张卡片的边缘距画布边至少 HANG_EDGE_MARGIN
-  const halfRoom: number = Math.min(px, boxW - px) - HANG_PHOTO_W / 2 - HANG_EDGE_MARGIN;
-  const hLimit: number = halfRoom > 0 ? halfRoom * 2 : 0;
-  // 竖直余量：弧的最低点（中间那张）到底部还要放得下一张卡片
-  const vRoom: number = bottom - py - HANG_GAP - HANG_PHOTO_H;
-  const vLimit: number = vRoom > 0 ? 2 * Math.sin(HANG_SWEEP_RAD / 2) * vRoom : 0;
-  const limit: number = Math.min(hLimit, vLimit);
-
-  for (let k = cap; k >= 1; k--) {
-    const hi: number = Math.min(arcSpread(k, boxW), limit);
-    if (!(hi > 0)) { continue; }
-    // 自重叠下限；k=1 没有相邻对，下限是 0（正下方一张，半径随便 —— 半径就是它"探多深"）。
-    const need: number = k > 1 ? arcSpreadNeed(k) : 0;
-    const lo: number = need < hi ? need : hi;
-    for (let step = 0; step < SPREAD_TRIES; step++) {
-      const t: number = SPREAD_TRIES === 1 ? 0 : step / (SPREAD_TRIES - 1);
-      const spread: number = hi - (hi - lo) * t;   // 从最宽往最窄试
-      if (!(spread > 0)) { continue; }
-      const raw: CardRect[] = rawRects(px, py, k, spread);
-      if (raw.length !== k) { continue; }
-      // ③ 边界钳制 + 形状复核：只要有一张卡片要**被挪动**才放得下，这一档就不算数。
-      //    （"被钳得不成形"宁可收成点，也不画一条假的弧。）
-      let deformed: boolean = false;
-      const rects: CardRect[] = [];
-      for (let i = 0; i < raw.length; i++) {
-        const c: ClampedRect = clampRect(raw[i], boxW, bottom);
-        if (c.moved) { deformed = true; break; }
-        rects.push(c.rect);
-      }
-      if (deformed) { continue; }
-      // 自己内部不许重叠（arcSpreadNeed 已经保证下限，这里是精确复核）
-      if (anyOverlap(rects)) { continue; }
-      // ④「+N」角标只在"挂不全"时出现，它也要放得下、且不压住别人
-      let badge: CardRect = { x: 0, y: 0, w: 0, h: 0 };
-      let hasBadge: boolean = false;
-      if (k < total) {
-        const b: ClampedRect = clampRect(badgeRect(px, py, k, spread), boxW, bottom);
-        if (b.moved) { continue; }
-        badge = b.rect;
-        hasBadge = true;
-      }
-      // 不许压住已经接受的任何卡片（自己的卡片之间上面已经查过）
-      let clash: boolean = false;
-      for (let i = 0; i < rects.length && !clash; i++) {
-        for (let j = 0; j < accepted.length; j++) {
-          if (rectOverlapArea(rects[i], accepted[j]) > HANG_OVERLAP_EPS) { clash = true; break; }
-        }
-      }
-      if (!clash && hasBadge) {
-        for (let j = 0; j < accepted.length; j++) {
-          if (rectOverlapArea(badge, accepted[j]) > HANG_OVERLAP_EPS) { clash = true; break; }
-        }
-      }
-      if (clash) { continue; }
-      return { shown: k, spread: spread, rects: rects, badge: badge, hasBadge: hasBadge };
-    }
-  }
-  return emptyPlan();
+  const right: number = markers.length === 0 ? PIN_DOT_R : maxDx + MARKER_R;
+  const bottom: number = markers.length === 0 ? PIN_DOT_R + 2 : maxDy + MARKER_R + 2;
+  return { x: pin.x + right - BADGE_W, y: pin.y + bottom, w: BADGE_W, h: BADGE_H };
 }
 
 // ── 场景构建 ────────────────────────────────────────────────────────────────
@@ -1405,35 +1232,34 @@ function comparePins(a: ScenePin, b: ScenePin): number {
  *      （设计 §6.2；判"挤不挤"用屏幕坐标而非经纬度）。并簇后名字取**照片最多的那个**，
  *      多于一个地名时带上「等N地」—— 不能悄悄丢掉一个地名。
  *   5. **展开态**：`computeLayout` 按（钉数、每钉张数、zoom）给答案（设计 §6.2 的三档阈值）。
+ *      本形态下它只决定**标记画不画**（false = 光点）。
+ *   6. **标记**：`expanded` 为真时，按 `pinMarkers(min(张数, MAX_MARKERS))` 给出
+ *      钉子旁那几个小点的偏移。
+ *
+ * ── 第 6 步为什么不再有"空间复核"（task-18 删掉的整段）────────────────────────
+ * 旧形态要回答"这块画布上挂得下几张卡片、弧要多宽才不互相压住"，于是有了
+ * `planPin` 的两轮（广度 → 深度）、逐对相交检测、`clampRect` 兜底、`badgeRect` 避让。
+ * 新形态的标记是**贴着钉子的固定小簇**（最宽 21.8pt，见 `pinMarkers`），
+ * 它的位置与画布大小**无关** —— 没有"放不下"这回事，所以整段空间复核连同它的
+ * 全部理由一起删掉了。这不是"简化了判据"，而是那个问题在新形态下不存在。
  *
  * `zoom` 非有限值或 ≤ 0 时按 1 处理：`computeLayout` 里是 `zoom < 阈值` 的比较，
  * 让 NaN 直接进去会得到"false → 展开"，那是**静默的错误展开**；在入口处归一更诚实。
  *
- * ── 第 6 步：空间复核（本批新增，修的是"照片挂出画布"与"严重重叠"） ──────────
- * `computeLayout` 只看（钉数、每钉张数、zoom），**不知道画布多大**。于是 6 个钉子下的
- * 24 张卡片会在 360 宽的画布上互相压住、还会伸出右边界（实测：2 张出画布、7 对重叠）。
- * 这不是画法问题而是规则问题 —— "全部展开"在这块画布上必然失败。所以：
- *   · 每个钉子按**优先级**（照片多的先）用 `planPin` 找一个放得下的方案；
- *   · 放不下就少挂几张（挂出来的部分照常画弧，没挂的画成「+N」）；
- *   · 一张都放不下就**收成点**（点上有张数，点开还能看全部）。
- * 空间**只能否决意愿**：`shown > 0` 蕴含 `expanded === true`，不会凭空多出一个展开的钉子。
- *
- * `env` 不给时画布 = 地图块本身（`frame.blockH`）—— 见 `HangEnvelope` 的说明。
- *
- * ── 坐标系（改动过，设备与预览必须一致）──────────────────────────────────────
+ * ── 坐标系 ──────────────────────────────────────────────────────────────────
  * 投影用 `frame.w / frame.h`（不变形的框），出来的坐标**再加上 `frame.x / frame.y`**，
- * 于是 `ScenePin.x/y` 与 `hangRects` 的矩形都落在**整块画布（地图块）的坐标**里。
- * 这么定的原因：布局的边界判据（水平余量、挂载区底）说的是"屏幕边"，
- * 而屏幕边是地图块的边，不是绘制框的边 —— 绘制框居中之后两者不是一回事。
+ * 于是 `ScenePin.x/y` 落在**整块画布（地图块）的坐标**里 —— 与 `outlinePath` 的输出
+ * 同一个坐标系（`ScenePin.x/y` 现在也保证是**有限数**：见下面两次 `projectMercator`
+ * 之后的校验）。
  *
- * ── 投影用哪个 bounds：**只从框上读**（本批新增，修的是"照片与国界各画各的"）──────
+ * ── 投影用哪个 bounds：**只从框上读**（修的是"照片与国界各画各的"）──────────────
  * `const fb = frameBounds(frame)`，两次 `projectMercator` 都用它。以前这里写的是
  * 模块常量 `CHINA_BOUNDS`，而 `outlinePath` 收一个**自己的** bounds 参数 ——
  * 一旦调用方给国界传了新视野、这里还按全国投，照片就会整体飘到地图外面，
- * 而且两个函数都不报错（正是本批最该避免的失败）。现在两处都读 `frame.bounds`，
+ * 而且两个函数都不报错（正是最该避免的失败）。现在两处都读 `frame.bounds`，
  * 参数根本没机会不一致。
  */
-export function buildScene(photos: WallPhoto[], frame: MapFrame, zoom: number, env?: HangEnvelope): ScenePin[] {
+export function buildScene(photos: WallPhoto[], frame: MapFrame, zoom: number): ScenePin[] {
   const z: number = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
   // 视野框：**唯一**来源是框自己（见 frameBounds 与 MapFrame.bounds）。国界那边读的是同一个。
   const fb: number[] = frameBounds(frame);
@@ -1529,77 +1355,24 @@ export function buildScene(photos: WallPhoto[], frame: MapFrame, zoom: number, e
     expandedOf.set(layout[i].pinId, layout[i].expanded);
   }
 
-  // 6) 空间复核：画布分区（画布 = 地图块；挂载区底由 hangBottom 统一给）
-  const boxW: number = frame.blockW > 0 ? frame.blockW : 0;
-  // 判据与绘制方共用同一个 hangBottom —— 见它的注释（两边各算一遍就会漂移）
-  const bottom: number = hangBottom(frame, env);
-
-  // 优先级：**照片多的先挑**（冲突时保住信息量大的那个钉子）；并列按 pinId 字典序（可复现）。
-  const order: number[] = [];
-  for (let i = 0; i < merged.length; i++) {
-    const flag: boolean | undefined = expandedOf.get(merged[i].pinId);
-    if (flag === true && mergedPhotos[i].length > 0) { order.push(i); }
-  }
-  order.sort((a: number, b: number): number => {
-    const an: number = mergedPhotos[a].length;
-    const bn: number = mergedPhotos[b].length;
-    if (an !== bn) { return bn - an; }
-    if (merged[a].pinId === merged[b].pinId) { return 0; }
-    return merged[a].pinId < merged[b].pinId ? -1 : 1;
-  });
-
-  // ── 两轮：先「广度」，再「深度」 ─────────────────────────────────────────────
-  // 为什么不是"按优先级一次挑满"：实测（tools/fixtures/wall-sample-many.json，11 个钉子）
-  // 一次挑满时**西安（11 张）的弧横扫画布中部**，把广州/武汉/拉萨等 7 个钉子挤成点，
-  // 全图只挂出 16 张；而两轮（每个钉子先保底 1 张、再加挂）既能保住"每个去过的地方都露一张"
-  // —— 这正是地图墙作为"我去过哪儿"的那张地图的第一要义，也与设计 §6.2"钉子多时收成点、
-  // 钉子少时才展开"的**广度优先**精神一致（空间不够就是"钉子多"的另一种表现）。
-  // 第二轮加挂时会把该钉子第一轮的矩形从占用表里撤掉 —— 它是**原地长高**，不是另找一个地方。
-  const plans: Map<number, HangPlan> = new Map<number, HangPlan>();
-  for (let pass = 0; pass < 2; pass++) {
-    for (let oi = 0; oi < order.length; oi++) {
-      const i: number = order[oi];
-      const total: number = mergedPhotos[i].length;
-      const mine: HangPlan | undefined = plans.get(i);
-      if (pass === 0 && total <= 0) { continue; }
-      if (pass === 1 && mine === undefined) { continue; }
-      // 本轮允许挂的上限：第一轮一律 1 张（保底），第二轮放到意愿上限。
-      const capK: number = pass === 0 ? 1 : total;
-      // 占用表：把**自己上一轮**的矩形撤掉（原地加挂，不与自己打架）
-      const others: CardRect[] = [];
-      for (let oi2 = 0; oi2 < order.length; oi2++) {
-        const j: number = order[oi2];
-        if (j === i) { continue; }
-        const pj: HangPlan | undefined = plans.get(j);
-        if (pj === undefined || pj.shown <= 0) { continue; }
-        for (let k = 0; k < pj.rects.length; k++) { others.push(pj.rects[k]); }
-        if (pj.hasBadge) { others.push(pj.badge); }
-      }
-      const plan: HangPlan = planPin(merged[i].x, merged[i].y, total, capK, boxW, bottom, others);
-      if (pass === 0) {
-        // 保底阶段：放不下就留空（不写进 plans，第二轮也不会再动它 —— 它已经收成点）
-        if (plan.shown > 0) { plans.set(i, plan); }
-      } else if (plan.shown > mine.shown) {
-        plans.set(i, plan);
-      }
-    }
-  }
-
+  // 6) 标记：**没有空间复核**（见函数注释）。标记的位置与画布大小无关 ——
+  //    它是"贴着钉子的固定小簇"（`pinMarkers`），所以本步只是把点算出来。
+  //    张数超过 MAX_MARKERS 的部分不在这里处理：绘制方按 `photos.length − markers.length`
+  //    画「＋N」—— 这个减法只有一处，不会两边各算一遍。
   const out: ScenePin[] = [];
   for (let i = 0; i < merged.length; i++) {
     const flag: boolean | undefined = expandedOf.get(merged[i].pinId);
-    const plan: HangPlan | undefined = plans.get(i);
-    const shown: number = plan === undefined ? 0 : plan.shown;
-    out.push({
+    const expanded: boolean = flag === true;
+    const pin: ScenePin = {
       pinId: merged[i].pinId,
       name: mergedNames[i],
       x: merged[i].x,
       y: merged[i].y,
       photos: mergedPhotos[i],
-      expanded: flag === undefined ? false : flag,
-      shown: shown,
-      spread: plan === undefined ? 0 : plan.spread
-    });
+      expanded: expanded,
+      markers: expanded ? pinMarkers(mergedPhotos[i].length) : []
+    };
+    out.push(pin);
   }
   out.sort(comparePins);
   return out;
@@ -1850,25 +1623,18 @@ function escapeXml(s: string): string {
     .replace(/'/g, '&apos;');
 }
 
-/** 卡片底色：由 photoId 决定，同一张照片每次同色（预览里才分得清谁是谁）。 */
-const CARD_FILLS: string[] = ['#DCE8F5', '#E6E1F2', '#F3E3DA', '#DCEFE4', '#F2EBD8', '#E8E8EA'];
-
 /**
  * **地图块的底色**（`MapFrame.blockW × blockH` 那一整块）。
  * 设备侧 WallPage 的 `Stack` 底层用的是同一个字符串 —— 两边写死同一个常量不会漂，
  * 而"预览底是 `#F7FAF6`、设备底是 `#F2F7EF`"这种差异会让"在电脑上先看见"这件事打折扣。
+ *
+ * 本形态下它比以前更重要：地图铺满整块主体区，所以这**不是**"地图外面的一块底"，
+ * 而是"地图自己"（海 + 视野内没有轮廓数据的地方）。旧版那张"卡片底色表"
+ * （`CARD_FILLS` / `fillOf`）已随卡片一起删除 —— 墙上的照片现在是点，没有底色这回事。
  */
 export const BLOCK_FILL = '#F2F7EF';
 
-function fillOf(photoId: string): string {
-  let h: number = 7;
-  for (let i = 0; i < photoId.length; i++) {
-    h = (h * 31 + photoId.charCodeAt(i)) % 1000003;
-  }
-  return CARD_FILLS[h % CARD_FILLS.length];
-}
-
-/** `takenAt` → 卡片上的日期文字。0/负数 = 未知（**显示为"未知时间"而不是 1970-01-01**）。 */
+/** `takenAt` → 详情面板里的日期文字。0/负数 = 未知（**显示为"未知时间"而不是 1970-01-01**）。 */
 export function dateLabel(takenAt: number): string {
   if (!(takenAt > 0)) { return '未知时间'; }
   const iso: string = new Date(takenAt).toISOString();
@@ -1889,15 +1655,21 @@ export function dateLabel(takenAt: number): string {
  * ── 图层顺序（由下到上，改这里之前先想清楚谁压谁）────────────────────────────
  *   ① 底 `#F2F7EF`（**地图块的底色**，与设备侧 Stack 的底色逐字节相同 —— 地图铺满主体区）
  *   → ② 国界（调用方传进来的 `chinaPath`）→ ②′ **省界**（`provincePath`）
- *   → ③ **轨迹折线** → ④ 照片+挂线
- *   → ⑤ 钉点与地名（单独一层，永远在最上面，否则邻钉的卡片会盖住地名）。
- * 轨迹放在地图之上、照片之下：它是"我走过哪里"的背景叙事，压住照片就成了噪声。
+ *   → ③ **轨迹折线** → ④ **照片标记**（钉子旁那一簇小点 + 「＋N」）
+ *   → ⑤ 钉点与地名（单独一层，永远在最上面）。
+ * 轨迹放在地图之上、标记之下：它是"我走过哪里"的背景叙事，压住标记就成了噪声。
  *
  * ── 省界为什么必须画在国界**之后**（而不是之前、也不是同一层）────────────────────
  *   国界那一层不是一条线，而是一个**填充面**（`fill="#E8F0E4"` + `stroke`）：陆地是浅绿、
  *   海是底色。省界是陆地**内部**的线，画在填充之前会被那块填充**整个盖掉** ——
  *   症状是"数据明明有 107 条环，图上一条都看不见"。所以顺序只能是 填充 → 省界线。
- *   同理它必须在**轨迹与照片之前**：省界是底图信息，不是内容。
+ *   同理它必须在**轨迹与标记之前**：省界是底图信息，不是内容。
+ *
+ * ── 本形态下 SVG 里**没有照片卡片**（task-18）────────────────────────────────
+ *   Node 侧拿不到相册像素，旧版画的是"占位卡片"（26×34 的矩形 + 日期文字）。
+ *   现在照片在墙上就是**一个点**，所以 SVG 里也不该有卡片：
+ *   点（`<circle>`）+ 「＋N」（`<text>`）—— 与设备侧画的东西**逐个元素对得上**。
+ *   大图在「点开钉子」的详情面板里（设备侧的 `Image`，那部分 Node 侧本来就看不到）。
  *
  * `provincePath` 缺省 = 空串 = 不画省界（没有那份 rawfile 时的退化路径，与国界一致）。
  */
@@ -1933,14 +1705,13 @@ export function sceneToSvg(pins: ScenePin[], w: number, h: number, chinaPath: st
   }
   out.push(`<g id="pins">`);
   for (let i = 0; i < pins.length; i++) {
-    out.push(pinSvg(pins[i], w, h));
+    out.push(pinSvg(pins[i]));
   }
   out.push(`</g>`);
-  // 钉点与地名**单独一层、画在所有卡片之上**。
-  // 为什么必须是单独一层：钉子和卡片分属不同元素，按"钉子顺序"整块画下来时，
-  // 后面那个钉子的卡片会盖住前面那个钉子的名字（实测：敦煌的卡片压掉了"西藏·拉萨·城关 ·3"
-  // 的左半边，只剩一个"2"露在外面）。钉子是这个视图的**锚点**，它绝不能被照片盖住 ——
-  // 用户点它才能看到没挂出来的那几张。文字压在卡片上是可读的（深字浅底），被盖住就没了。
+  // 钉点与地名**单独一层、画在标记之上**。
+  // 为什么必须是单独一层：钉子和标记分属不同元素，按"钉子顺序"整块画下来时，
+  // 后面那个钉子的标记会盖住前面那个钉子的名字。钉子是这个视图的**锚点**，
+  // 它绝不能被标记盖住 —— 用户点它才能看到全部照片。
   out.push(`<g id="anchors">`);
   for (let i = 0; i < pins.length; i++) {
     out.push(pinAnchorSvg(pins[i]));
@@ -1951,42 +1722,30 @@ export function sceneToSvg(pins: ScenePin[], w: number, h: number, chinaPath: st
 }
 
 /**
- * 单个钉子的**内容**层：弧线上的照片 + 线。**不画钉点和名字**（那是 anchors 层的事）。
+ * 单个钉子的**标记**层：钉子旁那一簇小点 + 不够画时的「＋N」。
+ * **不画钉点和名字**（那是 anchors 层的事）。
  *
- * **挂几张、弦宽多少，一律读 `pin.shown` / `pin.spread`** —— 那是布局算出来的、已经
- * 通过"不出画布 + 不重叠"判据的方案。这里**不再自己算** `arcSpread`：
- * 绘制方与判据各算一遍，迟早会漂移成"算的时候不重叠、画出来重叠"（这正是本批要修的缺陷）。
- * 卡片位置由 `hangRects` 给（与判据同一个函数），所以画出来的矩形与判定过的矩形逐点相同。
+ * 画几个、画在哪儿，一律读 `pin.markers` —— 那是 `buildScene` 调的 `pinMarkers`
+ * 算出来的。这里**不再自己算一遍**：绘制方与场景方各算一遍，迟早会漂移成
+ * "算的时候贴着一个地方、画出来在另一个地方"（旧版 `arcSpread` 就是这个坑）。
  */
-function pinSvg(pin: ScenePin, canvasW: number, canvasH: number): string {
+function pinSvg(pin: ScenePin): string {
   const out: string[] = [];
   const cx: number = pin.x;
   const cy: number = pin.y;
   const n: number = pin.photos.length;
-  const shown: number = pin.expanded && pin.shown > 0 && pin.shown <= n ? pin.shown : 0;
+  const ms: PinMarker[] = pin.markers;
   out.push(`<g id="pin-${escapeXml(pin.pinId)}">`);
-
-  if (shown > 0) {
-    const offs: HangOffset[] = hangOffsets(shown, pin.spread);
-    // 先画线（在照片之下），再画照片 —— 否则线会压在卡片上面
-    for (let k = 0; k < shown; k++) {
-      const ex: number = cx + offs[k].dx;
-      const ey: number = cy + HANG_GAP + offs[k].dy;
-      out.push(`<line x1="${r2(cx)}" y1="${r2(cy)}" x2="${r2(ex)}" y2="${r2(ey)}" `
-        + `stroke="#C3B49B" stroke-width="0.6"/>`);
-    }
-    const rects: CardRect[] = hangRects(cx, cy, shown, pin.spread, canvasW, canvasH);
-    for (let k = 0; k < shown && k < rects.length; k++) {
-      const r: CardRect = rects[k];
-      out.push(photoCardSvg(pin.photos[k], r.x + r.w / 2, r.y));
-    }
-    if (n > shown) {
-      // 「+N」：挂在弧线最低那张卡片**下方**（那里通常是空的），水平居中于钉子。
-      // 位置与判据用的 badgeRect 是同一处几何 —— 它参与避让，不会被邻钉的照片压住。
-      const b: CardRect = clampRect(badgeRect(cx, cy, shown, pin.spread), canvasW, canvasH).rect;
-      out.push(`<text x="${r2(b.x + b.w / 2)}" y="${r2(b.y + b.h - 1.6)}" font-size="6" fill="#8A8A8A" `
-        + `text-anchor="middle">+${n - shown}</text>`);
-    }
+  for (let k = 0; k < ms.length; k++) {
+    out.push(`<circle cx="${r2(cx + ms[k].dx)}" cy="${r2(cy + ms[k].dy)}" r="${MARKER_R}" `
+      + `fill="${MARKER_COLOR}"/>`);
+  }
+  if (n > ms.length) {
+    // 「＋N」：右下方，右缘与最右那个标记对齐（位置由 badgeRectOf 一处给出，
+    // 单测与设备侧读的是同一个函数）。
+    const b: Rect = badgeRectOf(pin, ms);
+    out.push(`<text x="${r2(b.x + b.w / 2)}" y="${r2(b.y + b.h - 1.4)}" font-size="6" fill="#8A8A8A" `
+      + `text-anchor="middle">+${n - ms.length}</text>`);
   }
   out.push(`</g>`);
   return out.join('\n');
@@ -1998,34 +1757,19 @@ function pinAnchorSvg(pin: ScenePin): string {
   const cx: number = pin.x;
   const cy: number = pin.y;
   const n: number = pin.photos.length;
-  const shown: number = pin.expanded && pin.shown > 0 && pin.shown <= n ? pin.shown : 0;
   out.push(`<g id="anchor-${escapeXml(pin.pinId)}">`);
-  // 钉点：展开时小一点（它只是线的起点），收起时大一点（它就是"点"，要能点得到）
-  const dotR: number = shown > 0 ? 2.2 : 3.4;
-  out.push(`<circle cx="${r2(cx)}" cy="${r2(cy)}" r="${r2(dotR)}" fill="#C0392B"/>`);
-  out.push(`<circle cx="${r2(cx)}" cy="${r2(cy)}" r="${r2(dotR + 1.8)}" fill="none" `
+  // 钉点是**主角**（标记是内容、钉是锚），所以半径恒定：它不再随"挂了几张"变。
+  out.push(`<circle cx="${r2(cx)}" cy="${r2(cy)}" r="${PIN_DOT_R}" fill="${PIN_COLOR}"/>`);
+  out.push(`<circle cx="${r2(cx)}" cy="${r2(cy)}" r="${PIN_HALO_R}" fill="none" `
     + `stroke="#C0392B" stroke-width="0.6" opacity="0.4"/>`);
-  // 名字标签：放在钉子上方（下方是照片的地盘），**带该钉子的全部张数**。
-  // 「少挂了几张」由弧线下方那个 `+N` 角标负责说 —— 这里不再重复，避免标签变长后在
-  // 密集处（京沪只差 29pt）两条标签互相压住。文字描边（paint-order）保证压在卡片上也读得清。
+  // 名字标签：放在钉子上方（下方是标记簇的地盘），**带该钉子的全部张数**。
+  // 「还有几张没画成点」由右下角那个 `+N` 负责说 —— 这里不再重复，避免标签变长后在
+  // 密集处（京沪只差 29pt）两条标签互相压住。文字描边（paint-order）保证压在省界/轨迹
+  // 上也读得清。
   const label: string = n > 1 ? `${pin.name} ·${n}` : pin.name;
-  out.push(`<text x="${r2(cx)}" y="${r2(cy - dotR - 3.4)}" font-size="6.5" fill="#3F4A3C" `
+  out.push(`<text x="${r2(cx)}" y="${r2(cy - PIN_HALO_R - 2.2)}" font-size="6.5" fill="#3F4A3C" `
     + `stroke="#F7FAF6" stroke-width="1.4" paint-order="stroke" `
     + `text-anchor="middle">${escapeXml(label)}</text>`);
   out.push(`</g>`);
   return out.join('\n');
-}
-
-/** 一张占位照片卡片：(x,y) 是卡片顶端中点。 */
-function photoCardSvg(p: WallPhoto, x: number, y: number): string {
-  const left: number = x - HANG_PHOTO_W / 2;
-  const fill: string = fillOf(p.photoId);
-  const label: string = dateLabel(p.takenAt);
-  const body: string = `<rect x="${r2(left)}" y="${r2(y)}" width="${HANG_PHOTO_W}" height="${HANG_PHOTO_H}" `
-    + `rx="2" fill="${fill}" stroke="#8FA8C0" stroke-width="0.5"/>`
-    + `<rect x="${r2(left + 1.8)}" y="${r2(y + 1.8)}" width="${HANG_PHOTO_W - 3.6}" height="${HANG_PHOTO_H - 3.6}" `
-    + `rx="1.4" fill="none" stroke="#FFFFFF" stroke-width="0.5" opacity="0.75"/>`
-    + `<text x="${r2(x)}" y="${r2(y + HANG_PHOTO_H / 2 + 1.4)}" font-size="4.2" fill="#5A6672" `
-    + `text-anchor="middle">${escapeXml(label)}</text>`;
-  return body;
 }
