@@ -28,12 +28,20 @@
  *   只缓存**确定性的否定结论**（`subtype !== 3`）：
  *     · 肯定结论**不能**缓存 —— 缓存"它是动态照片"就得同时缓存 `MovingPhoto` 对象，
  *       而对象的释放出口在渲染它的组件那一层（ui/CardStack.ets），缓存会让所有权出现两个主人；
- *     · **查询失败 / 命中 0 条 / 请求超时都不写缓存**（这一点与 animSource 不同）：
- *       那里的失败几乎都是"文件坏了"（确定性的），而这里的失败可能是
- *       **选图器的永久授权还没生效 / IPC 抖动**（瞬时的）。把瞬时失败记成
+ *     · **查询失败 / 命中 0 条 / 请求超时都不写缓存**：
+ *       这里的失败可能是**选图器的永久授权还没生效 / IPC 抖动**（瞬时的）。把瞬时失败记成
  *       "这张不是动态照片"，用户会永远看不到那张的角标 —— 一个不会自愈的静默降级。
  *   代价：坏照片每次滑回来都会重试一次查库。这个代价是**故意**付的（宁可多查一次库，
  *   也不要一个永久错误的结论）。
+ *
+ * ── 「已下结论」与「没探到」必须**随结果一起**传到调用点（缺陷 D4 的修法）─────────
+ *   上面那条策略只做对了一半：**数据层**不写负缓存了，可是**返回值**是
+ *   `MovingPhoto | undefined` —— "确定不是动态照片"与"这次没探到"在类型上**同形**。
+ *   于是刷卡页只能把两者都当成"这张有结论了"，把 `motionForId` 写成这张，
+ *   而重新触发的唯一执行者是 `@Watch onItemChanged`，它第一件事就是按 photoId 去重
+ *   → **同一张卡在本会话内再也没有机会**（角标不亮、长按无反应，用户也没有恢复动作）。
+ *   `MotionProbeResult.concluded` 就是补上的那一位：数据层是**唯一**知道
+ *   "为什么失败"的地方，这个区分必须由它给出，而不是让刷卡页去猜。
  */
 
 import { common } from '@kit.AbilityKit';
@@ -113,6 +121,45 @@ export class MotionHandle {
 }
 
 /**
+ * 一次探测的结果：把「**已下结论**」与「**没探到**」在**类型上**分开（缺陷 D4 的修法）。
+ *
+ * 为什么必须分开（两个字段缺一不可）：
+ *   · 只给 `handle` 的话，"确定不是动态照片"与"查库 0 条 / 请求超时"完全同形 ——
+ *     而前者可以就此定案（不再探测），后者**必须**留着重试的机会；
+ *   · 只给 `concluded` 的话，调用点还得再判一次 handle 是不是空 —— 两个字段并排写出来，
+ *     "什么算结论"这件事就是读得到的，不用去猜哪一支算了 `confirmedNoMotion`。
+ *
+ * 与 `confirmedNoMotion` 的分工：那个 map 是**跨调用**的记忆（省下一次查库），
+ * 本结果只描述**这一次**探测。两者一致时（`concluded && 命中缓存`）都成立，不冲突。
+ */
+export interface MotionProbeResult {
+  /** 探到的动态照片句柄；undefined = 这次没有对象可用。 */
+  handle: MotionHandle | undefined;
+  /**
+   * true = 这次探测**有定论** —— 正（拿到对象）或负（确定不是动态照片，已写进
+   *   `confirmedNoMotion`）。调用点据此定案：**不再探测这张**。
+   * false = **没探到**（查库 0 条 / 读 subtype 抛错 / 请求超时 / 回传空 / IPC 抖动 /
+   *   宿主 Context 缺失）—— 全是瞬时的。调用点**不得**把它当结论，必须保留重试的机会。
+   */
+  concluded: boolean;
+}
+
+/** 正结论：对象到手（`concluded = true`，因为"它是动态照片"确定无疑）。 */
+function probeReady(h: MotionHandle): MotionProbeResult {
+  return { handle: h, concluded: true };
+}
+
+/** 负结论：确定不是动态照片（`confirmedNoMotion` 已写）。 */
+function probeConcludedStatic(): MotionProbeResult {
+  return { handle: undefined, concluded: true };
+}
+
+/** **没探到**：瞬时失败，不是结论，调用点必须允许重试。 */
+function probeMissed(): MotionProbeResult {
+  return { handle: undefined, concluded: false };
+}
+
+/**
  * 「这张**确定**不是动态照片」的缓存，key = photoId（= URI）。
  * 只放**确定**的否定结论（见文件头的缓存策略），所以它的每一条都对应一次成功的查库。
  * 上限：条目数 = 用户刷过的静态照片数，每项只有一个 bool —— 与 `animSource` 的
@@ -121,13 +168,19 @@ export class MotionHandle {
 const confirmedNoMotion: Map<string, boolean> = new Map();
 
 /**
- * 读一张照片的动态照片对象。**不抛错**：任何失败都返回 `undefined`，
- * 调用点据此"没有角标、长按什么都不做"（退路是静态图，不是白屏、不是崩）。
+ * 读一张照片的动态照片对象。**不抛错**：任何失败都返回一个 `MotionProbeResult`，
+ * 调用点据 `concluded` 决定"定案"还是"留着下次重试"；`handle === undefined` 时
+ * 退路是"没有角标、长按什么都不做"（静态图，不白屏、不崩）。
  *
  * 三步，按代价从低到高，**顺序不可换**（换了就白花钱）：
  *   1) 负缓存（这张已确定不是动态照片）；
  *   2) `getAssets(uri)` 查库 + `PhotoKeys.PHOTO_SUBTYPE` 判据（**不解码、不请求视频**）；
  *   3) 只有确定是动态照片才 `requestMovingPhoto`（这一步才真正让平台准备对象）。
+ *
+ * ⚠️ 每一支的 `concluded` 都不是随手填的（D4 全靠它）：**只有"成功读到 subtype 并判定
+ * 它不是动态照片"这一支才算结论**。查不到 / 读不到 / 超时 / 回传空一律 `concluded = false`
+ * —— 它们的成因（授权未生效、IPC 抖动、平台内部失败）都是瞬时的，把它们当结论
+ * 就是那个"不会自愈的静默降级"。
  *
  * 实测依据（真机探针）：
  *   · `getAssets` 的 `.d.ts` 标着 `@permission ohos.permission.READ_IMAGEVIDEO`，
@@ -139,14 +192,15 @@ const confirmedNoMotion: Map<string, boolean> = new Map();
  */
 export async function loadMotion(
   ctx: common.Context, uri: string
-): Promise<MotionHandle | undefined> {
-  if (uri === '') { return undefined; }
-  if (confirmedNoMotion.get(uri) === true) { return undefined; }
+): Promise<MotionProbeResult> {
+  if (uri === '') { return probeMissed(); }
+  if (confirmedNoMotion.get(uri) === true) { return probeConcludedStatic(); }
   const asset: photoAccessHelper.PhotoAsset | undefined = await findAsset(ctx, uri);
   if (asset === undefined) {
-    // 查不到（没有授权 / 已被删除 / 查库异常）：**不写负缓存**，也不报错。
-    // 表现与"不是动态照片"一致（没有角标），但下次滑回来还会再问一次库。
-    return undefined;
+    // 查不到（没有授权 / 已被删除 / 查库异常）：**没探到** —— 不写负缓存，
+    // 也**不当作结论**上报（`concluded = false`），于是刷卡页下次还会再问一次库。
+    // 表现与"不是动态照片"一致（没有角标），区别是它**还会自己好起来**。
+    return probeMissed();
   }
   let raw: photoAccessHelper.MemberType | undefined = undefined;
   try {
@@ -155,18 +209,19 @@ export async function loadMotion(
     raw = asset.get(photoAccessHelper.PhotoKeys.PHOTO_SUBTYPE);
   } catch (e) {
     hilog.warn(DOMAIN, TAG, '%{public}s', `读照片 subtype 失败（按"不是动态照片"处理）: ${uri} ${errText(e)}`);
-    return undefined;
+    return probeMissed();
   }
   if (!isMovingPhotoSubtype(raw)) {
-    // 确定性结论：写缓存，这张以后不再查库（绝大多数照片走这一支）。
+    // **确定性结论**：写缓存，这张以后不再查库（绝大多数照片走这一支）。
     confirmedNoMotion.set(uri, true);
-    return undefined;
+    return probeConcludedStatic();
   }
   const mp: photoAccessHelper.MovingPhoto | undefined = await requestMotionObject(ctx, asset);
   if (mp === undefined) {
-    // 是动态照片，但这次**没取到对象**（超时/回传空/抛错）：不写负缓存（见文件头），
-    // 于是下次滑回来会重试。代价是重试，收益是"不会因为一次抖动就永久失去角标"。
-    return undefined;
+    // 是动态照片，但这次**没取到对象**（超时/回传空/抛错）：**没探到**（`concluded = false`），
+    // 于是刷卡页不会写 `motionForId`，下次与这张卡交互时会重试。
+    // 代价是重试，收益是"不会因为一次抖动就永久失去角标"。
+    return probeMissed();
   }
   let gotUri: string = '';
   try {
@@ -176,7 +231,7 @@ export async function loadMotion(
   }
   hilog.info(DOMAIN, TAG, '%{public}s',
     `动态照片已就绪: ${uri}（MovingPhoto.getUri=${gotUri === '' ? '(取不到)' : gotUri}）`);
-  return new MotionHandle(mp, uri);
+  return probeReady(new MotionHandle(mp, uri));
 }
 
 /**
