@@ -26,6 +26,13 @@ import {
   TARGET_MEDIAN_MS, TARGET_ROLLBACK_RATE, TARGET_CONVERSION_MIN,
   MAX_METRIC_EVENTS
 } from '../core/metrics';
+// 设计令牌（**全项目唯一的视觉取值处**）。本页的关键一条：判定色不再是三个硬编码色，
+// 而是 `C_OK` / `C_DANGER` / `C_TEXT_DIM` —— 旧值里「达标」绿（3.49:1）比「未达标」红
+// （4.76:1）更难读，那是一个会误导的颠倒，见 `verdictColor` 的说明。
+import {
+  C_ACCENT_TEXT, C_BG, C_DANGER, C_NOTICE, C_OK, C_SURFACE, C_TEXT, C_TEXT_DIM,
+  F_CAPTION, F_DISPLAY, F_LABEL, F_TITLE, R_MD, S1, S2, S3, S4
+} from '../core/designTokens';
 
 @Entry
 @Component
@@ -52,10 +59,15 @@ struct StatsPage {
   /**
    * 判定色。**无样本必须是灰的**（不是绿也不是红）：空数据既不是"达标"也不是"未达标"，
    * 给它上绿色就等于把"没量过"说成"量过且合格"（本页要消灭的那个陷阱）。
+   *
+   * ⚠️ 本批实测发现的一处**旧值缺陷**（不是审美问题）：旧的「达标」绿 `#1F9D55` 压白底
+   *    只有 **3.49:1**，而旧的「未达标」红 `#D33A2C` 是 **4.76:1** —— 也就是说
+   *    旧界面上"达标"这两个字比"未达标"更**难**读，是一个会误导的颠倒。
+   *    新令牌把这个关系摆正：`C_OK` **6.17:1**、`C_DANGER` **7.88:1**，且都 ≥ 4.5。
    */
   private verdictColor(v: TargetVerdict): string {
-    if (!v.hasSample) { return '#999999'; }
-    return v.met ? '#1F9D55' : '#D33A2C';
+    if (!v.hasSample) { return C_TEXT_DIM; }
+    return v.met ? C_OK : C_DANGER;
   }
 
   /** 比率 → 「12.3%」。显示保留 1 位小数（判定用的是原始值，见页脚说明）。 */
@@ -72,53 +84,59 @@ struct StatsPage {
   metricCard(title: string, reading: string, target: string, v: TargetVerdict) {
     Column() {
       Row() {
-        Text(title).fontSize(14).fontColor('#333333').layoutWeight(1)
-        Text(verdictText(v)).fontSize(13).fontWeight(FontWeight.Bold).fontColor(this.verdictColor(v))
+        Text(title).fontSize(F_LABEL).fontColor(C_TEXT).layoutWeight(1)
+        // 判定词与读数**同色**：这样"达标/未达标"不是靠一个角落的小字，而是整张卡的读数
+        // 本身就在说这件事（读数用的是 F_DISPLAY —— 全表唯一的重音档）。
+        Text(verdictText(v)).fontSize(F_LABEL).fontWeight(FontWeight.Bold).fontColor(this.verdictColor(v))
       }.width('100%')
 
       Row() {
-        Text(reading).fontSize(24).fontWeight(FontWeight.Bold).fontColor(this.verdictColor(v))
-        Text(`目标 ${target}`).fontSize(12).fontColor('#888888').margin({ left: 10 }).layoutWeight(1)
+        Text(reading).fontSize(F_DISPLAY).fontWeight(FontWeight.Bold).fontColor(this.verdictColor(v))
+        // 「目标 …」用次要文字色：它是读数的**参照系**，不该与读数同重。
+        // 旧值是 `#888888`（3.40:1，不达标）—— 本批换成 `C_TEXT_DIM`（5.86:1）。
+        Text(`目标 ${target}`).fontSize(F_CAPTION).fontColor(C_TEXT_DIM).margin({ left: S3 }).layoutWeight(1)
       }
-      .width('100%').alignItems(VerticalAlign.Bottom).margin({ top: 4 })
+      .width('100%').alignItems(VerticalAlign.Bottom).margin({ top: S1 })
     }
     .width('100%').alignItems(HorizontalAlign.Start)
-    .padding(12).backgroundColor('#FFFFFF').borderRadius(10).margin({ bottom: 10 })
+    .padding(S4).backgroundColor(C_SURFACE).borderRadius(R_MD).margin({ bottom: S3 })
   }
 
   /** 样本量的一行：左标签右数值。样本量与指标数值同等重要（没有它指标无法被信任）。 */
   @Builder
   sampleRow(label: string, value: string) {
     Row() {
-      Text(label).fontSize(12).fontColor('#666666').layoutWeight(1)
-      Text(value).fontSize(12).fontColor('#333333')
+      Text(label).fontSize(F_CAPTION).fontColor(C_TEXT_DIM).layoutWeight(1)
+      Text(value).fontSize(F_CAPTION).fontColor(C_TEXT)
     }
-    .width('100%').padding({ top: 3, bottom: 3 })
+    .width('100%').padding({ top: S1, bottom: S1 })
   }
 
   /** 页脚的一条口径说明 */
   @Builder
   note(text: string) {
-    Text(text).fontSize(11).fontColor('#888888').width('100%').margin({ bottom: 4 })
+    Text(text).fontSize(F_CAPTION).fontColor(C_TEXT_DIM).width('100%').margin({ bottom: S1 })
   }
 
   build() {
     Column() {
-      Text('使用统计').fontSize(20).fontWeight(FontWeight.Bold).margin({ top: 16 })
-      Text('spec §5.3 的三条验收指标，从落盘的历史数据算出来').fontSize(12).fontColor('#999999')
-        .margin({ top: 4, bottom: 12 })
+      Text('使用统计').fontSize(F_TITLE).fontWeight(FontWeight.Bold).fontColor(C_TEXT).margin({ top: S4 })
+      Text('spec §5.3 的三条验收指标，从落盘的历史数据算出来').fontSize(F_CAPTION).fontColor(C_TEXT_DIM)
+        .margin({ top: S1, bottom: S3 })
 
       Scroll() {
         Column() {
           // ── 空态横幅：三条**都**不可判定时才出现 ────────────────────────────
           // 逐条判定（而不是整页一个空态标志）是刻意的：一个从没收藏过、但已经刷过卡的用户，
           // 中位数/回弹率有样本、转化率没有 —— 那种情况下这一页仍然是"部分有数据"的。
+          // 底色用 `C_NOTICE`（暖砂）+ `C_ACCENT_TEXT`（5.58:1）：它必须与内容卡片
+          // （`C_SURFACE`）看得出区别，否则用户扫过去会把它也当成一张指标卡。
           if (!this.stats.medianVerdict.hasSample && !this.stats.rollbackVerdict.hasSample
             && !this.stats.conversionVerdict.hasSample) {
             Text('还没有数据：这台设备上还没有产生任何可统计的记录。刷几张照片之后再进来看。'
               + '（空数据不会被判成「达标」—— 三条指标都会显示「还没有数据」。）')
-              .fontSize(12).fontColor('#B26A00').width('100%')
-              .padding(10).backgroundColor('#FFF6E5').borderRadius(8).margin({ bottom: 10 })
+              .fontSize(F_LABEL).fontColor(C_ACCENT_TEXT).width('100%')
+              .padding(S3).backgroundColor(C_NOTICE).borderRadius(R_MD).margin({ bottom: S3 })
           }
 
           // ── 三条验收指标 ────────────────────────────────────────────────────
@@ -136,8 +154,8 @@ struct StatsPage {
 
           // ── 样本量：每一条都列出"参与计算的样本数" ──────────────────────────
           Column() {
-            Text('样本量').fontSize(13).fontWeight(FontWeight.Medium).fontColor('#333333')
-              .width('100%').margin({ bottom: 4 })
+            Text('样本量').fontSize(F_LABEL).fontWeight(FontWeight.Medium).fontColor(C_TEXT)
+              .width('100%').margin({ bottom: S1 })
             this.sampleRow('决策间隔的样本数（排除「上墙」）', `${this.stats.medianSample} 次`)
             // batch-39：回弹率的分母不再是"事件数"，而是**尝试次数**（一张照片的一次出现算一次）。
             // 标签必须把"含上墙"与"同卡重试只算一次"都写出来 —— 否则用户看到的 47 与
@@ -152,12 +170,12 @@ struct StatsPage {
             this.sampleRow('其中已被容量淘汰', `${this.stats.droppedCount} 条`)
           }
           .width('100%').alignItems(HorizontalAlign.Start)
-          .padding(12).backgroundColor('#FFFFFF').borderRadius(10).margin({ bottom: 10 })
+          .padding(S4).backgroundColor(C_SURFACE).borderRadius(R_MD).margin({ bottom: S3 })
 
           // ── 口径说明（可复核性：每个数是怎么来的，都写在这一段里）──────────
           Column() {
-            Text('口径说明').fontSize(13).fontWeight(FontWeight.Medium).fontColor('#333333')
-              .width('100%').margin({ bottom: 6 })
+            Text('口径说明').fontSize(F_LABEL).fontWeight(FontWeight.Medium).fontColor(C_TEXT)
+              .width('100%').margin({ bottom: S2 })
             this.note('· 回弹率 = **出现过回弹的尝试次数 ÷ 尝试次数**。'
               + '一次「尝试」= 一张照片的**一次出现**，所以：同一张卡"第一次没滑够弹回、再滑一次成功"'
               + '只算 **1 次**尝试（用户对这张照片的意图是一次，手滑不是第二次意图，这一组里回弹几次也只算 1）；'
@@ -193,12 +211,12 @@ struct StatsPage {
             this.note('· 本页**只读**：不做任何写入。要重置统计就删掉 files/metrics.json。')
           }
           .width('100%').alignItems(HorizontalAlign.Start)
-          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+          .padding({ left: S3, right: S3, top: S2, bottom: S2 })
         }
         .width('100%').alignItems(HorizontalAlign.Start)
       }
-      .layoutWeight(1).width('100%').padding({ left: 16, right: 16 }).scrollBar(BarState.Off)
+      .layoutWeight(1).width('100%').padding({ left: S4, right: S4 }).scrollBar(BarState.Off)
     }
-    .width('100%').height('100%').backgroundColor('#FAFAFA')
+    .width('100%').height('100%').backgroundColor(C_BG)
   }
 }
