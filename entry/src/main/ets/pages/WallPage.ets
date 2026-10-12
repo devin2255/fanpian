@@ -79,13 +79,25 @@ import { router } from '@kit.ArkUI';
 import { CHINA_REGION } from '../core/projection';
 import { parseAreaData } from '../core/areaData';
 import {
-  BADGE_H, BADGE_W, MARKER_COLOR, MARKER_R, MAX_MARKERS, PIN_COLOR, PIN_DOT_R, PIN_HALO_R,
-  TRACK_COLOR, TRACK_WIDTH, VIEW_PAD_RATIO, badgeRectOf, buildScene, dateLabel, defaultWallView,
+  BADGE_H, BADGE_W, MARKER_R, MAX_MARKERS, PIN_DOT_R, PIN_HALO_R,
+  TRACK_WIDTH, VIEW_PAD_RATIO, badgeRectOf, buildScene, dateLabel, defaultWallView,
   fitBounds, geoAspect, mapFrame, markerCountOf, outlinePath, panViewBy, refitViewToCanvas,
-  parseOutline, PROVINCE_STROKE, PROVINCE_WIDTH, trajectoryPath, viewMetrics, viewZoomOf,
+  parseOutline, trajectoryPath, viewMetrics, viewZoomOf,
   viewZoomRange, zoomViewAt
 } from '../core/render';
 import type { MapFrame, OutlineData, PinMarker, Rect, ScenePin, ViewMetrics, WallPhoto } from '../core/render';
+// 设计令牌（**全项目唯一的视觉取值处**）。
+// 本页是"两个世界同源"这句话的落点：地图那套配色**不被替换**，而是由令牌表**引用**
+// `core/render` 的既有常量（`C_MAP_BG = BLOCK_FILL`、`C_MAP_LINE = PROVINCE_STROKE`、
+// `C_MAP_TRACK = TRACK_COLOR`、`C_MAP_PIN = PIN_COLOR`、`C_MAP_MARKER = MARKER_COLOR`），
+// 所以"预览与设备必须是同一张图"这条前提一条都没动（断言在 designTokens.test.ts 里）。
+// 只有两个值（陆地填充、地名墨色）在 core/render 的 SVG 生成器里是内联字面量，
+// 于是它们的设备侧唯一定义处就是令牌表 —— 那里钉住了孪生位置。
+import {
+  C_ACCENT_TEXT, C_BG, C_LINE, C_MAP_BG, C_MAP_INK, C_MAP_LAND, C_MAP_LINE, C_MAP_MARKER,
+  C_MAP_PIN, C_MAP_TRACK, C_PHOTO_MAT, C_SURFACE, C_TEXT, C_TEXT_DIM,
+  F_CAPTION, F_LABEL, F_MICRO, LW_DIVIDER, LW_MAP_BORDER, LW_MAP_PROVINCE, R_SM, S1, S2, S3, S4, S5
+} from '../core/designTokens';
 // MAX_HANG 只在 core/placement.ts 里定义（设计 §6.2 的阈值那儿一份），render.ts 不转手导出。
 import { MAX_HANG } from '../core/placement';
 import { DecisionStore } from '../data/decisionStore';
@@ -110,8 +122,16 @@ const OUTLINE_RAW_NAME: string = 'china_outline.json';
  */
 const PROVINCE_RAW_NAME: string = 'china_provinces.json';
 
-/** 钉点标签的字号（fp）。见文件头"与预览刻意不同"的一处。 */
-const LABEL_FP = 8;
+/**
+ * 钉点标签的字号（fp）。见文件头"与预览刻意不同"的一处。
+ *
+ * ⚠️ 本批它改由令牌 `F_MICRO` 取值（**值同为 8**，所以这一处逐像素没有变化）：
+ *    字号阶梯的下界**刻意锚在 8**，正是因为这个值是真机验过的
+ *    （"从一道糊影变成能认出字"的那一档）—— 收敛字号时不许改掉它。
+ *    `labelW` 的估算（`字数 × 字号 + 6`）与它同源，所以标签的**宽度**也一字未变。
+ * 这里**不再留一个 `const LABEL_FP = 8` 的别名**：那会让"零硬编码"的守卫
+ *（它查 `.fontSize(<数字>)`）看不见这个 8，别名就成了守卫的一个盲区。
+ */
 /** 钉子的触摸命中区边长（pt）—— 钉点本身只有 3.4pt，手指点不到。 */
 const HIT_SIZE = 32;
 /**
@@ -165,8 +185,9 @@ struct WallPage {
   @State boxW: number = 0;
   @State boxH: number = 0;
   // ── 视野的四个验收数字（task-19）────────────────────────────────────────────
-  // **不在 build() 里用** —— 它们只进诊断行（用户截图 = 日志）。所以不放 @State，
-  // 直接在 `rebuild()` 里算完写进 `diag` 字符串，省掉 6 个会被 ArkUI 观察的字段。
+  // **不在 build() 里用**，只进 hilog（见 `rebuild()` 末尾那一段：它把这几个数打进
+  // `WALLDIAG` 行，本页原来还有一行把它们**画在屏幕上**的临时诊断行，已删除 ——
+  // 删它的理由与保留 hilog 的理由都写在 `rebuild()` 末尾）。
   // 数字全部来自 `core/render.viewMetrics`（预览图例与单测读的是同一个函数）：
   //   · 地图绘制宽/高（中国全域投影出来的尺寸）、两个比值；
   //   · 横向偏移 `westX`（中国西缘的屏幕 x，负 = 在屏幕左外侧）；
@@ -188,10 +209,19 @@ struct WallPage {
   @State selName: string = '';       // 面板标题里的地名
   @State selShown: number = 0;       // 该钉子在墙上画出来的标记数（少于张数时面板会说明）
   @State selPhotos: WallPhoto[] = []; // 该钉子的**全部**照片（照片一张都没丢，点开就在这儿）
-  // ── 诊断行（临时）────────────────────────────────────────────────────────────
-  // 真机上抓不到 hilog，所以把同样的数字**画在屏幕上**：用户截一张图就等于把日志交回来了。
-  // 这一行是为了拿 `boxW / boxH / mapH` 的真值（地图为什么小），定位完就该删掉。
-  @State diag: string = '';
+  // ── 那条「诊断行（临时）」已经删除（本批的发布阻塞项之一）───────────────────
+  // 它曾经是 `@State diag: string` + `rebuild()` 里拼一个大字符串 + `build()` 末尾
+  // 一行 `Text('诊断 …')`。存在的原因是**真机上抓不到 hilog**，所以把同样的数字画在
+  // 屏幕上，让用户截一张图就等于把日志交回来（task-19 就是靠它拿到
+  // `box 376×624.86` 那批真值的）。定位完成之后它必须走 —— 用户不该在自己的照片墙上
+  // 看到一串 `图框 376×624.86@(−232.12,0)`。
+  // **删除范围**（三个部分，一个都不留）：`@State diag` 字段、`rebuild()` 里为它拼的
+  // 那一整段字符串（连同只被它读的 `viewMetrics` / `viewZoomRange` 局部量）、
+  // `build()` 末尾那一行 `Text`。
+  // **保留**：同一批数字的 `hilog` 版本（每一条都还在，且带 `WALLDIAG` 前缀）——
+  // 它对开发者有用、**用户看不见**，而且真机排障只能靠它（这台设备上抓不到 hilog
+  // 是当时的**环境**问题，不是"日志没用"）。`viewIsDefault` 也保留：它不是诊断行的一部分，
+  // 而是「重置视野」按钮的可用态判据（见 build() 顶部那一行）。
 
   private store: DecisionStore = new DecisionStore(getContext(this) as common.UIAbilityContext);
   private idx: LocationIndex = new LocationIndex(getContext(this) as common.UIAbilityContext);
@@ -227,7 +257,7 @@ struct WallPage {
   /** 手势中的视觉平移（vp，作用在"平移层"容器上）。两个容器**嵌套**，合成顺序因此无歧义。 */
   @State gTx: number = 0;
   @State gTy: number = 0;
-  /** 当前是否就是"默认铺满"的视野（重置按钮的可用态 + 诊断行）。 */
+  /** 当前是否就是"默认铺满"的视野（**只**用于「重置视野」按钮的可用态；原来诊断行也读它，那一行已删除）。 */
   @State viewIsDefault: boolean = true;
 
   /** 默认视野（由数据 + 画布求出，见 `rebuild`）。**重置视野按钮**回到它。 */
@@ -372,11 +402,11 @@ struct WallPage {
       : this.defaultBounds;
     this.viewBounds = bounds;
     this.viewIsDefault = !this.userMoved;
-    // 地图块 = 整个主体区；框 = **恒填满高度**的那个不变形绘制框（宽度放不下时 x 为负 ——
+    // 地图块 = **整个主体区**；框 = **恒填满高度**的那个不变形绘制框（宽度放不下时 x 为负 ——
     // 横向溢出正是"左右横滑"的几何形态，见 core/render 的 MapFrame 一节）。
+    // `.backgroundColor(C_MAP_BG)`（`#F2F7EF`）就是"地图自己"：它以前是一块贴着卡片的底，
+    // 本形态下地图铺满整块主体区，所以这层底 = 海 + 视野内没有轮廓数据的地方。
     const frame: MapFrame = mapFrame(this.boxW, this.boxH, bounds);
-    // 四个验收数字（地图绘制宽/高、两个比值、横向偏移、可滑余量）——**只进诊断行**
-    const vm: ViewMetrics = viewMetrics(frame);
 
     // 国界：坐标已按 frame 平移过（与钉子同一个坐标系）；投影用的 bounds 就是 frame.bounds，
     // 与 buildScene 读的是同一处（outlinePath 已经没有 bounds 参数了）；视口剔除也在里面
@@ -422,7 +452,7 @@ struct WallPage {
       // 位置来自 core/render.badgeRectOf（右缘与最右那个标记对齐，绝不压点）。
       const b: Rect = badgeRectOf(p, ms);
       const label: string = n > 1 ? `${p.name} ·${n}` : p.name;
-      const labelW: number = Math.round(label.length * LABEL_FP + 6);
+      const labelW: number = Math.round(label.length * F_MICRO + 6);
       pinsView.push({
         idx: i,
         cx: r2(p.x),
@@ -431,7 +461,7 @@ struct WallPage {
         labelW: labelW,
         // 标签基线：钉点外沿（PIN_HALO_R）之上再抬 LABEL_LIFT，再留一个字号的高度。
         // 与预览的 `pinAnchorSvg` 同一个口径（差别只有字号：8fp vs 6.5 用户单位）。
-        labelY: r2(p.y - PIN_HALO_R - LABEL_LIFT - LABEL_FP),
+        labelY: r2(p.y - PIN_HALO_R - LABEL_LIFT - F_MICRO),
         hitX: r2(p.x - HIT_SIZE / 2),
         hitY: r2(p.y - HIT_SIZE / 2),
         badge: n > ms.length ? `+${n - ms.length}` : '',
@@ -446,36 +476,24 @@ struct WallPage {
     for (let i = 0; i < pins.length; i++) { located += pins[i].photos.length; }
     this.locatedTotal = located;
     this.shownTotal = markers.length;
-    // ── 诊断（临时）：真机上抓不到 hilog，所以把同样的数字也画在屏幕上 ──────────
-    // 用户截一张图就等于把日志交回来。task-19 要核对的是**新模型的四个数字**：
-    //   · `地图 W×H`：中国全域投影出来的尺寸（来自 `core/render.viewMetrics`）。
-    //     **`地图高/画布高` 必须是 1.00**（纵向铺满，用户那条硬要求）；
-    //     **`地图宽/画布宽` 必须 > 1**（本批真机是 2.2347 —— 这就是"要横滑"的判据）。
-    //   · `横偏 x`：中国西缘的屏幕 x（负 = 在屏幕左外侧）。默认视野下真机实测 −365.68pt；
-    //     **往西拖到头时它应当正好变成 0.00**（中国西缘贴住屏幕左缘、再拖就停）。
-    //   · `可滑 Npt`：横向还能滑多少（真机 464.25pt，即 34.256° 经度）。
-    //   · `填满`：`heightRatio` 的百分数。铺满那一档是 100%；放大态会 > 100%（地图比画布大，
-    //     正常）；**< 100% 才是缺陷**（画布上有空白带）。
-    // 其余几样沿用旧形态的核对点：`pins N ｜ 标记 M`（M = 每个钉子的 min(张数,5) 之和，
-    // 与"上墙"的差额就是所有「＋N」的和）、`国界/省界` 的 path 字符数（省界必须明显更大）、
-    // `视野态` 与 `手势 k/T`。
-    const diagBounds: string = `数据[${r2(dataBounds[0])},${r2(dataBounds[1])},${r2(dataBounds[2])},${r2(dataBounds[3])}]`
-      + `→铺满[${r2(bounds[0])},${r2(bounds[1])},${r2(bounds[2])},${r2(bounds[3])}]`;
-    // 可缩区间**从 core 读**（下界随画布比例变：真机 2.2347×~103.33×），不再手写 '1×'。
-    // `render.test.ts` 里有一条单测直接断言"显示的下界 == 反复缩小实际到达的下界"。
-    const zoomRange: number[] = viewZoomRange(this.boxW, this.boxH);
-    const zoomMin: number = zoomRange[0];
-    const zoomMax: number = zoomRange[1];
-    this.diag = `box ${r2(this.boxW)}×${r2(this.boxH)} ｜ 图框 ${r2(frame.w)}×${r2(frame.h)}@(${r2(frame.x)},${r2(frame.y)})`
-      + ` ｜ **地图 ${r2(vm.mapW)}×${r2(vm.mapH)}**（高/画布 ${r2(vm.heightRatio)} 宽/画布 ${r2(vm.widthRatio)}）`
-      + ` ｜ 横偏 ${r2(vm.westX)} 可滑 ${r2(vm.panSlackX)}pt`
-      + ` ｜ 视野 ${diagBounds}${vb !== undefined ? '(数据)' : '(全国)'}`
-      + ` ｜ 放大 ${r2(viewZoomOf(dataBounds))}×→${r2(viewZoomOf(bounds))}×`
-      + ` ｜ pins ${pins.length} ｜ 标记 ${markers.length}`
-      + ` ｜ 国界 ${chinaPath.length} 省界 ${provincePath.length} ｜ track ${this.trackPath.length}`
-      + ` ｜ 视野态 ${this.viewIsDefault ? '默认铺满' : '已改'}（可缩 ${r2(zoomMin)}×~${r2(zoomMax)}×）`
-      + ` ｜ 手势 k=${r2(this.gScale)} T=(${r2(this.gTx)},${r2(this.gTy)})`
-      + ` ｜ 上墙 ${this.walledTotal} 命中 ${located} 标记 ${markers.length}`;
+    // ── 验收数字（task-19）—— **只进 hilog，不再有一行画在屏幕上** ─────────────
+    // 原来这里还拼了一个大字符串写进 `@State diag`，由 `build()` 末尾画成一行 9fp 的
+    // 「诊断 …」。本批把它删掉了（发布阻塞项：用户不该在自己的照片墙上看到
+    // `图框 376×624.86@(−232.12,0)` 这种东西，见类字段区那段说明）。
+    // ⚠️ **下面这行 hilog 一条数字都没少** —— 它才是真机排障用的那一份（用户看不见）。
+    //    这四组数字为什么重要，逐条留在这里（这是 task-19 的验收口径，不是装饰）：
+    //      · `mapW/mapH` + `heightRatio/widthRatio`：**`地图高/画布高` 必须是 1.00**
+    //        （纵向铺满，用户那条硬要求）；**`地图宽/画布宽` 必须 > 1**
+    //        （真机 2.2347 —— 这就是"要横滑"的判据）。
+    //      · `westX`：中国西缘的屏幕 x（负 = 在屏幕左外侧）。默认视野下真机实测 −365.68pt；
+    //        **往西拖到头时它应当正好变成 0.00**（中国西缘贴住屏幕左缘、再拖就停）。
+    //      · `panSlackX`：横向还能滑多少（真机 464.25pt，即 34.256° 经度）。
+    //      · `heightRatio`：铺满那一档是 100%；放大态会 > 100%（地图比画布大，正常）；
+    //        **< 100% 才是缺陷**（画布上有空白带）。
+    //    其余几样沿用旧形态的核对点：`pins/markers`（标记数 = 每个钉子的 min(张数,5) 之和，
+    //    与"上墙"的差额就是所有「＋N」的和）、`chinaPath/provincePath` 的 path 字符数
+    //    （省界必须明显更大）、`boundsFromData`（视野是不是由数据推出来的）。
+    const vm: ViewMetrics = viewMetrics(frame);
     hilog.info(DOMAIN, TAG, '%{public}s',
       `${DIAG} rebuild：boxW=${this.boxW} boxH=${this.boxH}`
       + ` frameW=${frame.w} frameH=${frame.h} frameX=${frame.x} frameY=${frame.y}`
@@ -490,7 +508,8 @@ struct WallPage {
       + ` chinaPath.length=${chinaPath.length} provincePath.length=${provincePath.length}`
       + ` provinceRings=${this.provinceData === undefined ? 0 : this.provinceData.rings.length}`
       + ` trackPath.length=${this.trackPath.length}`
-      + ` walled=${this.walledTotal} located=${located} markers=${markers.length}`);
+      + ` walled=${this.walledTotal} located=${located} markers=${markers.length}`
+      + ` viewIsDefault=${this.viewIsDefault}`);
     // ── 这里**不许**再写 `this.selIndex = -1` ────────────────────────────────
     // 这行曾经在：`rebuild()` 只在"数据到了"或"画布尺寸变了"时跑，而 `onAreaChange` 每次
     // 画布尺寸变化都会调它（页面刚进来时布局还没稳定 → 会连着跑好几次）。
@@ -645,24 +664,35 @@ struct WallPage {
 
   build() {
     Column() {
-      // ── 顶部：返回 + 张数 ────────────────────────────────────────────────
+      // ── 顶部：返回 + 张数（+ 重置视野）────────────────────────────────────
+      // ⚠️ 这一行的内边距**刻意保留原值**（`left/right 12` + `top 10` + `bottom 8`），
+      //    没有全部换成间距令牌：它是**地图画布的输入** —— 这一行的高度直接决定下面
+      //    Stack 的高度（`boxH`），而文件头那批真机数字（`376×624.86`）就是在这组
+      //    内边距下量出来的。`12`/`8` 恰好等于 `S3`/`S2`（所以那三个已经写成令牌），
+      //    只有 `top: 10` 不在 4 的倍数阶梯上 —— 改它会让上面那条历史记录对不上，
+      //    而收益只是"少一个字面量"。这里如实写下这个例外，不假装它是干净的。
       Row() {
-        Text('‹ 返回').fontSize(15).fontColor('#1F6FEB').padding({ right: 12 })
+        // 「‹ 返回」= 强调**文字**（`C_ACCENT_TEXT`：对纸底 5.65:1）。
+        // 旧值 `#1F6FEB`（冷蓝）压旧底色只有 4.44:1 —— **不达标**，而它是这一页的
+        // 主要出路之一。本批换成暖赭同色相的深档，既达标又与地图的轨迹同源。
+        Text('‹ 返回').fontSize(F_LABEL).fontColor(C_ACCENT_TEXT).padding({ right: S3 })
           .onClick(() => { router.back(); })
         Text(`地图墙 ｜ ${this.pinsView.length} 个地点 · ${this.shownTotal} 个标记 / 上墙 ${this.walledTotal} 张`)
-          .fontSize(15).fontWeight(FontWeight.Medium).layoutWeight(1)
+          .fontSize(F_LABEL).fontWeight(FontWeight.Medium).fontColor(C_TEXT).layoutWeight(1)
         // ── 重置视野：一键回到"**铺满高度 + 数据居中**"（task-19）────────────
         // 放在**手势容器之外**（这一行在 Stack 外面），所以它不会被自己的手势缩放/平移，
         // 也不会与地图的拖动冲突 —— 一个"永远在原位"的按钮才找得到。
         // 已经在默认视野时变灰：不是禁用（点了也无害），而是告诉用户"你现在就是默认状态"。
         // 它**必须**存在：地图比画布宽 2.23 倍，用户横滑到西头之后得有一条回家的路。
+        // 两个状态的区分手段是**颜色**而不是"更灰的灰"：可用 = 强调文字色（5.65:1），
+        // 已铺满 = 次要文字色（5.34:1）—— 两者都达标，差别是"要不要你现在动手"。
         Text(this.viewIsDefault ? '已铺满' : '重置视野')
-          .fontSize(13)
-          .fontColor(this.viewIsDefault ? '#AAAAAA' : '#1F6FEB')
-          .padding({ left: 10 })
+          .fontSize(F_LABEL)
+          .fontColor(this.viewIsDefault ? C_TEXT_DIM : C_ACCENT_TEXT)
+          .padding({ left: S3 })
           .onClick(() => { this.resetView(); })
       }
-      .width('100%').padding({ left: 12, right: 12, top: 10, bottom: 8 })
+      .width('100%').padding({ left: S3, right: S3, top: 10, bottom: S2 })
 
       // ── 主体：整块都是地图（地图块 = 这个 Stack 的全部）─────────────────
       // 手势挂在这一层（最外），里面是**两层嵌套的变换容器**：
@@ -676,30 +706,39 @@ struct WallPage {
             // 地图块的底色 = 整个主体区。这一层就是"地图铺满主体区"最直接的体现：
             // 它替代了旧版那条只占上方 37% 的色带；task-19 之后**绘制框也填满高度**
             // （`mapFrame` 恒 `h == boxH`），所以"地图"与"主体区"在纵向是同一件事。
-            Column().width('100%').height('100%').backgroundColor('#F2F7EF')
+            // ⚠️ 这个值**不是**令牌表里新挑的颜色：它就是 `core/render.BLOCK_FILL`，
+            //    也就是 `tools/render-preview.ts` 产出 SVG 时用的那个底色（令牌表的
+            //    `C_MAP_BG` 直接引用它）。于是"在电脑上先看见的那张图"与真机是同一张图。
+            Column().width('100%').height('100%').backgroundColor(C_MAP_BG)
 
             // 国界：一条 path 装下 96 个环（不放 96 个组件）。
             // 坐标已经在 core/render.outlinePath 里按地图框平移过 —— 与钉子、卡片同一个坐标系。
+            // 「陆地是浅绿、海是底色」：`C_MAP_LAND` 的孪生位置是 core/render 的 SVG
+            // （`sceneToSvg` 里那个 `fill="#E8F0E4"`），线宽 `LW_MAP_BORDER` 同样是孪生值
+            // （`stroke-width="0.8"`）—— 那两处是内联字面量（core 不在本批可改范围内），
+            // 所以令牌表里把它们钉住，改一边必须改另一边。
             if (this.chinaPath.length > 0) {
               Shape() {
                 Path().width(this.boxW).height(this.boxH).commands(this.chinaPath)
               }
               .width(this.boxW).height(this.boxH)
               .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
-              .fill('#E8F0E4').stroke('#BFD3B8').strokeWidth(0.8)
+              .fill(C_MAP_LAND).stroke(C_MAP_LINE).strokeWidth(LW_MAP_BORDER)
             }
 
             // 省界：与国界**同一套机制**的第二条 path。
-            // ⚠️ 顺序不能反：国界那一层是**填充面**（陆地 `#E8F0E4`），省界是陆地内部的线 ——
+            // ⚠️ 顺序不能反：国界那一层是**填充面**（陆地 `C_MAP_LAND`），省界是陆地内部的线 ——
             // 画在填充之前会被整块盖掉（症状："数据里 107 条环，图上一条都看不见"）。
             // 也不能放到轨迹/照片之后：省界是底图信息，不是内容。
+            // 颜色与国界是**同一个值**（`C_MAP_LINE`），主次由线宽表达（0.5 vs 0.8）——
+            // 这条取舍的实测经过写在 core/render 的 PROVINCE_STROKE 注释里，此处不重复。
             if (this.provincePath.length > 0) {
               Shape() {
                 Path().width(this.boxW).height(this.boxH).commands(this.provincePath)
               }
               .width(this.boxW).height(this.boxH)
               .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
-              .fill(Color.Transparent).stroke(PROVINCE_STROKE).strokeWidth(PROVINCE_WIDTH)
+              .fill(Color.Transparent).stroke(C_MAP_LINE).strokeWidth(LW_MAP_PROVINCE)
               .strokeLineJoin(LineJoinStyle.Round)
             }
 
@@ -711,7 +750,7 @@ struct WallPage {
               }
               .width(this.boxW).height(this.boxH)
               .viewPort({ x: 0, y: 0, width: this.boxW, height: this.boxH })
-              .fill(Color.Transparent).stroke(TRACK_COLOR).strokeWidth(TRACK_WIDTH)
+              .fill(Color.Transparent).stroke(C_MAP_TRACK).strokeWidth(TRACK_WIDTH)
               .strokeOpacity(0.85)
               .strokeLineCap(LineCapStyle.Round).strokeLineJoin(LineJoinStyle.Round)
             }
@@ -726,7 +765,7 @@ struct WallPage {
             // 外层容器的变换，这些 key 一个都不变 → 标记组件**一个都不重建**，只是被整体缩放/平移。
             ForEach(this.markers, (m: WallMarker) => {
               Circle()
-                .width(MARKER_R * 2).height(MARKER_R * 2).fill(MARKER_COLOR)
+                .width(MARKER_R * 2).height(MARKER_R * 2).fill(C_MAP_MARKER)
                 .position({ x: m.x - MARKER_R, y: m.y - MARKER_R })
             }, (m: WallMarker) => `${m.key}@${m.x},${m.y}`)
 
@@ -736,22 +775,30 @@ struct WallPage {
               // （`pinAnchorSvg` 里的 halo），只有颜色字符串与半径从 core 读，本页不另写数。
               Circle()
                 .width(PIN_HALO_R * 2).height(PIN_HALO_R * 2)
-                .fill(Color.Transparent).stroke(PIN_COLOR).strokeWidth(0.6).opacity(0.4)
+                .fill(Color.Transparent).stroke(C_MAP_PIN).strokeWidth(0.6).opacity(0.4)
                 .position({ x: a.cx - PIN_HALO_R, y: a.cy - PIN_HALO_R })
               Circle()
-                .width(PIN_DOT_R * 2).height(PIN_DOT_R * 2).fill(PIN_COLOR)
+                .width(PIN_DOT_R * 2).height(PIN_DOT_R * 2).fill(C_MAP_PIN)
                 .position({ x: a.cx - PIN_DOT_R, y: a.cy - PIN_DOT_R })
+              // 地名墨色 `C_MAP_INK`（深苔绿）：孪生位置同样是 core/render 的 SVG
+              // （地名 `<text fill="#3F4A3C">` + 一圈浅色描边做 paint-order stroke）。
+              // 字号 `F_MICRO` **就是**原来那个 `LABEL_FP = 8`（令牌阶梯的下界刻意锚在 8，
+              // 因为它是真机验过的值）—— 所以这一处**逐像素没有变化**，只是取值改从令牌来。
+              // 对陆地的对比度 7.99:1、对地图底 8.57:1（见令牌表的对比度清单）。
               Text(a.label)
-                .fontSize(LABEL_FP).fontColor('#3F4A3C')
+                .fontSize(F_MICRO).fontColor(C_MAP_INK)
                 .width(a.labelW).textAlign(TextAlign.Center)
                 .position({ x: a.cx - a.labelW / 2, y: a.labelY })
               // 「＋N」：标记画不全时出现，点它等于点钉子。
               // 位置来自 core/render.badgeRectOf（右缘与最右那个标记对齐，绝不压点）。
+              // ⚠️ 颜色从 `#8A8A8A` 换成 `C_TEXT_DIM`：前者压陆地只有 **2.96:1**
+              //    （本批实测，见 designTokens.test 的旧色对照）—— 它是一个"还有几张"
+              //    的读数，读不清就等于没有。现在对陆地 5.20:1。
               if (a.badge.length > 0) {
                 Text(a.badge)
-                  .fontSize(8).fontColor('#8A8A8A')
-                  .width(a.badgeW + 8).textAlign(TextAlign.Center)
-                  .position({ x: a.badgeX - 4, y: a.badgeY })
+                  .fontSize(F_MICRO).fontColor(C_TEXT_DIM)
+                  .width(a.badgeW + S2).textAlign(TextAlign.Center)
+                  .position({ x: a.badgeX - S1, y: a.badgeY })
                   .onClick(() => { this.open(a.idx); })
               }
               // 命中区放**最后**：它是透明的、32vp 见方，点在钉点/标签/＋N 上都能落到它这里。
@@ -778,16 +825,16 @@ struct WallPage {
         // ⚠️ 位置用**块高的一半**（不是 `mapY`）：框可能只占块的一小半（广域视野），
         //    按 `mapY` 放会把提示挤到顶上那条带里。
         if (this.phase === 0) {
-          Text('正在读取地点…').fontSize(13).fontColor('#999')
+          Text('正在读取地点…').fontSize(F_LABEL).fontColor(C_TEXT_DIM)
             .width('100%').textAlign(TextAlign.Center).position({ x: 0, y: this.boxH / 2 })
         } else if (this.phase === 1 && this.markers.length === 0) {
           Column() {
             Text(this.walledTotal === 0
               ? '墙上还没有照片。\n在刷卡页右滑收藏，再点「上墙」—— 上墙的照片会出现在这张地图上。'
               : `上墙的 ${this.walledTotal} 张都没有地点，墙上没有可放的钉子。\n上墙时如果照片没有 GPS，可以手选省 / 市 / 县，那个地点就会成为墙上的一个钉子。`)
-              .fontSize(13).fontColor('#999').textAlign(TextAlign.Center)
+              .fontSize(F_LABEL).fontColor(C_TEXT_DIM).textAlign(TextAlign.Center)
           }
-          .width('100%').padding({ left: 28, right: 28 }).position({ x: 0, y: this.boxH / 2 - 16 })
+          .width('100%').padding({ left: S5, right: S5 }).position({ x: 0, y: this.boxH / 2 - S4 })
         }
       }
       .width('100%').layoutWeight(1).clip(true)
@@ -836,17 +883,20 @@ struct WallPage {
       })
 
       // ── 退化说明（国界/区划读不到时才出现）─────────────────────────────
+      // 用**强调文字色**（对纸底 5.65:1）而不是旧值 `#B08A5A`：后者压在旧底上只有 3.95:1
+      // 左右（不达标），而这一行恰恰是"地图少了东西"的唯一解释 —— 读不清就等于没有。
       if (this.note.length > 0) {
-        Text(this.note).fontSize(10).fontColor('#B08A5A')
-          .width('100%').padding({ left: 12, right: 12, bottom: 3 })
+        Text(this.note).fontSize(F_CAPTION).fontColor(C_ACCENT_TEXT)
+          .width('100%').padding({ left: S3, right: S3, bottom: S1 })
       }
-      // ── 诊断行（临时）：让用户截一张图就等于把日志交回来（真机上 hilog 抓不到）──
-      if (this.diag.length > 0) {
-        Text(`诊断 ${this.diag}`).fontSize(9).fontColor('#B08A5A')
-          .width('100%').padding({ left: 12, right: 12, bottom: 2 })
-      }
-      Text('双指缩放 · 左右拖动看全国 · 点钉子或「＋N」看这个地点的全部照片').fontSize(10).fontColor('#AAA')
-        .width('100%').padding({ left: 12, right: 12, bottom: 8 })
+      // ── 这里原来有一行「诊断 …」（临时）：已删除（本批的发布阻塞项之一）────────
+      // 它把 `rebuild()` 算出来的那串验收数字画在屏幕上（`box 376×624.86 ｜ 图框 …`），
+      // 好让用户截图代替 hilog。**删除的理由**：那是开发期取证用的东西，用户不该在
+      // 自己的照片墙上看到它。**保留的是同一批数字的 hilog 版本**（`rebuild()` 末尾那条
+      // `WALLDIAG rebuild：…`，一条都没少）—— 它开发者可用、用户不可见。
+      Text('双指缩放 · 左右拖动看全国 · 点钉子或「＋N」看这个地点的全部照片')
+        .fontSize(F_CAPTION).fontColor(C_TEXT_DIM)
+        .width('100%').padding({ left: S3, right: S3, bottom: S2 })
 
       // ── 点开钉子的详情：**这是看大图的地方**（本形态下墙上只有小圆点）────────
       // 判据只看 @State（`selIndex` / `selPhotos`），**不看 `this.pins`** —— 后者不是被观察的。
@@ -854,7 +904,7 @@ struct WallPage {
         this.detail()
       }
     }
-    .width('100%').height('100%').backgroundColor('#FAFAFA')
+    .width('100%').height('100%').backgroundColor(C_BG)
   }
 
   /**
@@ -873,28 +923,34 @@ struct WallPage {
   detail() {
     Column() {
       Row() {
-        Text(`${this.selName} ·${this.selPhotos.length} 张`).fontSize(13).fontWeight(FontWeight.Medium).layoutWeight(1)
-        Text('关闭').fontSize(13).fontColor('#1F6FEB')
+        Text(`${this.selName} ·${this.selPhotos.length} 张`)
+          .fontSize(F_LABEL).fontWeight(FontWeight.Medium).fontColor(C_TEXT).layoutWeight(1)
+        // 「关闭」= 强调文字色（5.65:1）。旧值 `#1F6FEB` 压白底是 4.63:1 —— 达标，
+        // 但它是全页唯一一个冷色，与地图的暖赭/苔绿/砖红三个色族都不同源。
+        Text('关闭').fontSize(F_LABEL).fontColor(C_ACCENT_TEXT)
           .onClick(() => { this.close(); })
       }
-      .width('100%').padding({ bottom: 6 })
+      .width('100%').padding({ bottom: S2 })
 
       // 只在"墙上没画全"时说明。`selShown` 是**画出来的圆点数**（= min(张数, MAX_MARKERS)）；
       // 这里是**全部**照片，一张都没少。旧的"受画布空间限制所以少挂 N 张"那套话术
       // 随卡片几何一起删掉了 —— 现在少画几个点与画布大小无关，是标记本身的上限。
       if (this.selShown > 0 && this.selShown < this.selPhotos.length) {
         Text(`墙上画了 ${this.selShown} 个标记（一个地点最多 ${MAX_MARKERS} 个），这里是全部 ${this.selPhotos.length} 张`)
-          .fontSize(10).fontColor('#999').width('100%').padding({ bottom: 4 })
+          .fontSize(F_CAPTION).fontColor(C_TEXT_DIM).width('100%').padding({ bottom: S1 })
       }
 
-      List({ space: 8 }) {
+      List({ space: S2 }) {
         ForEach(this.selPhotos, (p: WallPhoto) => {
           ListItem() {
             Column() {
+              // 缩略图底色 = **照片衬纸**（`C_PHOTO_MAT`，旧值 `#DCE8F5` 是一块冷蓝，
+              // 是这套暖色纸感里唯一一处"系统蓝"的残留）。它在图片加载完成前可见，
+              // 所以它必须与纸族同源，否则每次加载都会闪一块冷色。
               Image(p.photoId)
                 .width(72).height(92).objectFit(ImageFit.Cover)
-                .borderRadius(4).backgroundColor('#DCE8F5')
-              Text(dateLabel(p.takenAt)).fontSize(9).fontColor('#666').padding({ top: 2 })
+                .borderRadius(R_SM).backgroundColor(C_PHOTO_MAT)
+              Text(dateLabel(p.takenAt)).fontSize(F_MICRO).fontColor(C_TEXT_DIM).padding({ top: S1 })
             }
           }
         }, (p: WallPhoto) => p.photoId)
@@ -903,9 +959,9 @@ struct WallPage {
       .scrollBar(BarState.Off)
       .width('100%').height(120)
     }
-    .width('100%').padding({ left: 12, right: 12, top: 10, bottom: 12 })
-    .backgroundColor('#FFFFFF')
-    .border({ width: { top: 0.5 }, color: '#DDDDDD' })
+    .width('100%').padding({ left: S3, right: S3, top: S3, bottom: S3 })
+    .backgroundColor(C_SURFACE)
+    .border({ width: { top: LW_DIVIDER }, color: C_LINE })
   }
 }
 
