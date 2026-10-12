@@ -86,6 +86,13 @@ import {
   armMotionProbe, beginMotionProbe, motionAttempts, newMotionProbeState,
   releaseMotionProbe, settleMotionProbe
 } from '../core/motionProbeState';
+// 设计令牌（**全项目唯一的视觉取值处**）。本文件对令牌的用法有一条额外的硬约束：
+// **只改属性值，不新增节点、不新增手势、不动任何动效时序** —— 见 build() 里四个按钮
+// 上方那段"视觉层级方案"，以及 `C_PHOTO_MAT` 处"为什么不加阴影/描边"的说明。
+import {
+  C_ACCENT, C_ARCHIVE, C_FAV, C_ON_PHOTO, C_PHOTO_MAT, C_SCRIM, C_SURFACE, C_TEXT_DIM,
+  F_CAPTION, F_LABEL, LW_BORDER, R_LG, R_MD, S1, S2
+} from '../core/designTokens';
 
 // 与 pages/SwipePage.ets 同款口径（DOMAIN / TAG 在本项目里是全局一致的）。
 const DOMAIN = 0x0000;
@@ -1117,12 +1124,17 @@ export struct CardStack {
   @Builder
   motionBadge() {
     Text(this.motionOn ? '● 播放中' : '▶ 动态')
-      .fontSize(11)
-      .fontColor('#FFFFFF')
-      .padding({ left: 7, right: 7, top: 3, bottom: 3 })
-      .backgroundColor(this.motionOn ? '#1F6FEB' : 'rgba(0,0,0,0.55)')
-      .borderRadius(10)
-      .margin({ top: 8, right: 8 })
+      .fontSize(F_CAPTION)
+      .fontColor(C_ON_PHOTO)
+      .padding({ left: S2, right: S2, top: S1, bottom: S1 })
+      // 两个状态共用同一个节点（只改文案与底色）—— 见本 @Builder 的说明：
+      // 「播放中」用**主强调面**（`C_ACCENT` + 白字 4.94:1），待播态用**暖黑遮罩**
+      // （`C_SCRIM`：压在**最亮**的照片上、白字仍有 5.72:1，见 designTokens 的推导）。
+      // 旧值 `rgba(0,0,0,0.55)` 本身是达标的（4.74:1），改它是为了**余量与同源**
+      // —— 纯黑遮罩压在暖纸上会发青；这一条在令牌表里写了完整账，不在这里重复。
+      .backgroundColor(this.motionOn ? C_ACCENT : C_SCRIM)
+      .borderRadius(R_MD)
+      .margin({ top: S2, right: S2 })
   }
 
 
@@ -1194,16 +1206,29 @@ export struct CardStack {
       // 改一处必须改另一处。父组件量到 Stack 高之后乘 0.62 作为 cardHeight 传进来，
       // 所以 @Prop cardHeight 与本节点的高度是同一个值（不是估算）。
       .width('100%').height('62%')
-      .backgroundColor('#EEE')
-      .borderRadius(16)
+      // 卡片底 = **照片衬纸**（`C_PHOTO_MAT`）。旧值是 `#EEE` —— 一块中性冷灰：
+      // 在暖纸上它是一块"发灰的斑"，而不是"相纸"。
+      // ⚠️ 本批**刻意不加阴影、不加描边**（虽然任务把"阴影/描边"列为卡片要看的项），
+      //    两条理由都是真机上才成立的、不值得赌的东西：
+      //      · 阴影：本节点挂着 `.clip(true)`（放大溢出必须裁掉，见下面的说明）。
+      //        "阴影与裁剪谁先谁后"是平台行为 —— 赌错的形态是**裁剪把阴影切成一条黑边**，
+      //        那比没有阴影难看。收益（一点深度感）远小于代价。
+      //      · 描边：本节点的 borderWidth 已经有一个**语义**（长按播放时的按压反馈，
+      //        默认态是 0，注释里写着"与改动前逐像素一致"）。把默认态从 0 改成 1
+      //        会改掉那条已验证的事实；更要紧的是 border 会不会**内缩**照片的绘制框
+      //        （`Contain` 的换算与平移边界都读 `boxW/boxH`）在文档里没有明确保证 ——
+      //        而那是上一批刚在真机上验过的一整套管线。
+      //    深度感改由**三档明度**承担：纸 `C_BG` → 衬纸 `C_PHOTO_MAT` → 相纸 `C_SURFACE`。
+      .backgroundColor(C_PHOTO_MAT)
+      .borderRadius(R_LG)
       // 本批新增的按压反馈（另一半是角标变「播放中」）：长按起播期间给卡片一圈细描边。
       // 为什么是描边而不是"卡片轻微缩放"（任务里给的另一个例子）：
       // 描边是**布局内**的属性，不引入任何新的渲染变换；而卡片上已经有照片自身的
       // `.scale()`/`.offset()`（上一批验过的管线），再叠一个"卡片的 scale"会让
       // 两个变换的相对顺序变成需要读文档才能确定的东西 —— 那是本批最不值得冒的风险。
-      // 宽度为 0 时描边不画（默认态与改动前逐像素一致）。
+      // 宽度为 0 时描边不画（默认态与改动前逐像素一致 —— 见上面"刻意不加描边"那条）。
       .borderWidth(this.motionOn ? MOTION_PRESS_BORDER : 0)
-      .borderColor('#1F6FEB')
+      .borderColor(C_ACCENT)
       // **放大/平移后必须裁掉溢出**：Contain + 4× 的照片会画到卡片之外，
       // 不裁的话照片会盖住卡片下方的按钮行（那是"看不见的按钮还能点"的形态）。
       // 圆角是否被一并裁掉由平台决定（真机需看一眼），所以照片自身**不再**设 borderRadius：
@@ -1535,25 +1560,54 @@ export struct CardStack {
       // 四个按钮：卡片外侧、卡片下方一行等分（layoutWeight(1)）。位置取舍见 M1 报告：
       // 塞进卡片内会压住照片主体（违反「不遮挡」），放在卡片外还顺带避开了与卡片
       // PanGesture 的竞争。顺序按使用频率与危险度排：主页面（回首页）/ 归档 / 上墙 / 收藏。
-      Row({ space: 8 }) {
+      //
+      // ── 视觉层级方案（本批新增；这是"四个按钮一样重"的修法）────────────────────
+      // 旧版：四个**都是实心填充**（上墙是蓝的，其余三个是 `#E6E6E6` 的大灰块）——
+      // 四个等宽等高的实心块，没有任何一个更抢眼；三个灰块还占了卡片下方一大片面积，
+      // 与"照片是主角"直接冲突。
+      //
+      // 新方案用**两条互相独立的手段**表达"上墙是最重要的那一个"：
+      //   ① **面积**：一行里**只有**「上墙」是实心强调块（`C_ACCENT` + 白字 4.94:1），
+      //      其余三个是描边胶囊（`C_SURFACE` 底 + 1vp 边框 + 各自的语义墨色）——
+      //      实心块在一排描边里天然是唯一的视觉焦点，这条不依赖颜色深浅的判断；
+      //   ② **字重**：只有「上墙」的标签用 `FontWeight.Medium`，其余用默认字重。
+      //      去掉①或②中任意一条，层级仍然成立（所以它不是"两个弱手段凑一起"）。
+      //
+      // 三个次按钮**各自有墨色**，而且都不是随手挑的（全部 ≥ 4.5:1，见令牌表）：
+      //   · 主页面 = `C_TEXT_DIM`（**无色**）—— 它是导航，不是对这张照片的表态。
+      //     刻意让它成为唯一"没有颜色"的那一个，用户扫一眼就知道它不该按得快；
+      //   · 归档 = `C_ARCHIVE`（苔绿，与地图陆地同族）；
+      //   · 收藏 = `C_FAV`（暖砖红，与地图钉同族）。
+      //   （为什么归档不复用"无色"：那会让它与主页面**完全同形**，
+      //     用户必须读字才能分清"离开这一页"和"处理掉这张照片" —— 是实打实的误触成本。）
+      //
+      // 尺寸：四个都是 44vp 高（触摸目标下限），行高 48。改这一行**不影响刷卡手感**：
+      // `cardHeight`（位移阈值与翻出距离的基准）是父组件量到**卡片区**高度后乘
+      // `CARD_HEIGHT_RATIO` 得来的，与这一行无关；本行只让"卡片 + 按钮"整体在纵向的
+      // 居中位置挪了 2vp（Column 是 FlexAlign.Center）。
+      Row({ space: S2 }) {
         Button('主页面')
-          .fontSize(12).height(40).layoutWeight(1)
-          .backgroundColor('#E6E6E6').fontColor('#333333')
+          .fontSize(F_LABEL).height(44).layoutWeight(1).borderRadius(R_MD)
+          .backgroundColor(C_SURFACE).fontColor(C_TEXT_DIM)
+          .border({ width: LW_BORDER, color: C_TEXT_DIM })
           .onClick(() => { this.tapHome(); })
         Button('归档')
-          .fontSize(12).height(40).layoutWeight(1)
-          .backgroundColor('#E6E6E6').fontColor('#333333')
+          .fontSize(F_LABEL).height(44).layoutWeight(1).borderRadius(R_MD)
+          .backgroundColor(C_SURFACE).fontColor(C_ARCHIVE)
+          .border({ width: LW_BORDER, color: C_ARCHIVE })
           .onClick(() => { this.tapDecide('archive'); })
         Button('上墙')
-          .fontSize(12).height(40).layoutWeight(1)
-          .backgroundColor('#1F6FEB').fontColor('#FFFFFF')
+          .fontSize(F_LABEL).fontWeight(FontWeight.Medium).height(44).layoutWeight(1).borderRadius(R_MD)
+          .backgroundColor(C_ACCENT).fontColor(C_ON_PHOTO)
+          .border({ width: LW_BORDER, color: C_ACCENT })
           .onClick(() => { this.tapWall(); })
         Button('收藏')
-          .fontSize(12).height(40).layoutWeight(1)
-          .backgroundColor('#E6E6E6').fontColor('#333333')
+          .fontSize(F_LABEL).height(44).layoutWeight(1).borderRadius(R_MD)
+          .backgroundColor(C_SURFACE).fontColor(C_FAV)
+          .border({ width: LW_BORDER, color: C_FAV })
           .onClick(() => { this.tapDecide('fav'); })
       }
-      .width('100%').height(44)
+      .width('100%').height(48)
     }
     // 86% 与 SwipePage.ets 的 CARD_WIDTH_RATIO 曾经是同一个事实的两处表达；横向模型取消后
     // 宽度不再参与任何阈值，那个常量已随之删除，这里的 86% 只是纯布局。

@@ -15,6 +15,12 @@ import { MetricsState, emptyMetrics, recordSwipe, medianDecisionMs, rollbackRate
 // 本页**消费**上一页存下的会话：cursor 是位置的唯一真相，advance 是唯一的"刷过一张"操作，
 // isSessionDone 定义完成态，currentPhotoId 回答"当前该刷哪张"。
 import { SwipeSession, isSessionDone, currentPhotoId, advance } from '../core/session';
+// 设计令牌（**全项目唯一的视觉取值处**）。本页只换视觉：顶部行的高度、`CARD_HEIGHT_RATIO`
+// 的乘数、以及 CardStack 的手势/动画一行未动 —— 见 build() 顶部那段的说明。
+import {
+  C_ACCENT, C_BG, C_LINE, C_ON_PHOTO, C_SURFACE, C_TEXT, C_TEXT_DIM,
+  F_CAPTION, F_LABEL, F_TITLE, LW_BORDER, R_MD, R_SM, S2, S3, S4
+} from '../core/designTokens';
 
 // 卡片占「可用高度」的比例（与 CardStack.ets 的 .height('62%') 必须一致）。
 // settle() 的位移阈值与 navOut() 的翻出距离都以「卡高」为基准（NAV_DISTANCE_RATIO = 0.28 是
@@ -202,40 +208,64 @@ struct SwipePage {
 
   build() {
     Column() {
+      // ── 顶部行（本批：只换视觉，**不动尺寸**）────────────────────────────────
+      // ⚠️ 这一行的**高度必须保持不变**（12vp 上下内边距 + 28vp 的按钮 = 52vp）：
+      //    它直接决定下方 Stack 的高度，而 `cardH` 是"量到的 Stack 高 × CARD_HEIGHT_RATIO"
+      //    —— 屏幕上的位移阈值与翻出距离都以它为准。所以本批在这行里**只改样式不改高度**：
+      //    「收藏」按钮仍是 28vp 高（没有借机把它抬到 44vp 的触摸目标）—— 手感优先。
+      // 三个元素的信息层级（左 → 右，由重到轻）：
+      //    剩余张数 = `C_TEXT` / 13fp（这一屏唯一的"进度"读数，所以用主文字色）；
+      //    中位/回弹 = `C_TEXT_DIM` / 11fp（**给开发者与验收看的**读数，不该与进度抢）；
+      //    收藏入口 = 描边小胶囊（导航，不是内容动作）。
+      // 旧版这里还有一个隐性问题：「收藏」是 ArkUI 的**默认按钮样式**（系统蓝的实心胶囊）——
+      // 那是一个我们没写过、却真实存在的硬编码色，它让"跳页"看起来像"主操作"。
       Row() {
-        Text(`剩余 ${this.items.length - this.session.cursor}`).fontSize(13).fontColor('#666').layoutWeight(1)
-        Text(`中位 ${this.medianMs}ms  回弹 ${this.rollbackPct}%`).fontSize(12).fontColor('#999')
-        Button('收藏').fontSize(12).height(28).margin({ left: 10 })
+        Text(`剩余 ${this.items.length - this.session.cursor}`).fontSize(F_LABEL).fontColor(C_TEXT).layoutWeight(1)
+        Text(`中位 ${this.medianMs}ms  回弹 ${this.rollbackPct}%`).fontSize(F_CAPTION).fontColor(C_TEXT_DIM)
+        Button('收藏')
+          .fontSize(F_CAPTION).height(28)
+          .borderRadius(R_SM)
+          .backgroundColor(C_SURFACE).fontColor(C_TEXT_DIM)
+          .border({ width: LW_BORDER, color: C_LINE })
+          .padding({ left: S3, right: S3 })
+          .margin({ left: S2 })
           .onClick(() => { router.pushUrl({ url: 'pages/FavPage' }); })
-      }.width('100%').padding(12)
+      }.width('100%').padding(S3)
 
       Stack() {
         // 完成态放在前面，卡片分支是它的 else —— 让"会话刷完 ⟺ 不渲染卡片"成为结构事实，
         // 空会话（queue 为空 → isSessionDone 为真）也因此不可能去取 items[0] 而越界。
         if (isSessionDone(this.session)) {
           Column() {
-            Text('本会话刷完').fontSize(18).fontColor('#666')
+            // 「刷完了」是一个**状态**，不是正文：用 F_TITLE 而不是旧版的 18fp + `#666`
+            // （旧值其实达标，但"一句话用灰字"读起来像提示，而不像"这一局结束了"）。
+            Text('本会话刷完').fontSize(F_TITLE).fontColor(C_TEXT)
             // 池子比要刷的张数少时（用户取消了补货）本会话会短一些，这里如实报数，
             // 免得用户以为"我要 100 张，怎么刷了 30 张就完了"是丢照片。
-            Text(`本次共 ${this.items.length} 张`).fontSize(12).fontColor('#999').margin({ top: 6 })
+            Text(`本次共 ${this.items.length} 张`).fontSize(F_LABEL).fontColor(C_TEXT_DIM).margin({ top: S2 })
             // 「继续刷 N 张」= 回首页（router.back()），而不是就地再抽一批。
             // 理由：抽样这件事只有一个正门 —— 张数选择 + 池子不够时的补货都在首页，
             // 就地重抽要么在刷照片页复制一份"读池子/补货/抽样"的逻辑（两处判据迟早漂移），
             // 要么就会绕过张数选择（用户没法改主意）。回首页还顺带把
             // 「这局刷完了，下一局要不要换个张数」这个决定权交回给用户，而张数已经在
             // AppStorage 里存着，首页打开时就是同一个数（见 pages/ClaimPage.ets 的 SIZE_KEY）。
+            // 层级：这里是**完成态**，「继续刷」是唯一的主操作 → 实心强调块；
+            // 「返回上一张」是回看（次要）→ 描边胶囊。旧版两个都是系统默认的蓝色实心块，
+            // 于是"结束这一局"与"再看一眼刚划走的"一样重。
             if (this.session.size > 0) {
               Button(`继续刷 ${this.session.size} 张`)
-                .fontSize(14).height(40).width(200)
-                .backgroundColor('#1F6FEB').fontColor('#FFFFFF')
-                .margin({ top: 16 })
+                .fontSize(F_LABEL).fontWeight(FontWeight.Medium).height(44).width(220)
+                .borderRadius(R_MD)
+                .backgroundColor(C_ACCENT).fontColor(C_ON_PHOTO)
+                .margin({ top: S4 })
                 .onClick(() => { this.goHome(); })
             } else {
               // 取不到会话的兜底态（见 aboutToAppear）：没有可继续的张数，给一个诚实的入口
               Button('回首页开始')
-                .fontSize(14).height(40).width(200)
-                .backgroundColor('#1F6FEB').fontColor('#FFFFFF')
-                .margin({ top: 16 })
+                .fontSize(F_LABEL).fontWeight(FontWeight.Medium).height(44).width(220)
+                .borderRadius(R_MD)
+                .backgroundColor(C_ACCENT).fontColor(C_ON_PHOTO)
+                .margin({ top: S4 })
                 .onClick(() => { this.goHome(); })
             }
             // 队尾也必须能回头：否则用户在最后一张上滑之后就再也看不到刚划走的那张，
@@ -245,9 +275,11 @@ struct SwipePage {
             // —— 比不显示更糟（用户会以为 App 卡了）。完成态里 cursor 只可能是
             // queue.length（正常刷完）或 0（空会话），所以判据就是 cursor > 0。
             if (this.session.cursor > 0) {
-              Button('← 返回上一张').fontSize(14).height(40).width(160)
-                .backgroundColor('#1F6FEB').fontColor(Color.White)
-                .margin({ top: 12 })
+              Button('← 返回上一张').fontSize(F_LABEL).height(44).width(180)
+                .borderRadius(R_MD)
+                .backgroundColor(C_SURFACE).fontColor(C_TEXT_DIM)
+                .border({ width: LW_BORDER, color: C_TEXT_DIM })
+                .margin({ top: S3 })
                 .onClick(() => { this.navigate(1); })
             }
           }
@@ -272,7 +304,7 @@ struct SwipePage {
         if (h > 0) { this.cardH = h * CARD_HEIGHT_RATIO; }
       })
     }
-    .width('100%').height('100%').backgroundColor('#FAFAFA')
+    .width('100%').height('100%').backgroundColor(C_BG)
   }
 
   /**
