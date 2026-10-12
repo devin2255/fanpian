@@ -59,6 +59,37 @@ import {
 //      照片尺寸、`boxW/boxH`、四个手势、位移/回弹/翻出全部逐位不变。
 const CARD_HEIGHT_RATIO = 0.62;
 
+// ── batch-43：本常量**这一批仍然一行未动**，但理由与上一批不同（旧结论 + 新证据）──────
+// 上一批的禁令是"改它会带走两个真机验过的阈值"；本批要回答的是**另一个**问题：
+//   「`onAreaChange` 量到的可用区高 `H`，是不是把一个用户其实按不到的底部（系统手势区）
+//     也算进去了？若是，则 `CARD_HEIGHT_RATIO` 的基准偏大 —— 位移阈值与翻出距离是按一段
+//     够不着的区域标定的。」
+// 查 SDK 后的结论：**没有包含**，这条担心不成立。四条依据：
+//   ① `EntryAbility.ets` **没有**调 `setWindowLayoutFullScreen` / `setImmersiveModeEnabledState`，
+//      而 SDK 写着这两个都没调时 `getImmersiveModeEnabledState()` 默认返回 **false**
+//      （`@ohos.window.d.ts:8404-8407`）；非沉浸式的定义就是"布局**避让**状态栏与导航栏"
+//      （同文件 `:4504-4505`）。
+//   ② `common.d.ts:17531-17532`：系统避让区（状态栏、导航栏、挖孔区…）**就是页面容器的
+//      固有安全区内边距**；`expandSafeArea` 的生效前提也写着"组件边界要与安全区域重合"
+//      （`common.d.ts:17219-17225`）—— 即默认状态下内容本来就在安全区**内**。
+//   ③ 全仓 `git grep expandSafeArea|SafeArea|getWindowAvoidArea|avoidArea` = **零命中**，
+//      没有任何一处主动越界；`module.json5` / `app.json5` 也没有相关配置。
+//   ④ **真机旁证**：`WallPage` 在设备上量到的地图画布高（`box 376×663.71`，task-16）说明
+//      页面内容比屏幕 809.14 **短 66~125vp** —— 一个状态栏解释不了，底部必然也被避让
+//      （区间推导见报告 §1.4；`core/designTokens.ts` 的 `BOTTOM_SAFE_INSET` 也引了这条）。
+// ⇒ `H` = 安全区高（页面高 − 状态栏 − 导航条），**不含**手势区；`cardHeight = 0.62H`
+//   以及由它导出的位移阈值 / 翻出距离**不需要重新标定**，本批按"不许动它"处理。
+//   （顺带作废的是上一批那张表里的绝对 y —— 它把页面底当成了屏底。⚠️ 本批一度以为
+//    它还漏了本页根 Column 的 `.padding(S3)`，复核后**自己更正**：那个 `.padding(S3)`
+//    挂在**顶部行**上（本文件 `:300` 收的是那个 `Row`），根 Column（`:378`）没有内边距。
+//    所以"按钮下沿距页面底 2vp"这个数**是对的**，错的只有"页面底 = 屏底"这一句。）
+//
+// 本批唯一与"安全区"有关的改动**不在本文件**：动作行的底部净空 `BOTTOM_SAFE_INSET`
+// （`core/designTokens.ts`）加在 `ui/CardStack.ets` 的按钮行上，**刻意不加在本页的根 Column**
+// —— 加在这里会让 `H` 变小 ⇒ `cardHeight` 变小 ⇒ 照片盒跟着变小（竖幅照片被缩小，
+// `boxW/boxH` 与两个阈值一起变）。加在 `CardStack` 里则 `H` 一个数不变，
+// 净空是从"可见卡片"里让出来的。这是本批最要紧的一处层次选择。
+
 const DOMAIN = 0x0000;
 const TAG = 'PhotoWall';
 
