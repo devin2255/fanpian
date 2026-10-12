@@ -108,6 +108,16 @@ function errText(e: Object): string {
   return JSON.stringify(e);
 }
 
+/**
+ * 把 vp 数四舍五入到 0.1 —— **只服务于日志可读性**（batch-44 的几何取证用）。
+ * 与 `pages/SwipePage.ets` 的 `r1` 是同一个用途、同一个实现，但**刻意各留一份**：
+ * 两份代码分属两个编译单元，谁改谁的那份都不会悄悄影响对方；而它的语义只是"打日志时少几位小数"，
+ * 判据用的始终是节点量到的原值（`boxW/boxH/cardVis*` 一个都没有被它改写）。
+ */
+function round1(v: number): number {
+  return Math.round(v * 10) / 10;
+}
+
 export const NAV_VELOCITY = 800;         // vp/s：轻轻一甩就翻页
 export const NAV_DISTANCE_RATIO = 0.28;  // 卡高比例：拖到位也翻页
 export const SPRING_BACK_MS = 150;
@@ -370,6 +380,20 @@ export struct CardStack {
   private drawnW: number = 0;
   private drawnH: number = 0;
 
+  // ── 本批（batch-44）新增：**可见卡片**的量测（只进 hilog）────────────────────
+  // 上面 boxW/boxH 量的是**照片盒**；这两个量的是**可见卡片容器**（外层 Stack）。
+  // 两个一起量，才能把"照片盒与卡片各自由什么决定高度"从"读代码推"变成"设备上量"：
+  //   照片盒高 = `@Prop cardHeight`（= 父组件量到的可用区高 × 0.62，**一个数**）；
+  //   可见卡片高 = 可用区高 − 按钮行 48 − `BOTTOM_SAFE_INSET` 32（由 `layoutWeight(1)` 定）。
+  // 它们**不是同一个来源**，这就是"照片尺寸与卡片可见高度解耦"这条不变量的落点。
+  // 都是普通字段（不参与渲染，不该触发重渲染），只有 logCardGeometry() 读它们。
+  private cardVisW: number = 0;
+  private cardVisH: number = 0;
+  // 两份日志各自的"上一次内容"：`onAreaChange`/`onComplete` 都可能被重复触发
+  //（父组件重渲染、同一张照片重新解码），按内容去重才不会把日志刷成噪音。
+  private geoKey: string = '';
+  private photoKey: string = '';
+
   // ── 动图（本批新增）──────────────────────────────────────────────────────
   // 交给 Image 的动图描述符；undefined = 走静态 URI（**绝大多数**照片都是这条）。
   @State animDesc: DrawableDescriptor | undefined = undefined;
@@ -463,6 +487,10 @@ export struct CardStack {
     this.srcH = 0;
     this.drawnW = 0;
     this.drawnH = 0;
+    // batch-44：照片尺寸那行日志的**去重键**也必须跟着清 —— 否则「← 返回上一张」回到
+    // 同一张时会因为键相同而**不打那一行**，而用户恰恰是拿那几行做"三种比例对照"的。
+    // 语义与上面三个数完全一致：它们都是"这张照片长什么样"的度量，按卡（按次访问）重置。
+    this.photoKey = '';
   }
 
   /**
@@ -486,6 +514,96 @@ export struct CardStack {
     const o: PanOffset = clampOffset(this.panX, this.panY, c.width, c.height, this.boxW, this.boxH, this.zoomScale);
     this.panX = o.x;
     this.panY = o.y;
+  }
+
+  /**
+   * 卡片/照片盒几何的**设备读数**（batch-44 新增；只在 hilog 里，屏幕上不加任何东西）。
+   *
+   * ── 它回答的问题 ──────────────────────────────────────────────────────────────
+   *   batch-43 把 `BOTTOM_SAFE_INSET = 32` 加在按钮行上，让**可见卡片**矮了 32vp。
+   *   控制器质疑：若"可见卡片高"与"照片盒高"同源或相差不多，那么高受限的竖幅照片
+   *   （3:4，照片高 = 照片盒高）会被**压小或裁掉** —— 而 batch-43 只举了横幅与方形
+   *   （两种都是**宽受限**，照片尺寸只由盒**宽**决定，对盒高的变化天然不敏感）。
+   *   本批的回答分两层：
+   *     · **算**（离线，逐位对照 `d5cdf2c`）：照片盒是一个**固定数**（`@Prop cardHeight`），
+   *       不是"可见卡片的百分比"，所以卡片矮 32vp 动不了它；本机可用区高下二者相差
+   *       **200.5vp**，且"盒 < 卡"这条不等式对任意 `H > 210.5` 都成立 —— 不存在"相差不多"。
+   *       三种比例的照片显示尺寸因此**逐位不变**（证明脚本 `fix-batch-44-layout.mjs`）。
+   *     · **量**（本函数）：上面那句是"读代码 + 算术"，本函数让它在设备上可核 ——
+   *       两个数各自量出来，`放得下`那一项直接回答"照片盒会不会被卡片挤到"。
+   *   两层的结论必须一致；若真机上不一致（例如卡片高 ≠ 可用区 − 80），
+   *   那就说明本页的布局假设在该机型/该窗口模式下不成立 —— 那正是要看见的东西。
+   *
+   * ── 怎么读（写在这里，报告里也有一份对着真机读的期望值）─────────────────────────
+   *   · `照片盒` 应恒等于 `0.62 × 可用区H`（可用区H 见 SwipePage 的 `[标尺]` 那一行），
+   *     **与卡片高无关** —— 这就是"解耦"的直接证据；
+   *   · `可用卡片` 应恒等于 `可用区H − 80`（按钮行 48 + 净空 32）。若它等于 `可用区H − 48`，
+   *     说明那 32vp 的 `margin` 没有被 `layoutWeight(1)` 算进固定高度 ⇒ 按钮行会溢出可用区
+   *     （batch-43 的净空**没生效**）—— 这一行日志就是它的哨兵；
+   *   · `照片盒/卡片` 应 ≈ **0.6954**（H = 738.14 时）；远小于 1 ⇒ 不存在"相差不多"。
+   *
+   * ⚠️ 边界：它是**只读**回调，不改任何布局、不进任何算式（`boxW/boxH` 的写入点仍在
+   *    照片盒自己的 `onAreaChange` 里，本批只在那里加了一次调用）。
+   *    它也**不**看 `@Prop cardHeight` 以外的高度来源 —— 那个数就是"照片盒高"本身。
+   */
+  private logCardGeometry(): void {
+    if (this.cardVisW <= 0 || this.cardVisH <= 0) { return; }
+    if (this.boxW <= 0 || this.boxH <= 0) { return; }   // 照片盒还没量到：等它那次回调
+    const key: string = `${this.cardVisW}x${this.cardVisH}|${this.boxW}x${this.boxH}`;
+    if (key === this.geoKey) { return; }
+    this.geoKey = key;
+    const slack: number = this.cardVisH - this.boxH;
+    const fits: string = slack >= 0 ? '是' : '**否（照片盒比卡片高，会被裁）**';
+    hilog.info(DOMAIN, TAG, '%{public}s',
+      `[卡片几何] 可见卡片=${round1(this.cardVisW)}×${round1(this.cardVisH)} `
+      + `照片盒=${round1(this.boxW)}×${round1(this.boxH)} `
+      + `照片盒/卡片=${round1(this.boxH / this.cardVisH)} `
+      + `照片盒放得下=${fits} 余量=${round1(slack)} `
+      + `(照片盒应=0.62×可用区H；可见卡片应=可用区H−80；可用区H 见 [标尺] 行)`);
+    // 与几何同一时刻打"阈值基准"，因为两者读的是**同一个 `@Prop cardHeight`** ——
+    // 放在这里而不是另一个回调里，是为了让"照片盒 == 阈值基准"这条等式在同一屏日志里可核。
+    this.logCardBasis();
+  }
+
+  /**
+   * 把 `@Prop cardHeight`（= 照片盒高）**按父组件口径**再打一遍 —— 它同时是三个读者的输入
+   * （位移阈值 / 翻出距离 / 照片盒），所以"它在真机上到底是多少"值得留一行。
+   * 只读，且只在这一行日志里出现。
+   */
+  private logCardBasis(): void {
+    hilog.info(DOMAIN, TAG, '%{public}s',
+      `[阈值基准] cardHeight=照片盒高=${round1(this.cardHeight)} `
+      + `⇒ 位移阈值=${round1(this.cardHeight * NAV_DISTANCE_RATIO)} `
+      + `翻出距离=${round1(this.cardHeight * 1.2)} 速度阈值=${NAV_VELOCITY}`);
+  }
+
+  /**
+   * 照片**实际绘制尺寸**的设备读数（batch-44 新增；只在 hilog 里）。
+   *
+   * 它是待办①"三种比例照片尺寸逐位不变"这条结论在真机上的**正面证据**：
+   * 用户滑到一张竖幅照片时，这一行会打出 `内容=<宽>×<高>`，与离线表里的
+   * `343.2×457.6`（3:4，H=738.14 时）对得上即为"照片没被改小"。
+   * 三种比例在**同一次会话**里各滑一张，就能得到三行可对照的读数。
+   *
+   * ⚠️ 单位按本仓库既有口径：`源` 是 px（SDK 明说 onComplete 报的是像素），
+   *    `内容` 是 vp（与 `resolveContentSize` 的既有用法一致，上一批真机验过）。
+   *    **即便这个单位约定在别的机型上不成立**，"内容宽/内容高"的**比值**仍然有效 ——
+   *    比值是判"哪一条边受限"的判据，与单位无关。
+   * 只在"换了照片或换了尺寸"时打（`photoKey` 去重）：同一张解码两次不重复刷屏。
+   */
+  private logPhotoDrawn(): void {
+    if (this.drawnW <= 0 || this.drawnH <= 0) { return; }
+    if (this.boxW <= 0 || this.boxH <= 0) { return; }   // 盒还没量到：这一次先不打（下一次回调会再来）
+    const key: string = `${this.item.photoId}|${this.drawnW}x${this.drawnH}`;
+    if (key === this.photoKey) { return; }
+    this.photoKey = key;
+    const boxAspect: number = this.boxW / this.boxH;
+    const limited: string = (this.drawnW / this.drawnH >= boxAspect) ? '宽受限' : '高受限';
+    hilog.info(DOMAIN, TAG, '%{public}s',
+      `[照片尺寸] 源=${this.srcW}×${this.srcH}px 内容=${round1(this.drawnW)}×${round1(this.drawnH)}(vp) `
+      + `比例=${round1(this.drawnW / this.drawnH)} ${limited} `
+      + `照片盒=${round1(this.boxW)}×${round1(this.boxH)}(盒比例=${round1(boxAspect)}) `
+      + `(高受限的照片：内容高应恒等于照片盒高=cardHeight，与可见卡片高无关)`);
   }
 
   // ── 动图：装载 / 释放 ─────────────────────────────────────────────────────
@@ -904,6 +1022,10 @@ export struct CardStack {
     }
     // 尺寸变了 → 平移边界跟着变（首次拿到尺寸时把"算不出"变成"算得出"）
     this.reclampPan();
+    // batch-44：把"这张照片实际画了多大"打一行 —— 它是待办①（三种比例照片尺寸逐位不变）
+    // 在真机上的**正面证据**。**位置在 reclampPan 之后**：日志不得改变上面任何一步的行为
+    // （它只读 drawnW/drawnH/boxW/boxH，一个都不写）。
+    this.logPhotoDrawn();
   }
 
   /**
@@ -1263,6 +1385,32 @@ export struct CardStack {
         //     写 `'62%'` 会得到 0.62 × 690.14 = 427.9（照片会整体缩 6.6%，且竖幅照片被缩小）；
         //   · `@Prop cardHeight` 是**唯一**与父组件同源的数，也是下面 `settle()` / `navOut()`
         //     读的同一个数 —— 于是"照片盒高 == 阈值基准高"这件事仍然只有一处定义。
+        //
+        // ── batch-44 复核：batch-43 加的 32vp 净空**有没有动到照片**（逐位对照 `d5cdf2c`）──
+        // 结论：**没有**。这一行的 `.height(this.cardHeight)` 是"照片盒的基准与卡片可见高度
+        // 解耦"这条要求的**落点**，而它上面那一行（可见卡片）= `layoutWeight(1)`
+        // = 「可用区 − 按钮行 48 − `BOTTOM_SAFE_INSET` 32」——两者**不同源**：
+        //   照片盒高 = `cardHeight` = `0.62 × 可用区H`（一个**乘出来的数**，与卡片高无关）
+        //   可见卡片高 = 可用区H − 80（由**布局**定）
+        // 本机可用区高（`H = 738.14`，见 SwipePage 的 `[标尺]` 日志）下：**457.65 vs 658.14**，
+        // 相差 **200.5vp**；而且"盒 < 卡"对任意 `H > 210.5` 都成立（`0.62H < H − 80`）——
+        // 所以控制器担心的那个前提（"卡片容器高与照片盒高同源或相差不多"）**不成立**，
+        // 高受限的竖幅照片**不会**被 32vp 挤到（它需要 457.65，卡里有 658.14）。
+        // 三种比例的照片显示尺寸（`Contain`，盒 = 353.44 × 457.65，与 `d5cdf2c` **同一个矩形**）：
+        //   横幅 1.4396 → 353.44×245.51（宽受限）｜方形 1.0 → 353.44×353.44（宽受限）
+        //   **3:4 竖幅 → 343.24×457.65（高受限，唯一真正敏感的一档）**
+        // 逐位对照表与证明脚本：`fix-batch-44-layout.mjs`（从两个 revision 的源码各读一次常量，
+        // 对每种比例断言"两版照片矩形逐位相同"）。
+        // ⚠️ 一处**旧读数的更正**（batch-43 报告 §5.2 的竖幅那一行）：它写的是
+        //   "0.62H **见方** ≈ 392~428" —— 方的是**盒**（353.44 × 457.65），不是照片；
+        //   3:4 照片是 `0.75×盒高 × 盒高` = **343.24 × 457.65**（高受限时照片高 = 盒高）。
+        //   "与改前逐位相同"这条结论**没被推翻**（两个版本的照片盒是同一个矩形），
+        //   作废的只是那一行让人误以为"照片也是个方块"的措辞与缺掉的宽度。
+        // ⚠️ 另一条边界（只登记、不改动）：这里的"盒 < 卡"是**本机可用区高**下的事实；
+        //   首帧尚未量到高度时 `cardHeight` 取兜底 600（见 @Prop 的说明），
+        //   而 batch-43 把可用卡片压矮 32vp 之后，`600 < 可用区H − 80` 的成立门槛
+        //   从 `H > 648` 抬到 `H > 680`（本机 738.14 仍有余量）。真机上由
+        //   `[卡片几何]` 那行的 `照片盒放得下` 直接看着 —— 那正是加这行日志的理由。
         .width('100%').height(this.cardHeight)
         // 放大/平移后必须裁掉溢出（与改动前同一节点、同一语义）：`Contain` + 4× 的照片会
         // 画到照片盒之外。裁在**照片盒**上而不是外层容器上，是为了让"4× 时看得到多少"
@@ -1281,6 +1429,9 @@ export struct CardStack {
             this.boxH = h;
             this.reclampPan();
           }
+          // batch-44：两个量都到齐时打一行"卡片/照片盒几何"（见 logCardGeometry）。
+          // **放在最后**：上面那三行是既有行为（`boxW/boxH` 是平移边界的输入），一个字未动。
+          this.logCardGeometry();
         })
       }
       // 外层容器 = 可见的卡片：`layoutWeight(1)` 让它吃满「顶部行之下、按钮行之上」。
@@ -1348,6 +1499,21 @@ export struct CardStack {
       // 那时它绝不允许盖住顶部行或按钮行。
       .clip(true)
       .translate({ x: this.dx, y: this.dy })
+      // ── batch-44 新增：**可见卡片**的量测（只读）──────────────────────────────────
+      // 这里是"照片盒会不会被卡片挤到"这个问题的另一半输入：照片盒的高由 `@Prop cardHeight`
+      // 定（已在上面量到），可见卡片的高由 `layoutWeight(1)` 定 —— 两者**不同源**，
+      // 所以需要各自量一次才能在设备上核"它们相不相同"（见 logCardGeometry 的说明）。
+      // ⚠️ 只读：不写任何 @State、不改布局、不加节点；`translate` 只改绘制位置、不改
+      //    布局区域，而本回调的键只取 w×h —— 拖动卡片不会因此刷日志。
+      .onAreaChange((_oldArea: Area, newArea: Area) => {
+        const w: number = Number(newArea.width);
+        const h: number = Number(newArea.height);
+        if (w > 0 && h > 0) {
+          this.cardVisW = w;
+          this.cardVisH = h;
+        }
+        this.logCardGeometry();
+      })
       // ── 三个手势共存（本批最大风险点）──────────────────────────────────────
       // 手势组必须是 **GestureMode.Parallel**，这不是随手选的：
       //   · `Exclusive` 的语义（gesture.d.ts:180-186）是「一旦有手势识别成功，识别过程即结束、

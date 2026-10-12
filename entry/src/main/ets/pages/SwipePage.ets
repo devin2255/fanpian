@@ -1,5 +1,5 @@
 import { common } from '@kit.AbilityKit';
-import { router } from '@kit.ArkUI';
+import { componentUtils, display, router, UIContext, window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { DecisionStore } from '../data/decisionStore';
 import { SessionStore, takeSession } from '../data/sessionStore';
@@ -77,8 +77,32 @@ const CARD_HEIGHT_RATIO = 0.62;
 //   ④ **真机旁证**：`WallPage` 在设备上量到的地图画布高（`box 376×663.71`，task-16）说明
 //      页面内容比屏幕 809.14 **短 66~125vp** —— 一个状态栏解释不了，底部必然也被避让
 //      （区间推导见报告 §1.4；`core/designTokens.ts` 的 `BOTTOM_SAFE_INSET` 也引了这条）。
+//      ⚠️ **batch-44 复核：这一条不算证据**（结论本身既没被证实、也**没被推翻** —— 它只是
+//      "不足以定案"）。三条理由，逐条都是上面那句的漏洞：
+//        · 它是**推断的推断**：`boxH` 本身就不是量出来的，而是"624.86（量到的画布高）+
+//          被删掉的诊断行 13~14.6vp"反推的 638（还叠了一个 ±3 的余量）；
+//        · 剩下那一大截要靠"两行文字各自的字号 × 行高倍数 × 会不会换行"去猜，
+//          于是区间宽到 [66, 125] —— **区间宽度 59vp 比结论量级还大**；
+//        · 更要紧的是：**控制器质疑的对象是 624.86 这个数本身**（它是地图墙那个
+//          `layoutWeight(1)` Stack 的量测值，**不是页面高**），核对后**这条质疑成立**：
+//          那段算式里 `boxH` 只是页面框架中的一项，被当成了"页面主体高"的唯一输入。
+//      ⇒ 本批**不拿它下结论**（①②③ 是 SDK 与源码层面的事实，仍然成立、一条未删），
+//        改为**造一个能量出确定数字的手段**：见本文件下面的「安全区标尺」
+//        （`logSafeAreaRuler`，**只进 hilog**）。真机跑一次，这一条就能从"推断"变成"测量"。
 // ⇒ `H` = 安全区高（页面高 − 状态栏 − 导航条），**不含**手势区；`cardHeight = 0.62H`
 //   以及由它导出的位移阈值 / 翻出距离**不需要重新标定**，本批按"不许动它"处理。
+//   ⚠️ 上面这行结论**本批维持不变，但它的证据等级要如实降一档**：现在它是"①②③ 支持、
+//      ④ 待测"的**待验证结论**，不再是"四条依据齐备"。标尺那四行日志就是它的判决书，
+//      判据有**两条互相独立**的（完整口径写在 `logSafeAreaRuler`）：
+//        · 主判据 = **直接量**内容底到屏底的距离 `C = 屏高 − (可用区.screenOffset.y + 可用区H)`
+//          （`ComponentInfo.screenOffset` 的 SDK 原话是"Offset of the component relative to the
+//          screen"），C ≥ 24 ⇒ 不含手势区、C < 24 ⇒ 含 —— **一次定案**；
+//        · 副判据 = 不依赖任何位置接口的**有界**区间 `C ∈ [B+A−40, B+A]`（见 A/B 的定义），
+//          下界 ≥ 24 ⇒ 不含、上界 < 24 ⇒ 含、跨过 24 ⇒ 老实说"灰区、待人工判"。
+//      两条都打印、且主判据会与副判据区间对一次（落在里面才算互相印证）。
+//      无论哪一种读数成立，"不改 `CARD_HEIGHT_RATIO`"这个**动作**都不变 —— 因为
+//      `BOTTOM_SAFE_INSET` 的推导（`core/designTokens.ts`）在"页面已避让"与
+//      "页面铺到屏底"**两种假设下都成立**，它不依赖本条结论。
 //   （顺带作废的是上一批那张表里的绝对 y —— 它把页面底当成了屏底。⚠️ 本批一度以为
 //    它还漏了本页根 Column 的 `.padding(S3)`，复核后**自己更正**：那个 `.padding(S3)`
 //    挂在**顶部行**上（本文件 `:300` 收的是那个 `Row`），根 Column（`:378`）没有内边距。
@@ -97,6 +121,60 @@ const TAG = 'PhotoWall';
 function errText(e: Object): string {
   if (e instanceof Error) { return e.message; }
   return JSON.stringify(e);
+}
+
+/**
+ * 把 vp 数四舍五入到 0.1 —— **只服务于日志的可读性**（batch-44 的安全区标尺用）。
+ * 意图是"人眼扫一行就能读"，不是"改精度"：**判据用的是节点量到的原值**，
+ * 这个函数只出现在拼日志字符串的地方，不进任何算式、也不参与任何比较。
+ */
+function r1(v: number): number {
+  return Math.round(v * 10) / 10;
+}
+
+// ── 安全区标尺（batch-44）的两个**口径常量**：它们是判据的一部分，所以住在代码里而不是注释里 ──
+/**
+ * 手势导航条的高度（vp）—— 判据里的"手势带"按它计。
+ * 取值来源与 `core/designTokens.ts` 的 `BOTTOM_SAFE_INSET` 同源（那里是 24 + 8 = 32）：
+ * 24 是"从屏幕底部边缘上滑"那个手势的来源区高度。**不用平台接口取它**：`getWindowAvoidArea`
+ * 在非沉浸式下返回的是避让高度还是 0 本仓库未实测（见 `avoidAreaText` 的 ⚠️），
+ * 拿它当判据就是把没跑过的分支当证据。这里要的是一个**判据阈值**，宁可写死、写清来源。
+ */
+const GESTURE_BAR_VP = 24;
+
+/**
+ * 状态栏高度的**上界**（vp）—— 用来把"页面上下内边距之和 A"约束成一个**区间**。
+ * 40 这个数取自 `core/designTokens.ts` 里已有的那档最宽取值（batch-43 的推导里用过
+ * "即使把状态栏按最宽的一档取（40vp）"）。它是**上界**，不是测量值：
+ * 区间两端各判一次之后，只有真正跨过 `GESTURE_BAR_VP` 的情形才会被标成"灰区、待人工判"。
+ */
+const STATUS_BAR_MAX = 40;
+
+/**
+ * 标尺要量的两个节点的 **id**（`getRectangleById` 的输入）。
+ *
+ * ⚠️ 为什么必须给节点起 id：`UIContext.getComponentUtils().getRectangleById(id)` 是**唯一**
+ * 能拿到"组件相对**屏幕**的偏移"（`ComponentInfo.screenOffset`，SDK 原话
+ * "Offset of the component relative to the screen"）的接口 —— 而那个偏移正是本标尺要用
+ * **一次定案**判据：`内容底距屏底 = 屏高 − (可用区.screenOffset.y + 可用区H)`。
+ * 加 `.id()` 是**属性**改动：不新增节点、不改布局、不影响命中区与任何阈值
+ * （`id` 只被查询接口读）。两个 id 在全页唯一。
+ */
+const SR_ID_TOP_ROW = 'srTopRow';
+const SR_ID_AREA = 'srArea';
+
+/**
+ * `Length | undefined` → number（缺省/非法一律 0）。
+ * 存在的理由很具体：`Area.position` / `Area.globalPosition` 的 x/y 在 SDK 里是**可选**的，
+ * 而 `Number(undefined)` 得到的是 **NaN** —— NaN 一路拼进日志会打印成 "NaN"，
+ * 读日志的人无法区分"平台没报这个值"与"平台报了个 NaN"。这里把它压成 0 并在下一行照打，
+ * 语义由字段处的 ⚠️ 负责（0 = 读不到或真的是 0，两者都不当判据）。
+ */
+function finiteOrZero(v: Length | undefined): number {
+  if (v === undefined) { return 0; }
+  const n: number = Number(v);
+  if (!Number.isFinite(n)) { return 0; }
+  return n;
 }
 
 @Entry
@@ -148,6 +226,19 @@ struct SwipePage {
   private metricsDirty: boolean = false;
   private readonly SAVE_DEBOUNCE_MS: number = 1000;
 
+  // ── 本批（batch-44）新增：**安全区标尺**（只进 hilog）──────────────────────────
+  // 两个字段是**量到的**几何（`onAreaChange` 给的真值，vp），第三个是"只打一次"的闸门。
+  // 它们**不参与任何判定**：`cardHeight` 的算式一个字都没动（见 build() 的两处 onAreaChange）。
+  private srTopRowH: number = 0;   // 顶部行量到的高（vp）—— 与"窗口高 − 可用区"配成一对自校验
+  private srAreaH: number = 0;     // 可用区（本页 Stack）量到的高（vp）= 喂给 cardHeight 的那个 H
+  // 顶部行的两个**位置**读数：只在第 4 行当"第三读数"打印（主判据是 `screenOffset`，
+  // 见 screenOffsetY 的说明）。⚠️ 它们的参照系在 ArkUI 文档里写的是"父节点 / 页面"，
+  //   而"页面"是否等于窗口根**本批未核实** —— 所以它们**不参与**判定，
+  //   只在主判据读不到时，给人一个能对着第 3 行避让区互相印证的读数。
+  private srTopRowPosY: number = 0;
+  private srTopRowGlobalY: number = 0;
+  private srLogged: boolean = false;
+
   aboutToAppear(): void {
     // 数据源 = 上一页（首页）存下的会话；取走即清空（takeSession）——
     // 一局会话只能被消费一次，杜绝"再次进入本页时把上一局的队列从头再刷一遍"。
@@ -191,6 +282,12 @@ struct SwipePage {
     this.medianMs = Math.round(medianDecisionMs(this.metrics));
     this.rollbackPct = Math.round(rollbackRate(this.metrics) * 100);
     this.shownAt = Date.now();
+    // 标尺每次进本页都重新量一次（读数会随窗口模式变化：全屏 / 分屏 / 悬浮窗），
+    // 但**仍然只打一次**（`srLogged`）—— 布局在首帧后会多次触发 onAreaChange，
+    // 不设闸门就会刷屏，而刷屏的日志等于没有日志。
+    this.srTopRowH = 0;
+    this.srAreaH = 0;
+    this.srLogged = false;
   }
 
   // 与 CardStack 的做法一致：页面卸载后定时器不得再改状态
@@ -204,6 +301,231 @@ struct SwipePage {
   // 「看过」也挂在同一条收尾链上（见 flushSave）——它同样是"丢了就影响下一局优先级"的状态。
   onPageHide(): void {
     this.flushSave();
+  }
+
+  // ── 本批（batch-44）新增：安全区标尺（**只在 hilog 里**，屏幕上不加任何东西）────────
+
+  /**
+   * 打印**安全区标尺**：把「可用区到底含不含系统手势区」从一个**推断**变成一个**读数**。
+   *
+   * ── 它回答的问题（以及为什么必须由设备回答）────────────────────────────────────
+   *   `cardHeight = CARD_HEIGHT_RATIO × H`，而 `H` 是本页那个 `layoutWeight(1)` 的 Stack
+   *   量到的高。若 `H` 里含了一段用户其实按不到的底部（系统手势区），那么由 `cardHeight`
+   *   导出的**位移阈值**（`0.28 × cardHeight`）与**翻出距离**（`1.2 × cardHeight`）就是按
+   *   一段够不着的区域标定的。batch-43 的结论是"**不含**"，但它唯一的设备证据
+   *   （`WallPage` 画布高 → 页面内容高 → 缺口 66~125）是**推断的推断**，区间宽到不能定案
+   *   （旧结论与本批的复核都写在文件头 `CARD_HEIGHT_RATIO` 那一段注释里）。
+   *   ⇒ 本批不再拿那段推算下结论，改为把**量出来的数**打出来，让这条结论当场可判。
+   *
+   * ── 三个量（全部是**量出来的**，不是推算的）──────────────────────────────────────
+   *   · `顶行`  = 顶部那个 `Row` 的高（`onAreaChange` 量，vp）。它是**自校验项**：
+   *     按代码它必须是 `S3 + 28 + S3 = 52`。它若不是 52，说明这一页的框架与注释不符，
+   *     后面两个差值也就不能按注释去读。（它是"本行高度必须保持不变"那条约束的哨兵。）
+   *   · `可用区H` = 本页 Stack 的高（`onAreaChange` 量，vp）—— **喂给 `cardHeight` 的就是它**。
+   *   · `窗口` = 窗口矩形（`window.getWindowProperties().windowRect`，平台给的屏幕坐标，px→vp）。
+   *   由它们导出两个差值：
+   *     A = 窗口高 − 顶行 − 可用区H  ← 页面在**窗口内部**被平台避让掉的总量（上下之和）
+   *     B = 屏高 − 窗口底           ← 窗口底到**屏幕**底的距离
+   *
+   * ── 判据一（主）：**直接量**内容底到屏底的距离 ────────────────────────────────────
+   *   `UIContext.getComponentUtils().getRectangleById(id).screenOffset` 的文档原话是
+   *   "Offset of the component relative to the screen"（`@ohos.arkui.componentUtils.d.ts:79`）。
+   *   于是 `C = 屏高 − (可用区.screenOffset.y + 可用区H)` —— **一个减法的结果，没有任何推断**：
+   *     · `C ≥ 24`（手势导航条的高）⇒ 内容整体在屏幕底那条手势带之上 ⇒ **可用区不含手势区**；
+   *     · `C < 24` ⇒ 可用区的下沿就落在手势带里 ⇒ **含**。
+   *   两条**结构自校验**（不依赖任何"平台怎么避让"的假设，只依赖本页的树结构）：
+   *     · `chainGap = 可用区.screenY − 顶行.screenY − 顶行高` 必须是 **0**（两者是根 Column 里
+   *       相邻的兄弟）—— 它成立才说明 `screenOffset` 的参照系确实是屏幕；
+   *     · `C` 必须落在判据二的区间 `[B+A−40, B+A]` 里（两条**独立**读法的一致）。
+   *
+   * ── 判据二（副，**不依赖任何位置接口**）：一个有界的数 ──────────────────────────
+   *   记 `A = 窗口高 − 顶行 − 可用区H`（页面在窗口内部被避让的总量，上下之和）、
+   *   `B = 屏高 − 窗口底`（窗口底到屏底）。则 `C = B + 页面内部底内边距`，而顶内边距的上界
+   *   是状态栏最宽的一档 40vp（A 里若含状态栏，那段就在顶部；若窗口已被避让，它根本不在 A 里）：
+   *     ⇒ `C ∈ [B + A − 40, B + A]`
+   *   两端各与 24 比一次：下界 ≥ 24 ⇒ 不含；上界 < 24 ⇒ 含；**跨过 24 = 灰区**（真机上不罕见：
+   *   常见状态栏 19~40 + 手势条 24 之和 = 43~64，正落在灰区里）—— 灰区里**不假装有结论**，
+   *   如实打"待人工判"，并把第 3/4 行两个参考读数打出来。
+   *   判据二存在的意义是**不把结论押在一个新接口上**：`screenOffset` 读不到时它照样给判定
+   *   （只是可能落进灰区），两条读法互相印证时结论才算钉死。
+   *   ⚠️ 无论哪种读数，**动作不变**：**不改 `CARD_HEIGHT_RATIO`** —— `BOTTOM_SAFE_INSET` 的推导
+   *   在"页面已避让"与"页面铺到屏底"**两种假设下都成立**（`32 + 2 = 34 ≥ 24 + 10`）。
+   *
+   * ── 为什么屏幕高度取 `display.height`（以及它的不确定性）────────────────────────
+   *   SDK 对 `Display.height` 的定义是"Height of the display, in px"（`@ohos.display.d.ts`），
+   *   而同文件 `availableHeight` 的注释里又写着"要取屏幕上可用区的高，可以用 `height` 属性"
+   *   —— 两句放在一起**不能排除** `height` 在某些设备上已经扣掉了某段系统区。
+   *   所以两个都原样打出来（`屏`那一项），并附上 `densityPixels`：**任何人**都能用
+   *   `px ÷ densityPixels` 自己复算一遍。若那条歧义成立，第 1 行会自相矛盾
+   *   （例如 `B < 0`）—— 那本身就是可见的信号，而不是被悄悄吞掉。
+   *
+   * ⚠️ 边界（如实记账）：本函数**不**改动任何布局与判定 —— 两个调用点都是 `onAreaChange`
+   *    回调里的**只读**分支（`cardH` 的算式在它们之前，一个字未动）；
+   *    `getWindowAvoidArea` 的读数只在第 3 行出现，见 `avoidAreaText` 的 ⚠️。
+   */
+  private logSafeAreaRuler(): void {
+    if (this.srLogged) { return; }
+    if (this.srTopRowH <= 0 || this.srAreaH <= 0) { return; }   // 两个量都还没到齐：等下一次回调
+    this.srLogged = true;                                       // 先设闸门：后面是异步的，不能重入
+    const topRow: number = this.srTopRowH;
+    const area: number = this.srAreaH;
+    // 屏（同步读）：px 原值 + 密度都打出来，任何人都能自己复算 vp。
+    let scrWpx: number = 0;
+    let scrHpx: number = 0;
+    let availHpx: number = 0;
+    let density: number = 0;
+    let scrFail: string = '';
+    try {
+      const d: display.Display = display.getDefaultDisplaySync();
+      scrWpx = d.width;
+      scrHpx = d.height;
+      availHpx = d.availableHeight;
+      density = d.densityPixels;
+    } catch (e) {
+      // 取不到屏参数**不放弃**这次测量：窗口矩形与两个节点高仍然能回答主要问题。
+      scrFail = `读取失败(${errText(e)})`;
+    }
+    const ui: UIContext = this.getUIContext();
+    const scrH: number = scrHpx > 0 ? ui.px2vp(scrHpx) : -1;
+    // ── 主判据的输入：两个节点**相对屏幕**的 y（读不到记 -1）───────────────────────
+    const topRowY: number = this.screenOffsetY(SR_ID_TOP_ROW);
+    const areaY: number = this.screenOffsetY(SR_ID_AREA);
+    window.getLastWindow(this.ctx)
+      .then((w: window.Window) => {
+        const p: window.WindowProperties = w.getWindowProperties();
+        const r: window.Rect = p.windowRect;
+        const winTop: number = ui.px2vp(r.top);
+        const winH: number = ui.px2vp(r.height);
+        const winBottom: number = winTop + winH;
+        const insets: number = winH - topRow - area;               // A
+        const belowWin: number = scrH > 0 ? scrH - winBottom : -1;  // B
+        // ── 副判据（**不依赖任何位置接口**，只用平台矩形 + 两个量到的节点高）────────
+        // C = B + 页面内部底内边距；A = 顶内边距 + 底内边距；顶内边距 ∈ [0, 状态栏上界 40]
+        const cLo: number = Math.max(0, belowWin + insets - STATUS_BAR_MAX);
+        const cHi: number = Math.max(0, belowWin + insets);
+        // ── 主判据：**直接量出来的**内容底到屏底的距离（screenOffset 的语义是 SDK 明写的）──
+        const cScreen: number = (scrH > 0 && areaY >= 0) ? scrH - (areaY + area) : -1;
+        // 结构自校验：顶部行与可用区是根 Column 里**相邻的两个兄弟** ⇒ 可用区.screenOffset.y
+        // 必须等于 顶部行.screenOffset.y + 顶行高。这一条不依赖任何"窗口/页面怎么避让"的假设，
+        // 只依赖本页的树结构 —— 它成立才说明 screenOffset 的参照系确实是屏幕（我们假设的那个）。
+        const chainGap: number = (topRowY >= 0 && areaY >= 0) ? (areaY - topRowY - topRow) : -999;
+        const chainOk: boolean = chainGap > -998 && Math.abs(chainGap) < 0.6;
+        // 主判据是否落在副判据的区间里：落在里面 ⇒ 两条独立读法互相印证，且顺带把 A 拆开了
+        const inBand: boolean = cScreen >= 0 && cScreen >= cLo - 0.6 && cScreen <= cHi + 0.6;
+        // ── 判定（主判据优先；主判据读不到时退到副判据；两条都读不到才说"无判据"）──────
+        let verdict: string = '';
+        let basis: string = '';
+        if (cScreen >= 0) {
+          basis = `主判据 screenOffset（内容底=${r1(areaY + area)}vp，屏高=${r1(scrH)}vp ⇒ C=${r1(cScreen)}vp）`;
+          verdict = cScreen >= GESTURE_BAR_VP
+            ? `C=${r1(cScreen)} ≥ ${GESTURE_BAR_VP} ⇒ **可用区不含手势区**（上一批的结论成立，基准没偏大）`
+            : `C=${r1(cScreen)} < ${GESTURE_BAR_VP} ⇒ **可用区含手势区**（上一批结论④被推翻，基准偏大一档）`;
+          verdict = verdict + (inBand
+            ? `；副判据区间 [${r1(cLo)}, ${r1(cHi)}] 包含它 ⇒ 两条读法一致，` +
+              `且可得 页面内部底内边距 = C − B = ${r1(cScreen - belowWin)}vp`
+            : `；⚠️ 但它**落在副判据区间 [${r1(cLo)}, ${r1(cHi)}] 之外** ⇒ 两条读法不一致，` +
+              `先查顶端那条结构自校验（chainGap=${r1(chainGap)}），不要直接采信任一条`);
+        } else if (scrH > 0) {
+          basis = '副判据（screenOffset 读不到：getRectangleById 抛错或节点没找到）';
+          if (cLo >= GESTURE_BAR_VP) {
+            verdict = `C ∈ [${r1(cLo)}, ${r1(cHi)}]，下界 ≥ ${GESTURE_BAR_VP} ⇒ **可用区不含手势区**`;
+          } else if (cHi < GESTURE_BAR_VP) {
+            verdict = `C ∈ [${r1(cLo)}, ${r1(cHi)}]，上界 < ${GESTURE_BAR_VP} ⇒ **可用区含手势区**`;
+          } else {
+            verdict = `**灰区**：C ∈ [${r1(cLo)}, ${r1(cHi)}] 跨过 ${GESTURE_BAR_VP}，拆不出上下两段 ⇒ **待人工判**`;
+          }
+        } else {
+          basis = '无判据（屏高与 screenOffset 都读不到）';
+          verdict = '本行不给判定，只有第 1 行的 A/B 两个差值可用';
+        }
+        // ── 第 1 行：全部数字（尽量不解释，但主判据的两个原值必须同时在场，便于复核）──
+        hilog.info(DOMAIN, TAG, '%{public}s',
+          `[标尺] 屏=${r1(scrH)}vp(${scrHpx}px×密度${density}=${r1(scrHpx / (density > 0 ? density : 1))}) `
+          + `屏宽=${r1(ui.px2vp(scrWpx))}vp(${scrWpx}px) `
+          + `窗口[top=${r1(winTop)} h=${r1(winH)} bottom=${r1(winBottom)}]vp(${r.top}/${r.height}px) `
+          + `顶行=${r1(topRow)}(量,screenY=${r1(topRowY)}) 可用区H=${r1(area)}(量,screenY=${r1(areaY)}) `
+          + `A=窗高−顶行−H=${r1(insets)} B=窗口底到屏底=${r1(belowWin)} `
+          + `C副=[${r1(cLo)},${r1(cHi)}] C主=${r1(cScreen)} chainGap=${r1(chainGap)} `
+          + `display.availableHeight=${availHpx}px ${scrFail}`);
+        // ── 第 2 行：判定（与上面同一批数，不引入任何新输入）────────────────────
+        hilog.info(DOMAIN, TAG, '%{public}s',
+          `[标尺·判定] ${basis}：${verdict}`
+          + `（口径：C = 内容底距屏底；手势带按 ${GESTURE_BAR_VP}vp 计；副判据口径 `
+          + `C = B + 页面内部底内边距 ∈ [B+A−${STATUS_BAR_MAX}, B+A]）`);
+        // ── 第 3 行：避让区（**只打印不判断**）────────────────────────────────
+        hilog.info(DOMAIN, TAG, '%{public}s',
+          `[标尺·避让区·只打印不判断] ${this.avoidAreaText(w, window.AvoidAreaType.TYPE_SYSTEM, '系统(状态栏)')} `
+          + `${this.avoidAreaText(w, window.AvoidAreaType.TYPE_SYSTEM_GESTURE, '系统手势区')} `
+          + `${this.avoidAreaText(w, window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR, '导航指示条')}`);
+        // ── 第 4 行：**候选**拆分（第三读数；只在主判据读不到时用得上）────────────
+        hilog.info(DOMAIN, TAG, '%{public}s',
+          `[标尺·候选拆分·语义未核实] 顶行 position.y=${r1(this.srTopRowPosY)} `
+          + `globalPosition.y=${r1(this.srTopRowGlobalY)} `
+          + `（若其中任一个真的等于"页面内部顶内边距"，则 页面内部底内边距 = A − 它 = `
+          + `${r1(insets - this.srTopRowGlobalY)}，C = B + 它 = ${r1(belowWin + insets - this.srTopRowGlobalY)}）`
+          + ` ⚠️ ArkUI 对 position/globalPosition 的参照系（父节点 / 页面 / 窗口根）本批**未核实**，`
+          + `这一行**不得单独当判据**；它与第 3 行的状态栏读数若吻合，才算两条独立读数互相印证。`);
+      })
+      .catch((): void => {
+        // 取不到窗口句柄（理论上不该发生：本页必然挂在主窗口上）也必须留下一行**可查**的证据，
+        // 否则"用户说没看到那行日志"与"这行日志没打出来"无法区分。
+        hilog.warn(DOMAIN, TAG, '%{public}s',
+          `[标尺] 窗口矩形读取失败（getLastWindow 被拒）—— 仅有量到的数：顶行=${r1(topRow)} 可用区H=${r1(area)} `
+          + `顶行screenY=${r1(topRowY)} 可用区screenY=${r1(areaY)} 屏高=${r1(scrH)}`);
+      });
+  }
+
+  /**
+   * 读一个节点**相对屏幕**的 y（vp）。读不到返回 **-1**（调用点据此退到副判据）。
+   *
+   * 接口：`UIContext.getComponentUtils().getRectangleById(id)`（`@ohos.arkui.UIContext.d.ts:2529`），
+   * 返回值 `ComponentInfo.screenOffset` 的文档原话是 "Offset of the component relative to the screen"
+   * （`@ohos.arkui.componentUtils.d.ts:79`）—— 这正是本标尺要的参照系。
+   *
+   * ⚠️ 三条边界，都在这里一次处理掉（调用点因此不必再防守）：
+   *   · 该接口在 `componentUtils`（模块级）上是 **@deprecated since 18**、`@useinstead
+   *     UIContext.ComponentUtils#getRectangleById` —— 本函数用的**就是**后者（非弃用的那一支）；
+   *   · 它**会抛**（`BusinessError 100001 - UI execution context not found`）：包在 try/catch 里，
+   *     抛了就返回 -1，绝不外溢（标尺是诊断，绝不能因为它把页面搞崩）；
+   *   · 它返回的是 **px**（与 windowRect 同族）⇒ 必须过 `px2vp` 才是 vp。
+   *     这里的换算与屏高用的是**同一个** `px2vp`，所以两者的口径一致 —— 差额才有意义。
+   */
+  private screenOffsetY(id: string): number {
+    try {
+      const info: componentUtils.ComponentInfo = this.getUIContext().getComponentUtils().getRectangleById(id);
+      const px: number = info.screenOffset.y;
+      if (!Number.isFinite(px)) { return -1; }
+      return this.getUIContext().px2vp(px);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, '%{public}s', `[标尺] getRectangleById('${id}') 读取失败：${errText(e)}`);
+      return -1;
+    }
+  }
+
+  /**
+   * 把一条避让区读成一行文本。**只用于打印**。
+   *
+   * ⚠️ 为什么它**不参与任何判断**（这是本批刻意留下的一条边界）：
+   *   `window.getWindowAvoidArea` 在**非沉浸式**下返回的是"避让区高度"还是 **0**，
+   *   本仓库**没有实测过**（batch-43 自己标注过这一点，本批同样量不到 —— 没有真机）。
+   *   拿它当判据就是把"一个没跑过的分支"当成证据；而把它当**边距**用更危险：
+   *   若平台其实已经避让过，那就是**重复避让**（白推 24vp、卡片白矮 24vp）。
+   *   所以它只出现在第 3 行，与判据（A/B 两个差值）**物理隔开**，并且这一行的抬头就写着
+   *   "只打印不判断"。人可以把三个读数与 A/B 对着看，但那一步是**人的判断**，不是代码的。
+   *
+   * 另：`visible` 字段也一并打出来 —— 它是这三个读数里唯一**语义无歧义**的一个
+   *  （"这个避让区当前是否生效"），单看它就能分辨"平台说没有避让区"与"有、但高度为 0"。
+   */
+  private avoidAreaText(w: window.Window, t: window.AvoidAreaType, name: string): string {
+    try {
+      const a: window.AvoidArea = w.getWindowAvoidArea(t);
+      const ui: UIContext = this.getUIContext();
+      return `${name}[visible=${a.visible} 上=${r1(ui.px2vp(a.topRect.height))} `
+        + `下=${r1(ui.px2vp(a.bottomRect.height))} 左=${r1(ui.px2vp(a.leftRect.width))} `
+        + `右=${r1(ui.px2vp(a.rightRect.width))}]`;
+    } catch (e) {
+      return `${name}[读取失败(${errText(e)})]`;
+    }
   }
 
   /** 决策只更新内存 Map；落盘合并到 1 秒窗口，避免每滑一张就全量读+写（UI 线程同步 I/O） */
@@ -298,6 +620,24 @@ struct SwipePage {
           .margin({ left: S2 })
           .onClick(() => { router.pushUrl({ url: 'pages/FavPage' }); })
       }.width('100%').padding(S3)
+      // `id` 只被标尺的 `getRectangleById` 读（见 SR_ID_TOP_ROW 的说明）—— 属性改动，不进布局。
+      .id(SR_ID_TOP_ROW)
+      // ── batch-44 新增：只读的**量测点**（安全区标尺的三个输入之一）─────────────────
+      // 它量的是本行的实际高（按代码应为 `S3 + 28 + S3 = 52`）。加它的理由是**上一段那条
+      // 约束需要哨兵**："本行高度必须保持不变"这句话在注释里躺了两批，却没有任何东西
+      // 在真机上核过它 —— 而它直接决定可用区高、进而 `cardHeight` 与两个阈值。
+      // ⚠️ 它是**只读**回调：不写任何状态（只写标尺自己的两个私有字段）、不改布局、
+      //    不新增节点、不进任何算式 —— `cardH` 的算式仍在下面那个 Stack 的 onAreaChange 里。
+      .onAreaChange((_oldArea: Area, newArea: Area) => {
+        const h: number = Number(newArea.height);
+        if (h > 0) { this.srTopRowH = h; }
+        // 两个位置读数（**只打印、不参与判定**，语义见字段处的 ⚠️）。
+        // 取值一律过一遍 `Number.isFinite`：`Position` 的 x/y 是可选的，缺省时 `Number(undefined)`
+        // 会得到 NaN —— 让 NaN 流进日志会打印出 "NaN"，而那看起来像"平台报了个数"。
+        this.srTopRowPosY = finiteOrZero(newArea.position.y);
+        this.srTopRowGlobalY = finiteOrZero(newArea.globalPosition.y);
+        this.logSafeAreaRuler();
+      })
 
       Stack() {
         // 完成态放在前面，卡片分支是它的 else —— 让"会话刷完 ⟺ 不渲染卡片"成为结构事实，
@@ -364,6 +704,8 @@ struct SwipePage {
         }
       }
       .layoutWeight(1).width('100%')
+      // `id` 只被标尺的 `getRectangleById` 读（见 SR_ID_AREA 的说明）—— 属性改动，不进布局。
+      .id(SR_ID_AREA)
       .onAreaChange((oldVal: Area, newVal: Area) => {
         // 量到的是 Stack 的高（页面高减去顶部行），换算成"阈值基准高"再交给 CardStack：
         // 位移阈值与翻出距离都以它为基准。
@@ -373,6 +715,13 @@ struct SwipePage {
         // 它是这三件事唯一的上游。
         const h = Number(newVal.height);
         if (h > 0) { this.cardH = h * CARD_HEIGHT_RATIO; }
+        // ── batch-44 新增：**同一个数**再喂给安全区标尺（只读，见 logSafeAreaRuler）─────
+        // 位置**必须在上面那行之后**：上面那一行是 `cardHeight` 的唯一上游，本批一个字未动；
+        // 标尺只是把**同一个 `h`** 抄一份去打日志，它既不参与也算不出 `cardH`。
+        // 这样"标尺报的 H"与"真正喂给 cardHeight 的 H"是**同一个数**，
+        // 日志里那个 H 才配当结论的依据（而不是"另一个地方量的另一个高"）。
+        this.srAreaH = h;
+        this.logSafeAreaRuler();
       })
     }
     .width('100%').height('100%').backgroundColor(C_BG)
