@@ -408,8 +408,22 @@ struct SwipePage {
     // 重新放回队列；将来接上 defer 入队时这条去重会自动放行重决策。
     // 注意 navigate(1)（返回上一张）让照片重新可决定走的是**删掉决策**（内存 delete + 盘上
     // dStore.remove）而不是把它置回 'unseen'：删掉之后这里 get 到 undefined，同样自动放行。
-    // 位置在 recordSwipe 之后、applyDecision 之前：重复事件仍会进 metrics，但 'wall'
-    // 已不参与滑动口径（见 core/metrics.ts），故不会污染回弹率与中位数。
+    // 位置在 recordSwipe 之后、applyDecision 之前：重复事件仍会进 metrics。
+    // ⚠️ 旧措辞「但 'wall' 已不参与滑动口径……故不会污染回弹率与中位数」是**旧口径**的话，
+    // batch-39（58ff624）起不再成立：'wall' 现在**计入回弹率的分母**，只有中位数仍排除它
+    //（见 core/metrics.ts 的 rollbackRate / medianDecisionMs）。按现行口径逐条复核：
+    //   - 分子（出现过回弹的尝试组）：能走到这道守卫的重复上报都是**决策** —— 回弹根本到不了这里，
+    //     handle() 在它上面那支 `if (rolledBack) { return; }` 就早退了，而回弹的重复上报另由
+    //     springBack 的 150ms 防抖（SPRING_BACK_MS）挡住。决策的 rolledBack 恒为 false
+    //     → 结构上不可能把某一组标成"手滑过"，分子不受影响；
+    //   - 分母（尝试组 = photoId|shownAt）：分组只对**同一个键**幂等（见 rollbackRate 注释）。
+    //     上面 (a)(b) 两种情形要分开看：(a) 的重复上报发生在 goTo() 之后，shownAt 已被刷成
+    //     下一张的时刻 → 会多出一个分组键，幅度与旧口径"每条重复事件给分母 +1"相同，不是
+    //     batch-39 引入的（wall 路径的 goTo 在异步 applyWall 里，同帧重复仍是同一个键）；
+    //     (b) 本来就是"同一张的第二次出现"，按新口径算 2 个组正是它的定义（见 rollbackRate
+    //     注释里"同一张照片在不同时间被独立刷两次 → 算 2 次"）。本批只如实记下，不改逻辑。
+    //   - 中位数：'wall' 照旧被排除（口径一字未动）；fav/archive 的重复上报会给样本 +1 ——
+    //     那是 medianDecisionMs 注释第 3 条里"有意不修"的同类残留。
     const already = this.decisions.get(photoId);
     if (already !== undefined && already.state !== 'unseen') {
       const atSlot: string = currentPhotoId(this.session);
