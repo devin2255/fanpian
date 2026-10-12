@@ -1,0 +1,490 @@
+/**
+ * 设计令牌（design tokens）—— **全项目唯一的视觉取值处**。
+ *
+ * ── 为什么这个文件在 `core/` 而不是 `ui/design.ets`（工单建议的位置）──────────────
+ *   工单要求「令牌取值 / 对比度判断必须测」，而本仓库的单测跑在 Node 上
+ *   （`node --experimental-strip-types --test`），它**只能加载 `.ts`**：`.ets` 会
+ *   `ERR_UNKNOWN_FILE_EXTENSION`。把令牌写成 `.ets` 就等于把"必须测"这条要求作废。
+ *   而 `core/` 的既有规矩恰好就是"纯逻辑、零 `@kit.*`、可被单测穷举"——令牌表正是
+ *   这种东西（本文件 import 了零个平台模块，见 `designTokens.test.ts` 的断言）。
+ *   另一条支持：`core/protoBinEvidence.test.ts` §2 会自动检查**每个** `core/*.ts`
+ *   是否被某个 `.ets` 以**值位置**引入 —— 这条守卫会替我们证明"令牌真的被页面用上了"，
+ *   而不是"定义了没人用"。
+ *   ⚠️ 除**新增**本文件外，`core/` 的既有模块一行未动（几何/逻辑仍由那 424 条钉着）。
+ *
+ * ── 风格方向（控制器已定，本文件只是把它变成数字）──────────────────────────────
+ *   **暖色纸感 · 低饱和 · 让照片出彩**：
+ *     · 底色是**暖纸**（不是纯白 `#FFFFFF`，也不是冷灰）—— 纯白显"系统默认"，
+ *       冷灰显"工具"，而这是一个「个人回忆馆」；
+ *     · 文字是**暖黑**（不是纯黑 `#000`）—— 纯黑压在暖底上会发脏；
+ *     · 所有强调色**从地图墙既有的三族色里取**（赭 27° / 砖红 6~9° / 苔绿 100°），
+ *       见下面「地图墙配色如何纳入」一节。新配色与地图**同源**，不是另立一套。
+ *
+ * ── 对比度（正文 ≥ 4.5:1、大字 ≥ 3:1）是怎么核的 ─────────────────────────────
+ *   不是"看着够深"，而是**公式**：WCAG 2.x 的相对亮度 + 对比度公式，实现就在本文件
+ *   （`srgbLuminance` / `contrastRatio` / `compositeOver`），断言的清单在
+ *   `designTokens.test.ts`。于是：
+ *     · 任何人改一个令牌的色值，只要它跌破阈值，**单测当场报红**；
+ *     · `npm test` 的输出就是"我怎么核的"的可复现证据（不是一张手算的表格）。
+ *   两条边界写在这里，免得被当成"全绿"：
+ *     · **照片之上**的文字（动态角标）无法用公式保证 —— 底是任意像素。
+ *       那里的手段是**遮罩浓度**：`C_SCRIM` 的 alpha 按"最坏情况 = 纯白照片"反推，
+ *       于是最坏情况下仍有 ≥ 4.5:1（断言在测试里）。
+ *     · 非文字（分隔线、控制边界）不在 4.5:1 这条规则里。见 `C_LINE` 的说明。
+ */
+// 地图那套配色**不复制**、只引用：`core/render` 是它的唯一定义处（理由见下面
+// 「地图墙的既有配色如何纳入令牌」那一节）。这个 import 同时让本模块留在 ArkTS
+// 编译图里 —— `core/protoBinEvidence.test.ts` 的 §2 会替我们检查这件事。
+import {
+  BLOCK_FILL, MARKER_COLOR, PIN_COLOR, PROVINCE_STROKE, PROVINCE_WIDTH, TRACK_COLOR
+} from './render.ts';
+
+// ── 色板：暖纸 / 暖墨 ─────────────────────────────────────────────────────────
+
+/**
+ * 页面底（**暖纸**）。
+ *
+ * 取值理由（不是"好看"）：
+ *   · 色相 40°（暖琥珀）、饱和 2.5%（几乎无色偏）—— 是"纸"而不是"黄"；
+ *   · 它必须比 `C_SURFACE` **暗**一档（0.874 vs 0.965 的相对亮度），否则卡片浮不起来；
+ *   · 它必须比地图块的底色 `#F2F7EF`（冷绿白）**暖**，于是地图看起来是"放在纸上的一张图"，
+ *     而不是"纸的一部分"—— 两个世界各自成立、又同处一张纸。
+ * 旧值 `#FAFAFA`（纯中性灰白）在真机上是"没有设计"的默认观感，也是本次要换掉的东西。
+ */
+export const C_BG: string = '#F4F0E8';
+
+/**
+ * 卡片 / 面板（**暖白相纸**）。
+ *
+ * 比 `C_BG` 亮一档（相对亮度 0.965 vs 0.874，比值 1.10:1），所以它有"浮起来"的读数；
+ * 但它**不是** `#FFFFFF`：R>G>B（253/251/246）保留了纸的暖调，且与 `#FFFFFF` 的
+ * 差值在 3x 屏上刚好能看出"这是一张纸，不是一块屏幕"。
+ */
+export const C_SURFACE: string = '#FDFBF6';
+
+/**
+ * 通知 / 提示底（暖砂）。**只在"这条是系统在说话"时用**（空数据横幅）。
+ *
+ * 与 `C_SURFACE` 分开的理由是可读的层级：同一种底色会让"系统提示"与"内容卡片"
+ * 长得一样，用户扫过去分不出哪条要读。它仍然在暖纸族里（色相 33°，不是另立一套）。
+ */
+export const C_NOTICE: string = '#F6EEE1';
+
+/**
+ * 主文字（**暖黑**）。
+ *
+ * R>G>B（46/42/36，色相 30°）：它是"暖黑"，不是 `#000`。
+ * 纯黑压在暖纸上会显得脏、发青，而且对比度 21:1 太硬（正文会被"钉"在纸上）。
+ * 对 `C_BG` 的对比度 **12.55:1** —— 远超 4.5:1，这是"标题要立得住"的余量。
+ */
+export const C_TEXT: string = '#2E2A24';
+
+/**
+ * 次要文字（**暖灰**）。
+ *
+ * 对 `C_BG` **5.34:1** —— 这是本令牌表里最要紧的一处修正：旧代码里"次要文字"是
+ * 四种灰各写各的，而**三种都不达标**（本批实测，压在 `#FAFAFA` 上）：
+ * `#999999` = **2.73:1**、`#888888` = **3.40:1**、`#AAAAAA` = **2.23:1**。
+ * 它们在真机上"发虚"不是错觉，是**算得出来的**不达标（连大字的 3:1 都不到）。
+ * 收敛成一个值、并且**达标**，是本次改动里最直接的可读性收益。
+ * 它同时是"归档"按钮与导航类按钮的墨色（见 `C_ARCHIVE` 与四个按钮的层级方案）。
+ */
+export const C_TEXT_DIM: string = '#6B6154';
+
+/**
+ * 照片衬纸（刷卡页卡片在 `ImageFit.Contain` 下留白处的底色）。
+ *
+ * 它比页面底 `C_BG` **略深**（相对亮度 0.82 vs 0.87，1.05:1），所以那张照片看起来是
+ * **落在一个浅槽里的相纸**，而不是"浮在纸上的一个白框"—— 这正是"界面是框、
+ * 照片是主角"要的读数：框比底更靠近照片，于是眼睛直接落在照片上。
+ * 旧值 `#EEE`（中性冷灰）在暖纸上是一块**发灰的斑**，与纸不是一家。
+ */
+export const C_PHOTO_MAT: string = '#EFEAE0';
+
+/**
+ * 分隔线 / 描边（**装饰**）。
+ *
+ * ⚠️ 它**不承担控件边界**：对 `C_BG` 只有 1.31:1。WCAG 1.4.11 要求"用来识别控件的
+ * 视觉信息"≥ 3:1 —— 所以四个按钮、四个张数胶囊的**边界一律用各自语义色**
+ * （`C_TEXT_DIM` / `C_FAV` / `C_ARCHIVE`，全部 ≥ 4.5:1），`C_LINE` 只用在
+ * "内容卡片之间的分隔线""面板顶边"这类**不承担识别职责**的地方。
+ * 这个分工是**故意的**：把描边压到很淡，卡片才像"纸上的两块内容"，而不是"两个框"。
+ */
+export const C_LINE: string = '#DCD3C2';
+
+/**
+ * 主强调（**面**：主按钮底 + 白字）。
+ *
+ * ── 取值是算出来的，不是挑出来的 ──────────────────────────────────────────────
+ *   起点是地图墙既有的**轨迹暖赭** `#D08A46`（`core/render.TRACK_COLOR`）。
+ *   它直接拿来当按钮底**不合格**：对白字只有 **2.84:1**（连大字的 3:1 都不到）。
+ *   于是保持**色相 27° 一动不动**（`#D08A46` 的色相正是 27°），只把明度压下来，
+ *   直到白字压上去 ≥ 4.5:1：落在 `#A85D20`，**4.94:1**。
+ *   换句话说：主强调色与地图轨迹色**是同一个色相的两档**，不是两个颜色。
+ *
+ * 用它的地方：所有"主按钮"的**底**（开始刷照片 / 上墙 / 继续刷 N 张 / 看地图墙），
+ * 以及动态照片播放中的角标底。全屏**同时最多一个**这样的实心块（见按钮层级方案）。
+ */
+export const C_ACCENT: string = '#A85D20';
+
+/**
+ * 强调**文字**（压在纸底上的强调字：`‹ 返回` / `关闭` / `重置视野` / 退化说明）。
+ *
+ * 为什么不是 `C_ACCENT`：两者的约束**不同**。
+ *   · `C_ACCENT` 是**面**，压在它上面的是白字 —— 约束是"面要够暗"（对白 4.94:1）；
+ *   · 本令牌是**字**，压在 `C_BG` 上 —— 约束是"字要够暗"，而纸底比纯白暗，
+ *     所以同一个 `#A85D20` 压纸底只有 **4.35:1**（差一点，不达标）。
+ * 于是同一色相再降一档到 `#8F4E16`：对 `C_BG` **5.65:1**、对 `C_SURFACE` **6.21:1**。
+ * 这就是"面"与"字"要分成两个令牌的**全部**理由 —— 不是为了多一个名字。
+ *
+ * 顺带修掉的一处旧值：它替换的是硬编码的 `#1F6FEB`（冷蓝），而那个蓝压 `#FAFAFA`
+ * 只有 **4.44:1** —— **不达标**。也就是说旧界面里所有"像链接的字"（`‹ 返回`、
+ * `关闭`、`重置视野`）都差一点点读不清，而这一点点用眼睛是看不出来的。
+ */
+export const C_ACCENT_TEXT: string = '#8F4E16';
+
+/**
+ * 收藏（**暖砖红**，色相 11°）。
+ *
+ * 与地图墙上钉子的红同族：`PIN_COLOR = #C0392B`（5.6°）、`MARKER_COLOR = #D9553F`（8.6°）。
+ * 这不是巧合 —— **收藏是上墙的来源**（照片先被收藏才谈得上挂上墙），两者本来就该同族。
+ * 对 `C_BG` **5.19:1**：所以它能当**描边胶囊的文字与边**（收藏按钮是次按钮，见层级方案）。
+ */
+export const C_FAV: string = '#A8452F';
+
+/**
+ * 上墙（**暖赭**，色相 27°）—— **与地图轨迹同一个值**（`core/render.TRACK_COLOR`）。
+ *
+ * 语义是产品级的：轨迹画的就是"我什么时候第一次到这儿"，而上墙就是"把这张照片钉到那儿"。
+ * 用一个颜色说这两件事，是**刻意的**：用户在收藏页看到的「墙上」角标，与地图上那条
+ * 连起所有钉子的线，是同一个概念的两个视图。
+ *
+ * ⚠️ 它是**浅档**（对白字只有 2.84:1），所以用它当底时必须配 `C_TEXT` **暖黑字**
+ *   （**5.03:1**）—— 这是本令牌表里唯一"深字压浅底"的组合，也是「墙上」角标的做法。
+ *   （浅底 + 深字的可读性并不比深底 + 白字差，差的只是"重量"；角标本来就该轻。）
+ */
+export const C_WALL: string = '#D08A46';
+
+/**
+ * 归档（**苔绿**，色相 98°）。
+ *
+ * 与地图的陆地/省界同族（`#E8F0E4` / `#BFD3B8` 都是 100° 附近的低饱和绿）——
+ * 这是把地图那套"绿"接回界面的唯一入口，否则地图的绿在其它页面上没有任何呼应。
+ * 对 `C_BG` **5.03:1**：能当描边胶囊的字与边。
+ *
+ * 为什么"归档"要有一个颜色（它明明是"中性"的动作）：四个按钮里，`主页面` 必须是
+ * **无色**的那一个（它是导航，不是对照片的表态）。若 `归档` 也用无色，两个按钮就完全
+ * 同形，用户必须读字才能分清"离开这一页"和"处理掉这张照片" —— 那是实打实的误触成本。
+ */
+export const C_ARCHIVE: string = '#5E6A57';
+
+/**
+ * 危险 / 未达标（**深砖红**）。
+ *
+ * 与 `C_FAV` 同色族（11°）、**更深一档**（对 `C_BG` **7.18:1** vs 收藏的 5.19:1）。
+ * 同族是故意的：这套色板里"红"就一个含义 —— **强烈的、需要你注意的信号**；
+ * 深浅承担"重量"的差别：收藏是一次轻快的正向动作，未达标是一个要你去改的判定。
+ * 两者**从不同屏**（收藏在刷卡/收藏页，未达标在统计页），所以同族不产生歧义；
+ * 若将来要同屏出现，把 `C_FAV` 提到 `C_ACCENT` 档即可（一处改动）。
+ */
+export const C_DANGER: string = '#8F2E1C';
+
+/**
+ * 达标 / 成功（苔绿深档，色相 133°）。
+ *
+ * 与 `C_ARCHIVE` 同属绿族但**不同档、不同角色**：`C_ARCHIVE` 是 98° 的低饱和苔绿
+ * （一个安静的动作色），本令牌是 133° 的深绿（一个**判定**色，对 `C_SURFACE` **6.17:1**）。
+ * 统计页上"达标"必须一眼看出是绿的，而绿在白底上的可读性天然吃亏 —— 所以取深档。
+ * 它替换的旧值 `#1F9D55` 压 `#FFFFFF` 只有 **3.49:1**（不达标）：也就是说
+ * 旧界面上"达标"这两个字比"未达标"（`#D33A2C` = 4.76:1）更**难**读 —— 一个会误导的颠倒。
+ */
+export const C_OK: string = '#2F6B3C';
+
+/**
+ * 照片之上的**遮罩**（暖黑 72%）+ 照片之上的文字（纯白）。
+ *
+ * 底是**任意一张照片**，对比度无法用公式保证 —— 能保证的只有"最坏情况"：
+ * 把遮罩压在最亮的照片（纯白）上，合成后的底与白字的对比度 **5.74:1**（测试里断言）。
+ *
+ * ⚠️ 这里有一条**实测纠正**（本批先算了才发现，不许含糊过去）：旧值
+ *   `rgba(0,0,0,0.55)` 在白照片上是 **4.74:1** —— 它是**达标**的，不是缺陷。
+ *   所以改它的理由不是"旧的不达标"，而是两条别的东西：
+ *     (a) **同源**：纯黑遮罩压在暖纸上会发青，改用暖黑（`C_TEXT` 的 46/42/36）后
+ *         它与纸族、与墨色是同一族；
+ *     (b) **余量**：4.74 只有 5% 的余量，而"底是任意照片"意味着**最坏情况就是常态附近**；
+ *         72% 把最坏情况提到 5.74:1，代价是零（只是 alpha 从 0.55 到 0.72）。
+ *   （同一轮里另一条旧值倒是真的不达标：`#999999` 压 `#FAFAFA` 只有 **2.73:1** ——
+ *     连大字的 3:1 都不到。那是本批要修的东西，见 `C_TEXT_DIM`。）
+ * `C_ON_PHOTO` 是全表唯一的纯白：它压的是照片/深色遮罩，不受"底色不许纯白"那条约束
+ * （那条约束说的是**页面的底**，不是照片之上的字）。
+ */
+export const C_SCRIM_R: number = 0x2E;
+export const C_SCRIM_G: number = 0x2A;
+export const C_SCRIM_B: number = 0x24;
+export const C_SCRIM_ALPHA: number = 0.72;
+export const C_SCRIM: string =
+  `rgba(${C_SCRIM_R},${C_SCRIM_G},${C_SCRIM_B},${C_SCRIM_ALPHA})`;
+export const C_ON_PHOTO: string = '#FFFFFF';
+
+// ── 地图墙的既有配色如何"纳入令牌"（而不是被替换）────────────────────────────
+//
+// 地图那套色（绿底 / 冷绿省界 / 暖赭轨迹 / 砖红钉子）**不重写**，只**转出口**：
+// 下面五个 `C_MAP_*` 直接引用 `core/render` 的既有导出，所以它们的定义处仍然**只有一处**。
+// 为什么不去改 `core/render` 把它们改成"令牌"：那份常量同时是
+// `tools/render-preview.ts` 产出 SVG 的输入，"在电脑上先看见"这件事的前提就是
+// 预览与设备**逐字节同源**（见 `render.ts` 的 BLOCK_FILL / PROVINCE_STROKE 注释）。
+// 把它搬进令牌层会让预览反过来依赖 UI 层 —— 方向错了。
+//
+// 于是规则是：**地图的几何颜色住在 core/render，界面从令牌层引用它们**。
+// `designTokens.test.ts` 里有一条断言直接钉住这个等式（`C_MAP_BG === BLOCK_FILL` 等），
+// 所以"两边写死同一个字符串、哪天悄悄漂了"这件事不可能发生。
+//
+// 另外两个值（陆地填充、地名墨色）在 `core/render` 的 SVG 生成器里是**内联字面量**
+// （`sceneToSvg` 的 `fill="#E8F0E4"` 与地名 `<text fill="#3F4A3C">`），没有导出。
+// `core/` 不在本次允许改动的范围内，所以它们是设备侧的**唯一定义处**，
+// 注释里钉住孪生位置 —— 改一处必须改另一处（真机与预览必须仍是同一张图）。
+
+/** 地图块底色（= 海 + 视野外）。引用 `core/render.BLOCK_FILL`，不复制字面量。 */
+export const C_MAP_BG: string = BLOCK_FILL;
+/** 陆地填充（浅绿）。孪生位置：`core/render.ts` 的 `sceneToSvg` 里 `fill="#E8F0E4"`。 */
+export const C_MAP_LAND: string = '#E8F0E4';
+/** 国界描边 = 省界颜色（同一档，主次由线宽表达）。引用 `core/render.PROVINCE_STROKE`。 */
+export const C_MAP_LINE: string = PROVINCE_STROKE;
+/** 旅行轨迹（暖赭）。引用 `core/render.TRACK_COLOR` —— 与 `C_WALL` 是同一个值。 */
+export const C_MAP_TRACK: string = TRACK_COLOR;
+/** 钉点（砖红）。引用 `core/render.PIN_COLOR`。 */
+export const C_MAP_PIN: string = PIN_COLOR;
+/** 墙上的照片标记点。引用 `core/render.MARKER_COLOR`。 */
+export const C_MAP_MARKER: string = MARKER_COLOR;
+/** 地名墨色（深苔绿）。孪生位置：`core/render.ts` 的 `sceneToSvg` 里地名 `<text fill="#3F4A3C">`。 */
+export const C_MAP_INK: string = '#3F4A3C';
+/** 国界描边的线宽。孪生位置：`core/render.ts` 的 `sceneToSvg` 里 `stroke-width="0.8"`。 */
+export const LW_MAP_BORDER: number = 0.8;
+/** 省界线宽。引用 `core/render.PROVINCE_WIDTH`（0.5 —— 靠线宽分主次，不靠颜色）。 */
+export const LW_MAP_PROVINCE: number = PROVINCE_WIDTH;
+
+// ── 线宽 ─────────────────────────────────────────────────────────────────────
+
+/** 控件描边（胶囊按钮 / 张数选择器）。1vp 在 3x 屏上是 3px —— 看得见，但不成为一个"框"。 */
+export const LW_BORDER: number = 1;
+/** 分隔线（详情面板顶边）。0.5 与改动前逐像素一致，不借机调整视觉重量。 */
+export const LW_DIVIDER: number = 0.5;
+
+// ── 间距（4 的倍数，只此六档）────────────────────────────────────────────────
+
+/** 4 —— 同一组元素内部（文字与它的单位、标签与它的值）。 */
+export const S1: number = 4;
+/** 8 —— 相邻元素之间（一行里的两个读数、网格的 gap）。 */
+export const S2: number = 8;
+/** 12 —— 容器的内边距（卡片、面板、页面左右边距）。 */
+export const S3: number = 12;
+/** 16 —— 区块之间（卡片之间、标题与内容之间）。 */
+export const S4: number = 16;
+/** 24 —— 大块留白（首屏的段落间距）。 */
+export const S5: number = 24;
+/** 32 —— 页面级的呼吸（首屏左右留白、整页的上下留白）。 */
+export const S6: number = 32;
+
+// ── 字号阶梯（**6 档**，从原来的 13 档收敛）──────────────────────────────────
+//
+// 阶梯的**下界锚在 8**，不是审美选择：8fp 是地图地名在真机上验过的值
+// （`pages/WallPage.ets` 文件头记着它"从一道糊影变成能认出字"的那一档）。
+// 收敛字号时**不许**把一个真机验过的值改掉 —— 所以下界是 8，而不是"更好看的 9"。
+// 8 → 11 → 13 → 15 是 1.2~1.4 倍的等比阶梯（服务于信息密度）；
+// 18 是页面标题档；26 是唯一的重音档（一屏最多一处）。
+// 旧值 → 新档的映射（13 档 → 6 档）：
+//   8→F_MICRO  9→F_MICRO  10→F_CAPTION  11→F_CAPTION  12→F_LABEL
+//   13→F_LABEL 14→F_BODY  15→F_BODY     16→F_BODY     18→F_TITLE
+//   20→F_TITLE 24→F_DISPLAY 26→F_DISPLAY
+
+/** 8 —— 地图地名、缩略图日期。**锚定真机验过的 8fp**，是全表最小档。 */
+export const F_MICRO: number = 8;
+/** 11 —— 说明、页脚、口径注释、次要读数。 */
+export const F_CAPTION: number = 11;
+/** 13 —— 标签、按钮文字、正文里的次要层级。 */
+export const F_LABEL: number = 13;
+/** 15 —— 正文与主要读数（"已认领 N 张"、完整态标题）。 */
+export const F_BODY: number = 15;
+/** 18 —— 页面 / 区块标题。 */
+export const F_TITLE: number = 18;
+/** 26 —— 唯一的重音档：首屏主标题、统计页的大数字。**一屏最多一处**。 */
+export const F_DISPLAY: number = 26;
+
+// ── 圆角（**3 档**，从原来的 5 档收敛）──────────────────────────────────────
+//
+// 三档都取**既有值**（6 / 10 / 16），没有借"收敛"之名改掉任何一个真机看过的外观：
+// 旧的 4→R_SM、6→R_SM、8→R_MD、10→R_MD、16→R_LG。
+// 语义分工：小件（角标、网格格子、缩略图）/ 中件（面板、按钮、卡片）/ 大件（照片卡）。
+
+/** 6 —— 小件：角标、收藏网格的格子、详情面板的缩略图。 */
+export const R_SM: number = 6;
+/** 10 —— 中件：统计卡、面板、按钮、胶囊角标。 */
+export const R_MD: number = 10;
+/** 16 —— 大件：刷卡页的照片卡（唯一的大圆角，它要"像一张照片"）。 */
+export const R_LG: number = 16;
+
+// ── 对比度：纯函数（这才是"我怎么核的"）─────────────────────────────────────
+
+/**
+ * `#RRGGBB` → `[r, g, b]`（0~255）。**非法输入返回空数组**（不抛错、不猜）。
+ * 返回数组而不是对象：ArkTS 下数组字面量的类型推导最省事，且调用点只按下标读。
+ */
+export function hexToRgb(hex: string): number[] {
+  if (!isHexColor(hex)) { return []; }
+  const r: number = parseInt(hex.substring(1, 3), 16);
+  const g: number = parseInt(hex.substring(3, 5), 16);
+  const b: number = parseInt(hex.substring(5, 7), 16);
+  return [r, g, b];
+}
+
+/** 严格的 `#RRGGBB` 判据（**不接受** `#RGB` / `#RRGGBBAA` / 缺 `#`）。 */
+export function isHexColor(s: string): boolean {
+  return /^#[0-9A-Fa-f]{6}$/.test(s);
+}
+
+/**
+ * WCAG 2.x 的**相对亮度**（0 = 黑，1 = 白）。
+ *
+ * 三件事都在这里，缺一条就会算错：
+ *   1) 每通道先归一化到 0~1；
+ *   2) 再做**伽马展开**（≤0.03928 走线性段，否则 `((c+0.055)/1.055)^2.4`）——
+ *      跳过这一步得到的是"感知亮度"，用它算对比度会**系统性偏离**真值；
+ *   3) 按 0.2126 / 0.7152 / 0.0722 加权（人眼对绿最敏感）。
+ * 非法输入返回 0（= 黑）。**不返回 NaN**：NaN 会让后面所有比较静默变 false，
+ * 那正是"守卫失效但看起来是绿的"这种假绿。
+ */
+export function srgbLuminance(hex: string): number {
+  const rgb: number[] = hexToRgb(hex);
+  if (rgb.length < 3) { return 0; }
+  const r: number = channelLuminance(rgb[0] / 255);
+  const g: number = channelLuminance(rgb[1] / 255);
+  const b: number = channelLuminance(rgb[2] / 255);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/** 单通道的伽马展开（`srgbLuminance` 的第 2 步，单独抽出来是为了能被直接断言）。 */
+export function channelLuminance(v: number): number {
+  if (v <= 0.03928) { return v / 12.92; }
+  return Math.pow((v + 0.055) / 1.055, 2.4);
+}
+
+/**
+ * 两个**不透明**色的对比度（1~21）。顺序无关（公式里 +0.05 是双向的）。
+ * 亮点：这条函数对 `C_TEXT`/`C_BG` 必须给出 ≥ 4.5 —— 断言在单测里，
+ * 所以"换个更淡的正文色"这种改动会**当场报红**，而不是等真机上有人觉得看不清。
+ */
+export function contrastRatio(a: string, b: string): number {
+  const la: number = srgbLuminance(a);
+  const lb: number = srgbLuminance(b);
+  const hi: number = la > lb ? la : lb;
+  const lo: number = la > lb ? lb : la;
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/**
+ * 半透明前景压在**不透明**底色上的合成色（`#RRGGBB`）。
+ *
+ * 存在的唯一理由是"照片之上的文字要对任意照片都能读"：
+ * 遮罩的浓度必须按**最坏情况**（最亮的照片 = 纯白）反推，而这张纸上的算式
+ * 必须能被断言，不能靠"看着差不多"。
+ * ⚠️ 合成在 **sRGB 编码空间**做（`c = a·fg + (1−a)·bg`），这与平台对 `rgba()`
+ *   的混合口径一致；不要在这里"顺手"转成线性光再混 —— 那会得到一个与真机不同的数。
+ */
+export function compositeOver(fgR: number, fgG: number, fgB: number, alpha: number, bgHex: string): string {
+  const bg: number[] = hexToRgb(bgHex);
+  if (bg.length < 3) { return '#000000'; }
+  const r: number = Math.round(alpha * fgR + (1 - alpha) * bg[0]);
+  const g: number = Math.round(alpha * fgG + (1 - alpha) * bg[1]);
+  const b: number = Math.round(alpha * fgB + (1 - alpha) * bg[2]);
+  return rgbToHex(r, g, b);
+}
+
+/** `[r,g,b]`（0~255）→ `#RRGGBB`（每通道夹到 0~255，再补足两位）。 */
+export function rgbToHex(r: number, g: number, b: number): string {
+  return '#' + two(clamp255(r)) + two(clamp255(g)) + two(clamp255(b));
+}
+
+function clamp255(v: number): number {
+  if (!Number.isFinite(v) || v < 0) { return 0; }
+  if (v > 255) { return 255; }
+  return Math.round(v);
+}
+
+function two(v: number): string {
+  const h: string = v.toString(16).toUpperCase();
+  return h.length < 2 ? '0' + h : h;
+}
+
+/** `C_SCRIM` 压在最亮（纯白）与最暗（纯黑）照片上的合成底 —— 遮罩浓度的两个边界。 */
+export function scrimOver(photoHex: string): string {
+  return compositeOver(C_SCRIM_R, C_SCRIM_G, C_SCRIM_B, C_SCRIM_ALPHA, photoHex);
+}
+
+// ── 令牌清单（单测的输入）───────────────────────────────────────────────────
+//
+// 为什么要把"名字 + 值 + 用途"再列一遍（明明上面每个常量都有注释）：
+// 单测需要一个**可枚举**的清单来断言"每个色值都是合法 `#RRGGBB`"，
+// 而 TypeScript 的常量在运行时是不可枚举的 —— 没有这份清单，"全部令牌都合法"
+// 就只能靠人肉数一遍。清单是**纯数据**，且测试里有一条断言钉住
+// "清单里的值 === 同名常量的值"，所以它不可能与上面漂开。
+
+/** 一条令牌：名字、色值、用途（`role` 直接进断言失败时的报错文案）。 */
+export interface ColorToken { name: string; value: string; role: string }
+
+/** 界面色（**不含** `C_SCRIM`：它是 `rgba()`，不适用"必须 `#RRGGBB`"这条断言）。 */
+export const COLOR_TOKENS: ColorToken[] = [
+  { name: 'C_BG', value: C_BG, role: '页面底（暖纸）' },
+  { name: 'C_SURFACE', value: C_SURFACE, role: '卡片/面板（暖白相纸）' },
+  { name: 'C_NOTICE', value: C_NOTICE, role: '通知/提示底（暖砂）' },
+  { name: 'C_PHOTO_MAT', value: C_PHOTO_MAT, role: '照片衬纸（Contain 留白处）' },
+  { name: 'C_TEXT', value: C_TEXT, role: '主文字（暖黑）' },
+  { name: 'C_TEXT_DIM', value: C_TEXT_DIM, role: '次要文字（暖灰）' },
+  { name: 'C_LINE', value: C_LINE, role: '分隔线/装饰描边' },
+  { name: 'C_ACCENT', value: C_ACCENT, role: '主强调面（主按钮底）' },
+  { name: 'C_ACCENT_TEXT', value: C_ACCENT_TEXT, role: '强调文字（压纸底）' },
+  { name: 'C_FAV', value: C_FAV, role: '收藏' },
+  { name: 'C_WALL', value: C_WALL, role: '上墙（= 地图轨迹）' },
+  { name: 'C_ARCHIVE', value: C_ARCHIVE, role: '归档' },
+  { name: 'C_DANGER', value: C_DANGER, role: '危险/未达标' },
+  { name: 'C_OK', value: C_OK, role: '达标/成功' },
+  { name: 'C_ON_PHOTO', value: C_ON_PHOTO, role: '照片之上的文字' },
+  { name: 'C_MAP_BG', value: C_MAP_BG, role: '地图块底色' },
+  { name: 'C_MAP_LAND', value: C_MAP_LAND, role: '地图陆地填充' },
+  { name: 'C_MAP_LINE', value: C_MAP_LINE, role: '国界/省界' },
+  { name: 'C_MAP_TRACK', value: C_MAP_TRACK, role: '旅行轨迹' },
+  { name: 'C_MAP_PIN', value: C_MAP_PIN, role: '地图钉点' },
+  { name: 'C_MAP_MARKER', value: C_MAP_MARKER, role: '墙上照片标记' },
+  { name: 'C_MAP_INK', value: C_MAP_INK, role: '地图地名' }
+];
+
+/** 一条对比度要求：前景、背景、下限、为什么是这个下限。 */
+export interface ContrastRule { fg: string; bg: string; min: number; why: string }
+
+/**
+ * 必须成立的对比度要求。`min` 的取值只有两种来源，没有第三种：
+ *   · **4.5** —— 正文尺寸的文字（WCAG 2.1 AA，`F_DISPLAY` 之外的所有档都是这个）；
+ *   · **3** —— 大字（本表里只有 `C_MAP_INK` 的地名标签走这条：它是 8fp，**不是**大字，
+ *     但它压在**填充面**上、而不是压在纸底上，且真机上它还有一圈浅色描边承担可读性
+ *     （与预览的 `paint-order: stroke` 同一个手段）—— 所以这里按 3 报，实际值远高于它，
+ *     具体数字见 `designTokens.test.ts` 的输出）。
+ */
+export const CONTRAST_RULES: ContrastRule[] = [
+  { fg: C_TEXT, bg: C_BG, min: 4.5, why: '正文压页面底' },
+  { fg: C_TEXT, bg: C_SURFACE, min: 4.5, why: '正文压卡片' },
+  { fg: C_TEXT_DIM, bg: C_BG, min: 4.5, why: '次要文字压页面底' },
+  { fg: C_TEXT_DIM, bg: C_SURFACE, min: 4.5, why: '次要文字压卡片' },
+  { fg: C_TEXT_DIM, bg: C_MAP_BG, min: 4.5, why: '地图「＋N」压地图底' },
+  { fg: C_ACCENT_TEXT, bg: C_BG, min: 4.5, why: '强调文字压页面底' },
+  { fg: C_ACCENT_TEXT, bg: C_SURFACE, min: 4.5, why: '强调文字压卡片' },
+  { fg: C_ACCENT_TEXT, bg: C_NOTICE, min: 4.5, why: '提示文字压提示底' },
+  { fg: C_ON_PHOTO, bg: C_ACCENT, min: 4.5, why: '主按钮白字压强调面' },
+  { fg: C_TEXT, bg: C_WALL, min: 4.5, why: '「墙上」角标的暖黑字压暖赭面' },
+  { fg: C_FAV, bg: C_BG, min: 4.5, why: '收藏描边胶囊（字与边）压页面底' },
+  { fg: C_FAV, bg: C_SURFACE, min: 4.5, why: '收藏压卡片' },
+  { fg: C_ARCHIVE, bg: C_BG, min: 4.5, why: '归档描边胶囊压页面底' },
+  { fg: C_ARCHIVE, bg: C_SURFACE, min: 4.5, why: '归档压卡片' },
+  { fg: C_DANGER, bg: C_SURFACE, min: 4.5, why: '「未达标」压统计卡' },
+  { fg: C_OK, bg: C_SURFACE, min: 4.5, why: '「达标」压统计卡' },
+  { fg: C_MAP_INK, bg: C_MAP_LAND, min: 3, why: '地图地名压陆地填充' },
+  { fg: C_MAP_INK, bg: C_MAP_BG, min: 3, why: '地图地名压地图底' }
+];

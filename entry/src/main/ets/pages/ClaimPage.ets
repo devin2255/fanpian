@@ -20,6 +20,13 @@ import { projectMercator, CHINA_REGION, Projected } from '../core/projection';
 import { applyDecision, emptyDecision, Action, Decision } from '../core/queue';
 import { emptyMetrics, MetricsState, medianDecisionMs } from '../core/metrics';
 import { DEFAULT_SESSION_SIZE, SESSION_SIZE_CHOICES, sampleSession, SwipeSession } from '../core/session';
+// 设计令牌（**全项目唯一的视觉取值处**）。本页**不许**再出现任何 `#RRGGBB` / 字号 / 圆角
+// 字面量 —— `core/designTokens.test.ts` 里有一条守卫会对 `pages/` 与 `ui/` 全量扫描，
+// 写一个硬编码色值就会当场报红（这就是工单要的"零硬编码"，而且是每次都会重跑的版本）。
+import {
+  C_ACCENT, C_BG, C_DANGER, C_LINE, C_ON_PHOTO, C_SURFACE, C_TEXT, C_TEXT_DIM,
+  F_BODY, F_DISPLAY, F_LABEL, LW_BORDER, R_MD, S1, S2, S3, S5, S6
+} from '../core/designTokens';
 
 // 「上次选的张数」在 AppStorage 里的键：刷照片页的「继续刷 N 张」会回到本页并要求
 // **预选同一张数**。主路径上本页不会被重建（router.back() 回到栈里的实例，@State 原样保留），
@@ -110,42 +117,89 @@ struct ClaimPage {
   }
 
   build() {
-    Column({ space: 16 }) {
-      Text('照片墙').fontSize(26).fontWeight(FontWeight.Bold)
-      Text(`已认领 ${this.claimed} 张照片`).fontSize(15).fontColor('#666')
+    Column({ space: S5 }) {
+      // ── 品牌区：首屏第一眼 ─────────────────────────────────────────────────
+      // 这是用户看到的第一屏，所以品牌区只放两行、且**用令牌里唯一的重音档**（F_DISPLAY）：
+      //   · 「照片墙」是产品名，一屏只此一处用 26fp（`F_*` 阶梯的设计前提就是"重音档一屏最多一处"）；
+      //   · 「个人回忆馆」是产品定位，用 `C_TEXT_DIM` 压在下面 —— 它解释这个 App 是干什么的，
+      //     而不是装饰。旧版这一屏只有一句 26fp 的标题加一堆同重量的说明文字，
+      //     没有任何"这是什么地方"的层次。
+      Column({ space: S1 }) {
+        Text('照片墙').fontSize(F_DISPLAY).fontWeight(FontWeight.Bold).fontColor(C_TEXT)
+        Text('个人回忆馆').fontSize(F_LABEL).fontColor(C_TEXT_DIM)
+      }
+      .alignItems(HorizontalAlign.Center)
+
+      // 「重新看见」这句话是产品定位的一部分：删除只是顺手，看见才是目的。
+      // 用 F_BODY/`C_TEXT_DIM`（5.34:1）而不是旧版的 15fp + `#666` —— 后者虽然达标，
+      // 但它与下面那段更弱的说明文字是同一个灰色，两段话读起来一样重。
+      Text(`已认领 ${this.claimed} 张照片`).fontSize(F_BODY).fontColor(C_TEXT_DIM)
       Text('选一个张数，直接开始刷照片。照片从这个池子里随机抽给你；池子不够时会自动打开系统相册补充。')
-        .fontSize(13).fontColor('#999').textAlign(TextAlign.Center).padding({ left: 32, right: 32 })
+        .fontSize(F_LABEL).fontColor(C_TEXT_DIM).textAlign(TextAlign.Center).padding({ left: S6, right: S6 })
 
       // 张数选择用「一排按钮」而不是 Select 下拉框，理由见报告：
       // 只有 4 个选项，平铺可以一眼看全 + 一次点击选中（下拉要先展开再选，多一次点击）；
       // 且选中态直接高亮在按钮上，「默认 100」这条产品口径不需要展开控件就能确认。
-      Text('这次刷多少张').fontSize(13).fontColor('#666')
-      Row({ space: 8 }) {
-        ForEach(SESSION_SIZE_CHOICES, (n: number) => {
-          Button(`${n}`)
-            .fontSize(14).height(38).layoutWeight(1)
-            .backgroundColor(this.selectedSize === n ? '#1F6FEB' : '#E6E6E6')
-            .fontColor(this.selectedSize === n ? '#FFFFFF' : '#333333')
-            .onClick(() => { this.chooseSize(n); })
-        }, (n: number) => `${n}`)
+      // ── 选中态的视觉手段：**实心填充**（`C_ACCENT` + 白字 4.94:1），不是换一个字色 ──
+      // 理由：这四个胶囊是**同一控件的四个状态**，"当前选中的是哪个"必须比"这四个是什么"
+      // 更抢眼；换字色做不到这一点（四个数字一样大、一样位置）。
+      // 未选中的胶囊：`C_SURFACE` 底 + `C_LINE` 描边 + `C_TEXT_DIM` 字（5.34:1）。
+      // ⚠️ 那条 1.31:1 的描边**不承担"识别控件"的职责**（WCAG 1.4.11 的 3:1 说的是
+      //    识别控件所必需的信息）：识别它的是数字本身（5.34:1）与选中态的实心块。
+      //    若将来要求更硬的边界，把这一处 `C_LINE` 换成 `C_TEXT_DIM` 即可（一个令牌）。
+      Column({ space: S3 }) {
+        Text('这次刷多少张').fontSize(F_LABEL).fontColor(C_TEXT_DIM)
+        Row({ space: S2 }) {
+          ForEach(SESSION_SIZE_CHOICES, (n: number) => {
+            Button(`${n}`)
+              .fontSize(F_LABEL).height(44).layoutWeight(1)
+              .borderRadius(R_MD)
+              .backgroundColor(this.selectedSize === n ? C_ACCENT : C_SURFACE)
+              .fontColor(this.selectedSize === n ? C_ON_PHOTO : C_TEXT_DIM)
+              .border({ width: LW_BORDER, color: this.selectedSize === n ? C_ACCENT : C_LINE })
+              .onClick(() => { this.chooseSize(n); })
+          }, (n: number) => `${n}`)
+        }
+        .width('100%')
       }
-      .width('100%').padding({ left: 24, right: 24 })
+      .width('100%').padding({ left: S5, right: S5 })
 
-      Button('开始刷照片')
-        .fontSize(16).height(46).width(200)
-        // 构建索引 + 抽样 + 跳转期间禁用：双击不再产生第二次会话，
-        // 也不会再起第二次地点索引构建（那两次会争同一个 .tmp）。
-        // ArkUI 的 enabled(false) 自带置灰效果，这就是给用户的视觉反馈。
-        .enabled(!this.starting)
-        .onClick(() => { this.startSession(); })
+      // ── 动作区：**一个实心主按钮 + 一个描边次按钮** ──────────────────────
+      // 层级方案（全项目统一，理由见 ui/CardStack 的四个按钮）：一屏**只有一个**实心强调块，
+      // 它就是要用户做的那件事。旧版这两个按钮都是 ArkUI 默认样式（系统蓝的实心胶囊），
+      // 于是"开始刷照片"与"看收藏"一样重 —— 首屏没有主次，用户得读字才知道该点哪个。
+      // 高度 48（主）/ 44（次）：都不小于 44vp 的触摸目标下限，且主按钮略高一点，
+      // 在"实心 vs 描边"之外再加一档尺寸差 —— 两条独立手段，去掉任一条仍有层级。
+      Column({ space: S3 }) {
+        Button('开始刷照片')
+          .fontSize(F_BODY).fontWeight(FontWeight.Medium).height(48).width(240)
+          .borderRadius(R_MD)
+          .backgroundColor(C_ACCENT).fontColor(C_ON_PHOTO)
+          // 构建索引 + 抽样 + 跳转期间禁用：双击不再产生第二次会话，
+          // 也不会再起第二次地点索引构建（那两次会争同一个 .tmp）。
+          // ArkUI 的 enabled(false) 自带置灰效果，这就是给用户的视觉反馈。
+          .enabled(!this.starting)
+          .onClick(() => { this.startSession(); })
 
-      Button('看收藏')
-        .fontSize(16).height(46).width(200)
-        .onClick(() => { router.pushUrl({ url: 'pages/FavPage' }); })
+        Button('看收藏')
+          .fontSize(F_LABEL).height(44).width(240)
+          .borderRadius(R_MD)
+          .backgroundColor(C_SURFACE).fontColor(C_TEXT_DIM)
+          .border({ width: LW_BORDER, color: C_TEXT_DIM })
+          .onClick(() => { router.pushUrl({ url: 'pages/FavPage' }); })
+      }
 
-      Text(this.msg).fontSize(12).fontColor('#D33')
+      // ── 消息行：**警示色**（`C_DANGER`，对纸底 7.18:1）────────────────────
+      // 它承载 5 条文案，其中 3 条是失败（选图失败 / 进入刷照片页失败 / 没有可刷的照片），
+      // 2 条是中性信息（"就用现有的继续" / "本次新增 N 张"）。
+      // **刻意没有**为它新增一个"消息类型"@State：那是逻辑改动，超出"只改视觉"的范围。
+      // 已知代价（写进报告，不藏）：那 2 条中性信息也会用警示色 —— 与旧版 `#D33` 的行为一致
+      //（旧版也是同一个红），所以这不是本次引入的回归。
+      Text(this.msg).fontSize(F_LABEL).fontColor(C_DANGER).textAlign(TextAlign.Center)
+        .padding({ left: S5, right: S5 })
     }
     .width('100%').height('100%').justifyContent(FlexAlign.Center)
+    .backgroundColor(C_BG)
   }
 
   private chooseSize(n: number): void {
