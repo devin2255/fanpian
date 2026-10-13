@@ -1,0 +1,44 @@
+// ============================================================================
+//  本地签名配置模板 —— 复制成 signing.local.json5 再填真值。
+//
+//    cp signing.local.json5.example signing.local.json5
+//
+//  signing.local.json5 已被 .gitignore 忽略，**永远不要提交它**。
+//  根目录 hvigorfile.ts 会在构建时读取本文件，并注入 hvigor 的
+//  `config.ohos.overrides.signingConfig` —— 所以 build-profile.json5 里
+//  不需要（也不允许）出现任何真实签名材料。
+//
+//  没有 signing.local.json5 时构建**依然成功**，只是产物不签名
+//  （只有 entry-default-unsigned.hap，装不上真机）。
+//
+//  值从哪来？在 DevEco Studio 里 File > Project Structure > Signing Configs
+//  勾选 "Automatically generate signature"，DevEco 会把生成结果写进
+//  build-profile.json5 —— 把那段 material 抄到本文件，然后
+//  `git restore build-profile.json5` 把仓库文件还原成模板。
+//  签名材料本体在 %USERPROFILE%\.ohos\config\ 下（.cer / .p7b / .p12）。
+//
+//  ⚠️ 本文件的字段不是随便写的：hvigor 会用 project-schema.json 校验
+//  overrides.signingConfig，只允许 `type` 与 `material` 两个字段，
+//  material 只允许下面这 7 个键。多写一个键（例如 name）构建会直接报
+//  "Schema validate failed"。
+// ============================================================================
+{
+  // 只允许 "HarmonyOS" 或 "OpenHarmony"。
+  "type": "HarmonyOS",
+  "material": {
+    // 证书文件（.cer）的本机绝对路径。JSON 里反斜杠要写两个。
+    "certpath": "C:\\Users\\<你的用户名>\\.ohos\\config\\<你的证书>.cer",
+    // 密钥别名，DevEco 自动生成的调试签名固定是 debugKey。
+    "keyAlias": "debugKey",
+    // 密钥口令。DevEco 写进 build-profile.json5 的是**密文**（十六进制串），
+    // 原样抄过来即可 —— 它由本机 .ohos\config\material\ 目录解密，换机器无效。
+    "keyPassword": "<从 DevEco 的 build-profile.json5 里原样抄过来>",
+    // 调试 profile（.p7b）的本机绝对路径。
+    "profile": "C:\\Users\\<你的用户名>\\.ohos\\config\\<你的 profile>.p7b",
+    "signAlg": "SHA256withECDSA",
+    // 密钥库（.p12）的本机绝对路径。
+    "storeFile": "C:\\Users\\<你的用户名>\\.ohos\\config\\<你的密钥库>.p12",
+    // 密钥库口令，同样是密文，原样抄。
+    "storePassword": "<从 DevEco 的 build-profile.json5 里原样抄过来>"
+  }
+}

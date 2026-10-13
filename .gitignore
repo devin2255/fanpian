@@ -10,6 +10,9 @@
 /.clang-tidy
 **/.test
 /.appanalyzer
+# 本机签名材料（真口令 + 真路径）：绝不入库。
+# 模板见 signing.local.json5.example，由根目录 hvigorfile.ts 在构建时读取。
+/signing.local.json5
 # 地图墙工具链的中间产物与原始数据：都不入库。
 # tools/raw 是 Natural Earth 的原始 GeoJSON（10m 那份 12.7 MB）；
 # tools/out 是可随时用 render-preview.ts 重新生成的预览图。

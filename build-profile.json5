@@ -1,20 +1,16 @@
 {
   "app": {
-    "signingConfigs": [
-      {
-        "name": "default",
-        "type": "HarmonyOS",
-        "material": {
-          "certpath": "<REMOVED-SIGNING-MATERIAL-DIR>\\<REMOVED-CERT-ID>=.cer",
-          "keyAlias": "debugKey",
-          "keyPassword": "<REMOVED-LEAKED-KEY-PASSWORD>",
-          "profile": "<REMOVED-SIGNING-MATERIAL-DIR>\\<REMOVED-CERT-ID>=.p7b",
-          "signAlg": "SHA256withECDSA",
-          "storeFile": "<REMOVED-SIGNING-MATERIAL-DIR>\\<REMOVED-CERT-ID>=.p12",
-          "storePassword": "<REMOVED-LEAKED-STORE-PASSWORD>"
-        }
-      }
-    ],
+    /*
+     * 签名材料不写在本文件里 —— 这是公开仓库，签名口令一旦入库就等于公开。
+     * 真实材料放在本机未入库的 `signing.local.json5`（已被 .gitignore 忽略），
+     * 由根目录 `hvigorfile.ts` 在构建时读取，注入 hvigor 的
+     * `config.ohos.overrides.signingConfig`，与本数组按 material 字段合并。
+     * 模板与填写说明见 `signing.local.json5.example`。
+     *
+     * 因此这里留空。没有本地文件时构建**依然成功**，只是产物不签名
+     * （只有 entry-default-unsigned.hap，装不上真机）。
+     */
+    "signingConfigs": [],
     "products": [
       {
         "name": "default",
