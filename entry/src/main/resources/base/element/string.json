@@ -10,7 +10,7 @@
     },
     {
       "name": "EntryAbility_label",
-      "value": "照片墙"
+      "value": "翻片"
     },
     {
       "name": "reason_read_imagevideo",
@@ -18,7 +18,7 @@
     },
     {
       "name": "reason_media_location",
-      "value": "用于读取照片的拍摄地点，把照片挂到地图照片墙上"
+      "value": "用于读取照片的拍摄地点，把照片挂到地图墙上"
     }
   ]
 }

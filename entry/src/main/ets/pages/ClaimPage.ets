@@ -120,13 +120,15 @@ struct ClaimPage {
     Column({ space: S5 }) {
       // ── 品牌区：首屏第一眼 ─────────────────────────────────────────────────
       // 这是用户看到的第一屏，所以品牌区只放两行、且**用令牌里唯一的重音档**（F_DISPLAY）：
-      //   · 「照片墙」是产品名，一屏只此一处用 26fp（`F_*` 阶梯的设计前提就是"重音档一屏最多一处"）；
-      //   · 「个人回忆馆」是产品定位，用 `C_TEXT_DIM` 压在下面 —— 它解释这个 App 是干什么的，
+      //   · 「翻片」是产品名，一屏只此一处用 26fp（`F_*` 阶梯的设计前提就是"重音档一屏最多一处"）；
+      //   · 「翻自己的照片」是产品定位，用 `C_TEXT_DIM` 压在下面 —— 它解释这个 App 是干什么的，
       //     而不是装饰。旧版这一屏只有一句 26fp 的标题加一堆同重量的说明文字，
       //     没有任何"这是什么地方"的层次。
+      //     ⚠️ 定位语必须**自己说清"这是刷自己照片的 App"**：「翻片」是「翻篇」的谐音梗，
+      //        名字本身推不出功能，所以这一行要顶住这件事。
       Column({ space: S1 }) {
-        Text('照片墙').fontSize(F_DISPLAY).fontWeight(FontWeight.Bold).fontColor(C_TEXT)
-        Text('个人回忆馆').fontSize(F_LABEL).fontColor(C_TEXT_DIM)
+        Text('翻片').fontSize(F_DISPLAY).fontWeight(FontWeight.Bold).fontColor(C_TEXT)
+        Text('翻自己的照片').fontSize(F_LABEL).fontColor(C_TEXT_DIM)
       }
       .alignItems(HorizontalAlign.Center)
 
