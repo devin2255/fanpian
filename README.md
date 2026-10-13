@@ -183,6 +183,45 @@ $env:DEVECO_SDK_HOME = "<你的 DevEco 安装目录>\sdk"
 ⚠️ **DevEco Studio 开着会与命令行争 `entry/build`** —— IDE 自行构建会清掉命令行刚建好的产物。
 命令行构建与 IDE 构建**不要同时进行**。取证时用「**删 build → 构建 → 同一进程内立即取证**」。
 
+### 🔑 本地签名配置（新 clone 必读）
+
+🔴 **先做这件事**：本仓库曾经把**真实签名口令**写进 `build-profile.json5` 并推到公开仓库
+（`776be16` 引入，一直存在到 `a9ac000`）。那些值已从**全部提交**里移除，但
+**「移除」不能撤销「已经暴露」** —— 请在 DevEco Studio 里**重新生成一份调试签名**，
+让旧口令彻底作废。那只是两次点击（`File > Project Structure > Signing Configs` →
+`Automatically generate signature`）。
+
+**仓库里现在没有任何签名材料。** 签名材料只存在于**本机未入库**的 `signing.local.json5`：
+
+| 文件 | 是否入库 | 作用 |
+|---|---|---|
+| `signing.local.json5.example` | ✅ 入库 | 模板 + 填写说明 |
+| `signing.local.json5` | ❌ **被 `.gitignore` 忽略** | 你的真实材料（口令 + 绝对路径） |
+| `build-profile.json5` | ✅ 入库 | `signingConfigs` **留空**，文件结构不变 |
+| `hvigorfile.ts` | ✅ 入库 | 构建时读本地文件，注入 hvigor 的 `config.ohos.overrides.signingConfig` |
+
+**步骤**：
+
+```powershell
+Set-Location "<你的 clone 路径>"
+Copy-Item signing.local.json5.example signing.local.json5
+# 然后按文件内注释填：3 个绝对路径 + 2 个口令
+```
+
+值从哪来：在 DevEco 里生成签名后，DevEco 会把结果写进 `build-profile.json5`；
+把那段 `material` 抄进 `signing.local.json5`，再 `git restore build-profile.json5`
+把仓库文件还原成模板。**绝不要提交那段值。**
+
+**不配也能编译**：没有 `signing.local.json5` 时 `assembleHap` **依然 `BUILD SUCCESSFUL`**，
+只是产物只有 `entry-default-unsigned.hap`（装不上真机）。两种情形都实测过。
+
+> ⚠️ `signing.local.json5` 的字段**受 schema 约束**：hvigor 用
+> `@ohos/hvigor-ohos-plugin/res/schemas/hvigorfile-configuration/project-schema.json`
+> 校验 `overrides.signingConfig`，只允许 `type` 与 `material` 两个字段，
+> `material` 只允许 `certpath` / `keyAlias` / `keyPassword` / `profile` / `signAlg` /
+> `storeFile` / `storePassword`。**多写一个键（例如 `name`）会直接
+> `Schema validate failed` 构建失败**（这是实测踩到的）。
+
 ### 📱 装到设备
 
 > ⚠️ **必须在你的自有终端执行** —— `hdc` 在 agent 的文件沙箱里跑不起来（密钥加载失败会让设备变 `Offline`）。
@@ -274,7 +313,7 @@ App 内嵌三个离线数据文件，全部有明确的来源、许可与**可�
 | 1 | **`bundleName` 仍是占位符** | `com.example.photospike`，`vendor` 是 `example`（`AppScope/app.json5:3-4`）。改名的**真实阻碍**：`.p7b` 调试 profile 与包名绑定，改名即失配，而重新生成需要 DevEco 的自动签名交互（`docs/decisions.md` 设置记录 / Ruling 1） |
 | 2 | **应用图标是 DevEco 默认模板** | `AppScope/resources/base/media/` 下只有模板生成的 `background.png` + `foreground.png` + `layered_image.json`，从未替换 |
 | 3 | **没有 `LICENSE` 文件** | 仓库根只有 `THIRD_PARTY_NOTICES.md`（第三方声明）。**本项目自身的许可未声明** —— 公开分发前必须补 |
-| 4 | **`build-profile.json5` 里含本机签名材料** | `signingConfigs` 内联了 `.cer` / `.p7b` / `.p12` 的**绝对路径**与 `keyPassword` / `storePassword`。它**已被 git 跟踪**（在仓库里，也在历史里）。这批任务未改动它（属"另一批的事"），但**应当清理**：改为 `local.properties` 或环境变量注入，并把调试签名材料从历史中移除 |
+| 4 | ~~**`build-profile.json5` 里含本机签名材料**~~ → ✅ **已处理** | 原状：`signingConfigs` 内联了 `.cer` / `.p7b` / `.p12` 的**绝对路径**（含用户名）与 `keyPassword` / `storePassword`，**被 git 跟踪、且已推到公开仓库**，任何一版历史都能读到。已做三件事：① 改为仓库只留模板，真值放未入库的 `signing.local.json5`，由 `hvigorfile.ts` 注入 hvigor 官方扩展点 —— 见「🔑 本地签名配置」；② 用 `git filter-repo` 把两串口令与含用户名的绝对路径从**全部 109 个提交**里移除；③ `--force-with-lease` 强推覆盖远端，并用全新 clone 复验 0 命中。**⚠️ 唯一的残留风险是"已经暴露过"这件事本身** —— 旧口令仍应视为已泄露，**必须重新生成签名**（见上节） |
 
 ### 🐞 功能未完成
 
